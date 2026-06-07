@@ -2,7 +2,7 @@
 spec_id: GRAPH-001
 title: "Oxc parse pipeline as an incremental query system (CST/semantic/IR)"
 subsystem: crates/graph
-status: drafting
+status: merged
 blast_radius: high
 plan_ref: "Initial spec backlog · Wave 1 (GRAPH-001); Build sequence · P0 Foundations"
 constitution_ref: [I-1, I-3]

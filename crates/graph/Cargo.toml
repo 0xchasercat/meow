@@ -1,0 +1,24 @@
+[package]
+name = "meow-graph"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+# GRAPH-001 — the single Oxc parse pipeline (stages 1/2/5) as an incremental query
+# system. THIS crate is the only `Parser::new` site in the workspace (I-1 / P15).
+# Footprint (I-10): all externals inherited from the workspace `# === GRAPH-001 ===` fence.
+[dependencies]
+oxc_allocator = { workspace = true }
+oxc_ast = { workspace = true }
+oxc_parser = { workspace = true }
+oxc_semantic = { workspace = true }
+oxc_span = { workspace = true }
+oxc_diagnostics = { workspace = true }
+self_cell = { workspace = true }
+rustc-hash = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+oxc_span = { workspace = true }
