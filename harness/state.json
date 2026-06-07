@@ -1,6 +1,6 @@
 {
   "version": 3,
-  "updated_at": "2026-06-08T02:00:00Z",
+  "updated_at": "2026-06-08T04:00:00Z",
   "mode": "incubating",
   "phase": {
     "id": "P1",
@@ -12,7 +12,7 @@
     "GRAPH": { "status": "active", "note": "GRAPH-001 + RT-003 merged: Oxc pipeline (single parser, I-1) + erasable type-strip (I-3)" },
     "RT": { "status": "active", "note": "RT-001/002/004/005/006 merged: V8, meow run, async I/O seam, strict-web globals, meow:http serve + typegen, determinism harness" },
     "LOAD": { "status": "active", "note": "LOAD-001 + LOAD-003 merged: the single resolver with full Node resolution (exports/imports/conditions/patterns/self-ref), no node_modules" },
-    "PKG": { "status": "active", "note": "PKG-001 merged: meow.lock.jsonl + content-addressed cache" },
+    "PKG": { "status": "active", "note": "PKG-001 + PKG-002 merged: meow.lock.jsonl + content-addressed cache + meow install (npm resolution, integrity-verified, deterministic lockfile); deps install + run with NO node_modules" },
     "WS": { "status": "planned", "note": "monorepo graph discovery + linking (P4)" },
     "TASK": { "status": "planned", "note": "typed tasks, in/out hashing, artifact->task (P4)" },
     "TEST": { "status": "planned", "note": "isolate-per-file, deterministic clock (P6); RT-006 substrate ready" },
@@ -37,10 +37,11 @@
     { "id": 9, "specs": ["RT-006"], "outcome": "merged" },
     { "id": 10, "specs": ["CFG-002"], "outcome": "merged" },
     { "id": 11, "specs": ["LOAD-003"], "outcome": "merged" },
-    { "id": 12, "specs": ["RT-005"], "outcome": "merged" }
+    { "id": 12, "specs": ["RT-005"], "outcome": "merged" },
+    { "id": 13, "specs": ["PKG-002"], "outcome": "merged" }
   ],
   "gates": {
-    "footprint": { "status": "green", "at": "2026-06-08T01:45:00Z", "evidence_ref": "harness/reality-checks/footprint-3.md" },
+    "footprint": { "status": "green", "at": "2026-06-08T04:00:00Z", "evidence_ref": "scripts/footprint.sh gzip 27.5MB <= 60MB (PKG-002 ureq+rustls; TLS dedup with deno_fetch)" },
     "craft": { "status": "green", "at": "2026-06-08T01:15:00Z", "evidence_ref": "harness/reality-checks/craft-7.md" },
     "strip-fidelity": { "status": "green", "at": "2026-06-07T17:30:00Z", "evidence_ref": "harness/reality-checks/strip-fidelity-1.md" },
     "types-fresh": { "status": "green", "at": "2026-06-08T01:45:00Z", "evidence_ref": "RT-005 meow types --check fresh; committed crates/runtime/types/meow" },
@@ -65,7 +66,7 @@
       "harness/PLAN.md",
       "harness/CANON.md"
     ],
-    "active": "P2 (Packages & Resolution) SPECCED - 5 specs drafted + committed (PKG-002 install, PKG-003 ResolutionGraph/PnP, PKG-004 materialize, OBS-001 why-dep, LSP-001 shared-resolver) to the depth bar, IRC-coordinated on the shared ResolutionGraph + Resolver::from_resolution contract. P1 MVP complete + gated. 16 open assumption forks in decisions.json for review.",
-    "next_pull_hint": "Build P2: implement PKG-002 (install; populates the cache LOAD-003 resolves) first, then PKG-003/004 (PnP+materialize, ADR-4), OBS-001, LSP-001; gate each. Review the 16 decisions.json forks."
+    "active": "P2 BUILDING - PKG-002 (meow install) merged + reality-checked: npm resolution + sha512-verify/sha256-cache integrity + deterministic meow.lock.jsonl; `meow install camelcase-keys@^10` then `meow run` executes the dep tree with NO node_modules, reinstall byte-identical (P2 core met via PKG-002 + LOAD-003). All 5 P2 specs drafted.",
+    "next_pull_hint": "Continue P2: OBS-001 why-dep (small/local) + PKG-003 ResolutionGraph (formalize shared PnP model for LSP resolver-parity), then PKG-004 materialize, LSP-001. Crypto-provider default installed for fetch (ureq+ring vs aws-lc-rs)."
   }
 }
