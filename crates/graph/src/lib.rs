@@ -31,7 +31,7 @@ pub use crate::error::{GraphError, StripDiagnostic};
 pub use crate::ids::FileId;
 pub use crate::ir::RuntimeIr;
 pub use crate::semantic::SemanticGraph;
-pub use crate::strip::{PermissivePolicy, StripPolicy};
+pub use crate::strip::{ErasablePolicy, PermissivePolicy, StripPolicy};
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -68,9 +68,10 @@ impl Default for GraphDb {
 }
 
 impl GraphDb {
-    /// New db with the permissive seam policy installed.
+    /// New db with the erasable-only strip policy installed — the policy `meow`
+    /// ships (I-3). Use [`with_policy`](Self::with_policy) to install another.
     pub fn new() -> Self {
-        Self::with_policy(Arc::new(PermissivePolicy))
+        Self::with_policy(Arc::new(ErasablePolicy))
     }
 
     /// New db with a caller-supplied [`StripPolicy`] (RT-003 installs the real one).

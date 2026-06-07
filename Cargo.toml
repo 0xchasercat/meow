@@ -62,3 +62,12 @@ rustc-hash = "2"
 # salsa later is contained behind the facade. oxc_transformer/oxc_codegen are deferred to
 # RT-003 (no speculative deps before the real type-strip lands).
 # === /GRAPH-001 ===
+# === RT-003 ===
+# Position-preserving type-stripping (CANON §9, I-3) walks the stage-1 Oxc AST and
+# blanks type-only spans to whitespace over the source string. This needs the Oxc
+# AST visitor (traversal only); NO oxc_transformer / oxc_codegen — those transpile
+# and emit fresh text, which loses byte positions and forces a sourcemap (forbidden
+# by CANON §9). Span-blanking needs no codegen, so none are pinned. Consumed ONLY by
+# crates/graph.
+oxc_ast_visit = "0.134"
+# === /RT-003 ===

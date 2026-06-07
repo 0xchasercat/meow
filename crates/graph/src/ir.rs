@@ -57,7 +57,21 @@ pub(crate) fn compute_runtime_ir(
         };
     }
 
-    // 2. Consult the installed strip policy.
+    // 2. TypeScript erasability is INTRINSIC to stripping: regardless of the
+    //    installed policy, a TS input that contains non-erasable syntax (enum,
+    //    runtime namespace, parameter property, `import =`, `export =`) can never be
+    //    whitespace-blanked to correct JS — so it is always rejected here. A
+    //    permissive policy can relax *additional* rules, never this one.
+    if cst.source_type().is_typescript() {
+        if let Err(diagnostics) = crate::strip::ErasablePolicy.check(sem) {
+            return IrOutcome {
+                ir: None,
+                diagnostics,
+            };
+        }
+    }
+
+    // 3. Consult the installed strip policy for any further rules.
     if let Err(diagnostics) = policy.check(sem) {
         return IrOutcome {
             ir: None,
@@ -66,29 +80,20 @@ pub(crate) fn compute_runtime_ir(
     }
 
     // === RT-003 ===
-    // Seam for RT-003's actual `oxc_transformer` / `oxc_codegen` type-strip. Until
-    // it lands, the only honest lowering is the IDENTITY passthrough for clean
-    // JavaScript (JS needs no stripping, so verbatim source IS the runtime IR).
-    // TypeScript has no strip yet, so it cannot be lowered — returning the verbatim
-    // TS as `positions_preserved: true` would be a lie (CONSTITUTION I-3 / I-11:
-    // prose must match code).
-    if cst.source_type().is_typescript() {
-        return IrOutcome {
-            ir: None,
-            diagnostics: vec![StripDiagnostic {
-                span: Span::default(),
-                message: "type stripping is not yet available (lands in RT-003)".to_string(),
-                help: "TypeScript cannot be lowered to runtime IR until the RT-003 strip lands; \
-                       only clean JavaScript can be lowered today"
-                    .to_string(),
-            }],
-        };
-    }
-
-    // Clean JavaScript, no errors, policy satisfied: identity passthrough.
+    // Erasable-only type strip (CANON §9, I-3). The policy gate above has already
+    // rejected every non-erasable construct, so what remains is erasable TS (or
+    // plain JS). Plain JS needs no stripping, so its verbatim source IS the runtime
+    // IR (identity — no allocation). Erasable TS is stripped to whitespace in place:
+    // annotations erased, positions byte-for-byte preserved, no downlevel emit and
+    // no sourcemap.
+    let code: Arc<str> = if cst.source_type().is_typescript() {
+        Arc::from(crate::strip::strip(&source, cst))
+    } else {
+        source
+    };
     IrOutcome {
         ir: Some(RuntimeIr {
-            code: source,
+            code,
             positions_preserved: true,
         }),
         diagnostics: Vec::new(),

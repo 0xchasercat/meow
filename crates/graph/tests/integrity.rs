@@ -4,7 +4,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use meow_graph::{GraphDb, RuntimeIr, SemanticGraph, StripDiagnostic, StripPolicy};
+use meow_graph::{
+    GraphDb, PermissivePolicy, RuntimeIr, SemanticGraph, StripDiagnostic, StripPolicy,
+};
 use oxc_span::Span;
 
 fn src(s: &str) -> Arc<str> {
@@ -34,15 +36,27 @@ fn parses_typescript_file() {
     assert!(names.contains(&"x"), "missing binding `x`: {names:?}");
     assert!(names.contains(&"foo"), "missing binding `foo`: {names:?}");
 
-    // Stage 5: TS cannot lower yet — RT-003 owns the strip — so the seam is honest
-    // and rejects rather than handing back un-stripped TS as runnable IR.
-    let diags = db
+    // Stage 5: RT-003 strips the TS to whitespace-preserving JS and lowers it.
+    let src_text = "const x: number = 1;\nfunction foo(a: string): string { return a; }\n";
+    let ir = db
         .runtime_ir(id)
         .expect("known id")
-        .expect_err("TS must not lower until RT-003");
+        .expect("clean erasable TS lowers after RT-003");
+    assert!(ir.positions_preserved, "strip preserves positions");
+    assert_eq!(
+        ir.code.len(),
+        src_text.len(),
+        "stripping only blanks bytes: length is stable"
+    );
     assert!(
-        diags.iter().any(|d| d.message.contains("RT-003")),
-        "expected RT-003 rejection: {diags:?}"
+        !ir.code.contains("number") && !ir.code.contains("string"),
+        "type annotations must be erased: {:?}",
+        ir.code
+    );
+    assert!(
+        ir.code.contains("const x") && ir.code.contains("return a"),
+        "runtime code must survive: {:?}",
+        ir.code
     );
 }
 
@@ -151,32 +165,33 @@ impl StripPolicy for RejectAll {
 
 #[test]
 fn strip_seam_is_wired() {
-    // Clean JS under the permissive default -> Some(Ok) with position-preserving IR.
+    // Clean JS under the default erasable policy -> Some(Ok) with identity IR
+    // (JS has no types to strip, so the source is the runtime IR verbatim).
     let mut ok_db = GraphDb::new();
     let id = ok_db.set_file("ok.js", src("const x = 1;\n"));
     let ir: &RuntimeIr = ok_db
         .runtime_ir(id)
         .expect("known id")
-        .expect("clean JS lowers under permissive policy");
+        .expect("clean JS lowers under the default policy");
     assert!(ir.positions_preserved);
     assert_eq!(
         &*ir.code, "const x = 1;\n",
-        "identity seam keeps source verbatim"
+        "identity seam keeps JS source verbatim"
     );
 
-    // TS input under the default policy -> Some(Err): the strip is RT-003's, so the
-    // seam refuses to pass un-stripped TS off as runnable IR.
+    // Erasable TS under the default policy -> Some(Ok): RT-003 strips the types to
+    // whitespace, preserving positions, and lowers the result.
     let mut ts_db = GraphDb::new();
-    let id = ts_db.set_file("typed.ts", src("const x: number = 1;\n"));
-    let diags = ts_db
+    let ts_text = "const x: number = 1;\n";
+    let id = ts_db.set_file("typed.ts", src(ts_text));
+    let ir = ts_db
         .runtime_ir(id)
         .expect("known id")
-        .expect_err("TS must not lower until RT-003");
-    assert_eq!(diags.len(), 1);
-    assert!(
-        diags[0].message.contains("RT-003"),
-        "expected RT-003 rejection: {diags:?}"
-    );
+        .expect("erasable TS lowers after the strip");
+    assert!(ir.positions_preserved);
+    assert_eq!(ir.code.len(), ts_text.len(), "strip only blanks bytes");
+    assert!(!ir.code.contains("number"), "type erased: {:?}", ir.code);
+    assert!(ir.code.contains("const x"), "value kept: {:?}", ir.code);
 
     // A file with a recovered parse error -> Some(Err): broken input is never
     // lowered into fabricated IR.
@@ -207,4 +222,47 @@ fn strip_seam_is_wired() {
     // A stale id (file removed) -> None, not a panic.
     rej_db.remove_file(Path::new("bad.js"));
     assert!(rej_db.runtime_ir(id).is_none(), "retired id yields None");
+}
+
+/// Finding 3 regression: erasability is INTRINSIC to TS stripping. Even under the
+/// `PermissivePolicy` (which accepts everything), non-erasable TS must NOT be
+/// silently lowered into wrong JS — it stays `Some(Err)`.
+#[test]
+fn permissive_policy_cannot_lower_non_erasable_ts() {
+    // `enum` emits runtime code: rejected even though the policy says "accept all".
+    let mut enum_db = GraphDb::with_policy(Arc::new(PermissivePolicy));
+    let id = enum_db.set_file("e.ts", src("enum E { A }\n"));
+    let diags = enum_db
+        .runtime_ir(id)
+        .expect("known id")
+        .expect_err("non-erasable enum must not lower under any policy");
+    assert!(
+        diags.iter().any(|d| d.message.starts_with("Enums")),
+        "expected the enum diagnostic: {diags:?}"
+    );
+
+    // A parameter property emits an assignment: also rejected under permissive.
+    let mut param_db = GraphDb::with_policy(Arc::new(PermissivePolicy));
+    let id = param_db.set_file(
+        "p.ts",
+        src("class C { constructor(public x: number) {} }\n"),
+    );
+    let diags = param_db
+        .runtime_ir(id)
+        .expect("known id")
+        .expect_err("non-erasable param property must not lower under any policy");
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.message.starts_with("Parameter properties")),
+        "expected the param-property diagnostic: {diags:?}"
+    );
+
+    // Sanity: erasable TS still lowers fine under permissive (the gate is surgical).
+    let mut ok_db = GraphDb::with_policy(Arc::new(PermissivePolicy));
+    let id = ok_db.set_file("ok.ts", src("const x: number = 1;\n"));
+    assert!(
+        ok_db.runtime_ir(id).expect("known id").is_ok(),
+        "erasable TS must still lower under the permissive policy"
+    );
 }

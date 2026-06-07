@@ -1,6 +1,6 @@
 {
   "version": 3,
-  "updated_at": "2026-06-07T15:30:00Z",
+  "updated_at": "2026-06-07T17:30:00Z",
   "mode": "incubating",
   "phase": {
     "id": "P0",
@@ -9,9 +9,9 @@
   "active_task": null,
   "in_flight_agents": [],
   "subsystems": {
-    "GRAPH": { "status": "active", "note": "GRAPH-001 merged: Oxc pipeline (CST/semantic/IR), single parser (I-1)" },
-    "RT": { "status": "active", "note": "RT-001 merged: V8 embed (deno_core 0.403), meow run executes ESM, op layer; no panic on user JS" },
-    "LOAD": { "status": "planned", "note": "LOAD-001 unblocked (GRAPH+PKG+RT-001 loader ready)" },
+    "GRAPH": { "status": "active", "note": "GRAPH-001 + RT-003 merged: Oxc pipeline (single parser, I-1) + erasable type-strip (default ErasablePolicy, I-3)" },
+    "RT": { "status": "active", "note": "RT-001 merged: V8 embed, meow run executes ESM; RT-002 (async I/O) next" },
+    "LOAD": { "status": "planned", "note": "LOAD-001 next: real resolver+cache; route TS via GRAPH strip for end-to-end meow run x.ts" },
     "PKG": { "status": "active", "note": "PKG-001 merged: meow.lock.jsonl + content-addressed cache" },
     "WS": { "status": "planned", "note": "monorepo graph discovery + linking (P4)" },
     "TASK": { "status": "planned", "note": "typed tasks, in/out hashing, artifact->task (P4)" },
@@ -29,11 +29,13 @@
     { "id": 1, "specs": ["DIST-001"], "outcome": "merged" },
     { "id": 2, "specs": ["PKG-001", "CFG-001"], "outcome": "merged" },
     { "id": 3, "specs": ["GRAPH-001"], "outcome": "merged" },
-    { "id": 4, "specs": ["RT-001"], "outcome": "merged" }
+    { "id": 4, "specs": ["RT-001"], "outcome": "merged" },
+    { "id": 5, "specs": ["RT-003"], "outcome": "merged" }
   ],
   "gates": {
     "footprint": { "status": "green", "at": "2026-06-07T15:30:00Z", "evidence_ref": "harness/reality-checks/footprint-2.md" },
-    "craft": { "status": "green", "at": "2026-06-07T15:30:00Z", "evidence_ref": "harness/reality-checks/craft-3.md" }
+    "craft": { "status": "green", "at": "2026-06-07T17:30:00Z", "evidence_ref": "harness/reality-checks/craft-4.md" },
+    "strip-fidelity": { "status": "green", "at": "2026-06-07T17:30:00Z", "evidence_ref": "harness/reality-checks/strip-fidelity-1.md" }
   },
   "drift_flags": [],
   "decisions": {
@@ -50,7 +52,7 @@
       "harness/PLAN.md",
       "harness/CANON.md"
     ],
-    "active": "P0 — DIST/PKG/CFG/GRAPH/RT-001 merged. `meow run hello.mjs` executes ESM through V8 (P0 exit 'trivial ESM' met). Floor+craft+footprint green.",
-    "next_pull_hint": "RT-003 (erasable type-strip, fills GRAPH seam) + LOAD-001 (resolver+cache, needs RT-001 loader) — both unblocked; RT-002 after. Then P0 exit check. Craft-gate each."
+    "active": "P0 — DIST/PKG/CFG/GRAPH/RT-001/RT-003 merged. V8 runs ESM; erasable TS strip works at GRAPH level. Floor+craft+strip-fidelity green.",
+    "next_pull_hint": "LOAD-001 (real resolver+cache; route TS via GRAPH strip so `meow run x.ts` works end-to-end) — needs GRAPH+PKG+RT-001; then RT-002 async I/O; then P0 exit check. Craft-gate each."
   }
 }
