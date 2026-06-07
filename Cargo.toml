@@ -97,3 +97,13 @@ deno_net = "0.242.0"
 deno_permissions = "0.109.0"
 hyper-util = { version = "0.1", features = ["client-legacy"] }
 # === /RT-004 ===
+# === RT-006 ===
+# Determinism harness (I-6): a seeded CSPRNG for reproducible Math.random /
+# crypto entropy, and the OS entropy source for the --allow-random grant. All
+# three are confined to crates/runtime/src/hermetic/state.rs (the one sanctioned
+# host-seam home; principles-check P16 allowlists /hermetic/). Versions unify with
+# the set already in the tree (no duplicate-version footprint cost, I-10).
+rand_chacha = "0.9"
+rand_core = "0.9"
+getrandom = "0.3"
+# === /RT-006 ===

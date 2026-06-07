@@ -35,6 +35,13 @@ deno_net = { workspace = true, optional = true }
 deno_permissions = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
 # === /RT-004 ===
+# === RT-006 ===
+# Determinism harness (I-6): seeded ChaCha20 (reproducible RNG) + the OS entropy
+# grant. Used ONLY in src/hermetic/state.rs (the one sanctioned host seam).
+rand_chacha = { workspace = true }
+rand_core = { workspace = true }
+getrandom = { workspace = true }
+# === /RT-006 ===
 
 [dev-dependencies]
 # Tests drive the async run path on a current-thread runtime (A5); deno_core also

@@ -34,6 +34,15 @@ pub mod io;
 pub mod web;
 // === /RT-004 ===
 
+// === RT-006 ===
+/// Determinism & hermeticity harness (CANON §1 #5 / I-6): routes V8's
+/// `Date`/`Math.random`, the Web `crypto` entropy, and host env through one
+/// governed seam — deterministic by default, real host source on grant. See
+/// [`hermetic::extensions`]. The sole sanctioned home of host clock/entropy/env
+/// reads (`principles-check.sh` P16 allowlists `src/hermetic/`).
+pub mod hermetic;
+// === /RT-006 ===
+
 use deno_core::{JsRuntime, ModuleId, PollEventLoopOptions, RuntimeOptions as DenoRuntimeOptions};
 
 // Re-exports: callers depend on `meow_runtime`, not `deno_core`, directly.

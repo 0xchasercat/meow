@@ -75,6 +75,18 @@ pub struct RunArgs {
     /// Arguments after `--`, to forward to the program (forwarding is not yet wired).
     #[arg(last = true)]
     pub argv: Vec<String>,
+    // === RT-006 ===
+    /// Expose the real system clock + monotonic time (the run is no longer reproducible).
+    #[arg(long)]
+    pub allow_clock: bool,
+    /// Use OS entropy for `Math.random` + `crypto.getRandomValues` (the run is no longer reproducible).
+    #[arg(long)]
+    pub allow_random: bool,
+    /// Expose host env vars: bare `--allow-env` grants ALL (widest), `--allow-env=HOME,PATH` scopes
+    /// to the named vars; ungranted vars stay invisible. Absent = no host env (deterministic).
+    #[arg(long, value_name = "NAMES", num_args = 0..=1, require_equals = true, default_missing_value = "")]
+    pub allow_env: Option<String>,
+    // === /RT-006 ===
 }
 
 #[derive(Debug, Args)]
@@ -172,7 +184,12 @@ impl Cli {
             Command::Sync => cmd_sync(),
             // === /CFG-001 ===
             // === RT-001 ===
-            Command::Run(args) => cmd_run(&args.entry, &args.argv),
+            Command::Run(args) => {
+                // === RT-006 ===
+                let hermetic = hermetic_config(&args);
+                // === /RT-006 ===
+                cmd_run(&args.entry, &args.argv, hermetic)
+            }
             // === /RT-001 ===
             // HONEST stub (CRAFT — "the action must DO the work"): no fake success path.
             // Structured, single-line, machine-greppable; stderr only; non-zero exit.
@@ -234,13 +251,45 @@ fn cmd_sync() -> ExitCode {
 }
 // === /CFG-001 ===
 
+// === RT-006 ===
+/// Build the hermetic (clock/rng/env) config from the `meow run` grant flags. No
+/// flags = fully deterministic (I-6); each `--allow-*` flips one source (A6).
+fn hermetic_config(args: &RunArgs) -> meow_runtime::hermetic::HermeticConfig {
+    let mut cfg = meow_runtime::hermetic::HermeticConfig::default();
+    if args.allow_clock {
+        cfg = cfg.with_real_clock();
+    }
+    if args.allow_random {
+        cfg = cfg.with_os_rng();
+    }
+    if let Some(names) = &args.allow_env {
+        cfg = if names.is_empty() {
+            cfg.with_env_all()
+        } else {
+            cfg.with_env_allow(
+                names
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+            )
+        };
+    }
+    cfg
+}
+// === /RT-006 ===
+
 // === RT-001 ===
 /// `meow run <file>`: canonicalize the named entry -> `file:` URL -> drive one
 /// ESM module to completion through V8. The binary edge owns host access (cwd via
 /// canonicalize) and error rendering; `meow-runtime` stays free of ambient reads
 /// (I-6). Plain JS/ESM (`.js`/`.mjs`) executes; a `.ts` entry fails honestly
 /// (TypeScript needs the type-strip, RT-003) via a `RuntimeError::Module`.
-fn cmd_run(entry: &std::path::Path, argv: &[String]) -> ExitCode {
+fn cmd_run(
+    entry: &std::path::Path,
+    argv: &[String],
+    hermetic: meow_runtime::hermetic::HermeticConfig,
+) -> ExitCode {
     if !argv.is_empty() {
         eprintln!("meow run: forwarding program arguments (after `--`) is not yet supported");
         return ExitCode::FAILURE;
@@ -318,11 +367,18 @@ fn cmd_run(entry: &std::path::Path, argv: &[String]) -> ExitCode {
         // is `AllowAll` (seam, not enforcement — SEC-001/P6). The seam value is
         // `Send + Sync` because deno_fetch resolves hosts on a spawned task.
         let caps: meow_runtime::web::NetCaps = std::sync::Arc::new(meow_runtime::AllowAll);
-        let extensions = meow_runtime::web::extensions(meow_runtime::web::WebOptions {
+        let mut extensions = meow_runtime::web::extensions(meow_runtime::web::WebOptions {
             caps,
             user_agent: format!("meow/{}", env!("CARGO_PKG_VERSION")),
         });
         // === /RT-004 ===
+
+        // === RT-006 ===
+        // Determinism shadows AFTER the Web globals so they rebind the real
+        // Date/crypto/performance. Deterministic by default; the --allow-* flags
+        // built `hermetic` (A6). Append, never replace.
+        extensions.extend(meow_runtime::hermetic::extensions(hermetic));
+        // === /RT-006 ===
 
         let mut runtime = match meow_runtime::Runtime::new(meow_runtime::RuntimeOptions {
             module_loader: loader,
