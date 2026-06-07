@@ -52,8 +52,8 @@
     { "id": "DF-002", "severity": "low", "tag": "craft", "summary": "craft-7 majors (PASS): M3 TZ/locale determinism CLOSED (b04cc91, pin UTC+en-US). Follow-ups: M1 condition priority vs Node (documented divergence); M2 fetch/serve two cap handles (AllowAll, SEC-001 unifies).", "ref": "harness/reality-checks/craft-7.md" }
   ],
   "decisions": {
-    "open": 0,
-    "max_severity": "none",
+    "open": 16,
+    "max_severity": "low",
     "needs_input": 0,
     "ref": "decisions.json"
   },
@@ -65,7 +65,7 @@
       "harness/PLAN.md",
       "harness/CANON.md"
     ],
-    "active": "P1 (MVP) COMPLETE - all 5 wave-2 specs merged + gated (RT-004/006/CFG-002/LOAD-003/RT-005). meow run a TS meow:http web server end-to-end, no node_modules, deterministic by default; floor + craft(7 PASS) + footprint(25MB gzip) + types-fresh + resolver-parity green. MVP exit met.",
-    "next_pull_hint": "P2 Packages & Resolution: PKG-002 install+integrity, PKG-003 PnP + --materialize, LSP-001 shared resolver. Follow-ups: craft DF-002 (unify cap handle; pin V8 UTC)."
+    "active": "P2 (Packages & Resolution) SPECCED - 5 specs drafted + committed (PKG-002 install, PKG-003 ResolutionGraph/PnP, PKG-004 materialize, OBS-001 why-dep, LSP-001 shared-resolver) to the depth bar, IRC-coordinated on the shared ResolutionGraph + Resolver::from_resolution contract. P1 MVP complete + gated. 16 open assumption forks in decisions.json for review.",
+    "next_pull_hint": "Build P2: implement PKG-002 (install; populates the cache LOAD-003 resolves) first, then PKG-003/004 (PnP+materialize, ADR-4), OBS-001, LSP-001; gate each. Review the 16 decisions.json forks."
   }
 }
