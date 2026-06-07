@@ -112,6 +112,12 @@ pub fn extensions(opts: WebOptions) -> Vec<Extension> {
 fn fetch_extensions(caps: NetCaps, user_agent: String) -> Vec<Extension> {
     use deno_permissions::PermissionsContainer;
 
+    // Ensure rustls has a process-default crypto provider before any TLS use.
+    // PKG-002's `ureq` pulled rustls' `ring` provider, so with deno_fetch's
+    // aws-lc-rs ALSO linked, rustls' default is ambiguous and deno_fetch's
+    // get_default() panics — install aws-lc-rs (its expected provider) once.
+    ensure_crypto_provider();
+
     let parser = Arc::new(perms::NoopDescriptorParser);
     let perms_container = PermissionsContainer::allow_all(parser);
 
@@ -139,4 +145,17 @@ fn fetch_extensions(caps: NetCaps, user_agent: String) -> Vec<Extension> {
             ..Default::default()
         },
     ]
+}
+
+/// Install the process-wide rustls crypto-provider default once (aws-lc-rs, the
+/// provider deno_fetch expects). Needed because PKG-002's `ureq` HTTPS client adds
+/// the `ring` provider, leaving rustls with two providers and no auto-default. The
+/// `Once` makes it idempotent + thread-safe; an Err means a default is already set
+/// (fine — any installed default stops the panic). web-fetch-gated.
+#[cfg(feature = "web-fetch")]
+fn ensure_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
 }

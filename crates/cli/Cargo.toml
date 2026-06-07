@@ -28,6 +28,10 @@ meow-pkg = { path = "../pkg" }
 meow-graph = { path = "../graph" }
 # Typed, causal edge errors (lockfile ambiguity surfaced honestly to `meow run`).
 thiserror = { workspace = true }
+# === PKG-002 ===
+semver = { workspace = true }
+ureq = { workspace = true }
+# === /PKG-002 ===
 # === /LOAD-001 ===
 
 [dev-dependencies]

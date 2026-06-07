@@ -52,6 +52,13 @@ predicates = "3"
 sha2 = "0.10"
 base64 = "0.22"
 semver = "1"
+# === PKG-002 ===
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
+# rustls is already in the tree (deno_fetch's TLS). Declared so the runtime can
+# install the aws-lc-rs crypto-provider default before fetch's first TLS use —
+# ureq's `ring` provider above otherwise makes rustls' process default ambiguous.
+rustls = "0.23"
+# === /PKG-002 ===
 # === /PKG-001 ===
 # === GRAPH-001 ===
 # The ONE parser (I-1, P15): Oxc sub-crates pinned together at one generation. The

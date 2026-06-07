@@ -7,7 +7,8 @@
 //! real by replacing its dispatch arm; the exhaustive `match` in [`Command::landing`]
 //! makes it a compile error to add a verb without wiring it.
 
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -96,6 +97,11 @@ pub struct InstallArgs {
     /// Virtual-store install mode (CANON §18; PKG owns the final flag surface).
     #[arg(long, value_enum, default_value_t = InstallMode::Pnp)]
     pub mode: InstallMode,
+    // === PKG-002 ===
+    /// Optional package specifier(s) to add before installing, e.g. `lodash` or `p-limit@^5`.
+    #[arg(value_name = "PKG")]
+    pub packages: Vec<String>,
+    // === /PKG-002 ===
 }
 
 #[derive(Debug, Args)]
@@ -196,6 +202,9 @@ impl Cli {
             // === CFG-001 ===
             Command::Sync => cmd_sync(),
             // === /CFG-001 ===
+            // === PKG-002 ===
+            Command::Install(args) => cmd_install(&args),
+            // === /PKG-002 ===
             // === RT-005 ===
             Command::Types(args) => cmd_types(&args),
             // === /RT-005 ===
@@ -411,6 +420,272 @@ fn cmd_doctor() -> ExitCode {
 }
 // === /CFG-002 ===
 
+// === PKG-002 ===
+const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org";
+
+/// Production npm registry client. Lives at the CLI edge so `meow-pkg` stays
+/// network-free; all registry I/O is explicit here.
+struct NpmRegistry {
+    base: String,
+}
+
+impl NpmRegistry {
+    fn npm() -> NpmRegistry {
+        NpmRegistry {
+            base: NPM_REGISTRY_URL.to_owned(),
+        }
+    }
+
+    fn base_url(&self) -> &str {
+        &self.base
+    }
+
+    fn metadata_url(&self, name: &meow_pkg::PackageName) -> String {
+        format!("{}/{}", self.base, encode_package_name(name))
+    }
+}
+
+impl meow_pkg::RegistrySource for NpmRegistry {
+    fn fetch_metadata(
+        &self,
+        name: &meow_pkg::PackageName,
+    ) -> Result<meow_pkg::PackageMetadata, meow_pkg::RegistryError> {
+        let url = self.metadata_url(name);
+        let mut response = match ureq::get(&url).call() {
+            Ok(response) => response,
+            Err(ureq::Error::StatusCode(status)) => {
+                return Err(meow_pkg::RegistryError::Status { url, status });
+            }
+            Err(err) => {
+                return Err(meow_pkg::RegistryError::Fetch {
+                    target: url,
+                    reason: err.to_string(),
+                });
+            }
+        };
+        response
+            .body_mut()
+            .read_json::<meow_pkg::PackageMetadata>()
+            .map_err(|err| meow_pkg::RegistryError::Metadata {
+                name: name.to_string(),
+                reason: err.to_string(),
+            })
+    }
+
+    fn fetch_tarball(&self, url: &str) -> Result<Vec<u8>, meow_pkg::RegistryError> {
+        let mut response = match ureq::get(url).call() {
+            Ok(response) => response,
+            Err(ureq::Error::StatusCode(status)) => {
+                return Err(meow_pkg::RegistryError::Status {
+                    url: url.to_owned(),
+                    status,
+                });
+            }
+            Err(err) => {
+                return Err(meow_pkg::RegistryError::Fetch {
+                    target: url.to_owned(),
+                    reason: err.to_string(),
+                });
+            }
+        };
+        response
+            .body_mut()
+            .read_to_vec()
+            .map_err(|err| meow_pkg::RegistryError::Fetch {
+                target: url.to_owned(),
+                reason: err.to_string(),
+            })
+    }
+}
+
+/// `meow install`: resolve declared deps, populate the cache, and write the lockfile.
+fn cmd_install(args: &InstallArgs) -> ExitCode {
+    match args.mode {
+        InstallMode::Pnp => {}
+        InstallMode::Vfs | InstallMode::Materialize | InstallMode::Vendor => {
+            eprintln!(
+                "meow install: `--mode {}` lands in PKG-004 (P2)",
+                install_mode_name(&args.mode)
+            );
+            return ExitCode::from(EXIT_UNIMPLEMENTED);
+        }
+    }
+
+    let root = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            eprintln!("meow install: cannot resolve the current directory: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let registry = NpmRegistry::npm();
+    let mut cfg = match load_install_config(&root) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            eprintln!("meow install: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    for package in &args.packages {
+        let (name, req) = match requested_dependency(&registry, package) {
+            Ok(dep) => dep,
+            Err(err) => {
+                eprintln!("meow install: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        cfg.dependencies.insert(name, req);
+    }
+
+    if !args.packages.is_empty() {
+        if let Err(err) = meow_config::write_json_config(&cfg, &root) {
+            eprintln!("meow install: {err}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    let cache = meow_pkg::Cache::in_home(crate::host::host_home());
+    let meow_req = match runtime_meow_requirement() {
+        Ok(req) => req,
+        Err(err) => {
+            eprintln!("meow install: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let direct = cfg
+        .dependencies
+        .iter()
+        .map(|(name, req)| (name.clone(), meow_pkg::DepSpec::Range(req.clone())))
+        .collect::<BTreeMap<_, _>>();
+    let lockfile = match meow_pkg::Installer::new(&registry, &cache, registry.base_url(), meow_req)
+        .resolve(&direct)
+    {
+        Ok(lockfile) => lockfile,
+        Err(err) => {
+            eprintln!("meow install: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let lock_path = root.join("meow.lock.jsonl");
+    if let Err(err) = lockfile.write_canonical(&lock_path) {
+        eprintln!("meow install: {err}");
+        return ExitCode::FAILURE;
+    }
+    if let Err(err) = meow_config::generate_root_package_json(&cfg, &root) {
+        eprintln!("meow install: {err}");
+        return ExitCode::FAILURE;
+    }
+
+    println!(
+        "installed {} packages → {} (no node_modules)",
+        lockfile.len(),
+        lock_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("meow.lock.jsonl")
+    );
+    ExitCode::SUCCESS
+}
+
+fn load_install_config(root: &Path) -> Result<meow_config::MeowConfig, String> {
+    match meow_config::MeowConfig::load(root) {
+        Ok(cfg) => Ok(cfg),
+        Err(meow_config::ConfigError::NotFound(_)) => Ok(meow_config::MeowConfig::default()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn requested_dependency(
+    registry: &NpmRegistry,
+    raw: &str,
+) -> Result<(meow_pkg::PackageName, meow_pkg::VersionReq), String> {
+    let (name, maybe_req) = split_package_arg(raw)?;
+    let requirement = match maybe_req {
+        Some(req) => resolve_requested_requirement(registry, &name, req)?,
+        None => dist_tag_requirement(registry, &name, "latest")?,
+    };
+    Ok((name, requirement))
+}
+
+fn split_package_arg(raw: &str) -> Result<(meow_pkg::PackageName, Option<&str>), String> {
+    if raw.is_empty() {
+        return Err("empty package specifier".to_owned());
+    }
+    let split_at = raw
+        .rmatch_indices('@')
+        .find_map(|(idx, _)| (idx > 0).then_some(idx));
+    let (name, req) = match split_at {
+        Some(idx) => (&raw[..idx], Some(&raw[idx + 1..])),
+        None => (raw, None),
+    };
+    if name.is_empty() {
+        return Err(format!(
+            "invalid package specifier {raw:?}: missing package name"
+        ));
+    }
+    if matches!(req, Some("")) {
+        return Err(format!(
+            "invalid package specifier {raw:?}: missing range after `@`"
+        ));
+    }
+    Ok((meow_pkg::PackageName::new(name), req))
+}
+
+fn resolve_requested_requirement(
+    registry: &NpmRegistry,
+    name: &meow_pkg::PackageName,
+    raw_req: &str,
+) -> Result<meow_pkg::VersionReq, String> {
+    match meow_pkg::VersionReq::parse(raw_req) {
+        Ok(req) => Ok(req),
+        Err(_) => dist_tag_requirement(registry, name, raw_req),
+    }
+}
+
+fn dist_tag_requirement(
+    registry: &NpmRegistry,
+    name: &meow_pkg::PackageName,
+    tag: &str,
+) -> Result<meow_pkg::VersionReq, String> {
+    let metadata = meow_pkg::RegistrySource::fetch_metadata(registry, name)
+        .map_err(|err| format!("cannot resolve {name}: {err}"))?;
+    let version = metadata
+        .dist_tags
+        .get(tag)
+        .ok_or_else(|| {
+            format!(
+                "unsupported requirement {tag:?} for {name}: meow install accepts semver ranges or npm dist-tags"
+            )
+        })?;
+    meow_pkg::VersionReq::parse(&format!("^{}", version.as_str())).map_err(|err| {
+        format!("cannot record resolved dist-tag {tag:?} for {name} as a semver requirement: {err}")
+    })
+}
+
+fn runtime_meow_requirement() -> Result<meow_pkg::VersionReq, String> {
+    let version = semver::Version::parse(env!("CARGO_PKG_VERSION"))
+        .map_err(|err| format!("invalid CLI version metadata: {err}"))?;
+    meow_pkg::VersionReq::parse(&format!("^{}.{}", version.major, version.minor))
+        .map_err(|err| format!("cannot derive runtime meow requirement: {err}"))
+}
+
+fn encode_package_name(name: &meow_pkg::PackageName) -> String {
+    name.as_str().replace('/', "%2f")
+}
+
+fn install_mode_name(mode: &InstallMode) -> &'static str {
+    match mode {
+        InstallMode::Pnp => "pnp",
+        InstallMode::Vfs => "vfs",
+        InstallMode::Materialize => "materialize",
+        InstallMode::Vendor => "vendor",
+    }
+}
+// === /PKG-002 ===
+
 // === RT-006 ===
 /// Build the hermetic (clock/rng/env) config from the `meow run` grant flags. No
 /// flags = fully deterministic (I-6); each `--allow-*` flips one source (A6).
@@ -507,13 +782,15 @@ fn cmd_run(
                 return ExitCode::FAILURE;
             }
         };
-        let root_deps = match root_deps_from_lockfile(&lockfile) {
+        // === PKG-002 ===
+        let root_deps = match load_declared_root_deps(&project_dir, &lockfile) {
             Ok(deps) => deps,
             Err(err) => {
                 eprintln!("meow run: {err}");
                 return ExitCode::FAILURE;
             }
         };
+        // === /PKG-002 ===
         let loader: std::rc::Rc<dyn meow_runtime::deno_core::ModuleLoader> =
             std::rc::Rc::new(meow_loader::MeowModuleLoader::new(
                 meow_loader::Resolver::new(
@@ -613,27 +890,41 @@ fn load_lockfile(
     meow_pkg::Lockfile::read(&lock_path)
 }
 
-/// Derive the project's direct-dependency map from the lockfile as a P1 stand-in:
-/// real direct-vs-transitive tracking arrives with `meow install` (PKG-002/P2).
-/// Each name maps to its single pinned version; a name pinned at multiple versions
-/// is an ambiguous root (which is the direct dependency?) and fails honestly rather
-/// than silently picking one (LOAD-003 supports multi-version transitively, but a
-/// root must be unambiguous).
-fn root_deps_from_lockfile(
+// === PKG-002 ===
+/// Derive runtime roots from the declared config when available. A missing config
+/// keeps the P1 fallback (unique lockfile names only) so local-only runs still work;
+/// a TS-only config with a non-empty lockfile is an honest error until config TS
+/// evaluation lands.
+fn load_declared_root_deps(
+    project_root: &Path,
     lockfile: &meow_pkg::Lockfile,
-) -> Result<std::collections::BTreeMap<meow_pkg::PackageName, meow_pkg::Version>, String> {
-    let mut deps = std::collections::BTreeMap::new();
+) -> Result<BTreeMap<meow_pkg::PackageName, meow_pkg::Version>, String> {
+    match meow_config::MeowConfig::load(project_root) {
+        Ok(cfg) => meow_pkg::resolve_roots(&cfg.dependencies, lockfile).map_err(|err| err.to_string()),
+        Err(meow_config::ConfigError::NotFound(_)) => fallback_root_deps_from_lockfile(lockfile),
+        Err(meow_config::ConfigError::TsNotSupported) if lockfile.is_empty() => Ok(BTreeMap::new()),
+        Err(meow_config::ConfigError::TsNotSupported) => Err(
+            "meow.config.ts exists but cannot be evaluated yet, so root dependencies cannot be derived from a non-empty meow.lock.jsonl; provide meow.config.json for now".to_owned(),
+        ),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn fallback_root_deps_from_lockfile(
+    lockfile: &meow_pkg::Lockfile,
+) -> Result<BTreeMap<meow_pkg::PackageName, meow_pkg::Version>, String> {
+    let mut deps = BTreeMap::new();
     for entry in lockfile.iter() {
         if let Some(prev) = deps.insert(entry.name.clone(), entry.version.clone()) {
             return Err(format!(
-                "lockfile pins multiple versions of `{}` ({prev}, {}) — which is the \
-                 direct dependency is ambiguous; `meow install` will pin it (P2)",
+                "lockfile pins multiple versions of `{}` ({prev}, {}) — root resolution is ambiguous without meow.config dependencies; run `meow install` or add meow.config.json",
                 entry.name, entry.version
             ));
         }
     }
     Ok(deps)
 }
+// === /PKG-002 ===
 // === /LOAD-001 ===
 
 #[cfg(test)]

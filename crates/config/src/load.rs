@@ -30,6 +30,13 @@ pub enum ConfigError {
     )]
     TsNotSupported,
 
+    #[error("failed to render config at {path}: {source}")]
+    Serialize {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+
     #[error("failed to {action} {path}: {source}")]
     Io {
         action: &'static str,

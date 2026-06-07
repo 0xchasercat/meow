@@ -50,7 +50,6 @@ fn version_and_help_succeed() {
 /// `(argv, verb, phase)` for every subcommand, with minimal valid args.
 const CASES: &[(&[&str], &str, &str)] = &[
     (&["dev", "x.ts"], "dev", "P1"),
-    (&["install"], "install", "P2"),
     (&["add", "p"], "add", "P2"),
     (&["remove", "p"], "remove", "P2"),
     (&["task", "t"], "task", "P4"),
@@ -70,8 +69,8 @@ const CASES: &[(&[&str], &str, &str)] = &[
 fn every_subcommand_stub_is_honest() {
     assert_eq!(
         CASES.len(),
-        15,
-        "15 stub subcommands (sync + run real — CFG-001/RT-001; doctor real — CFG-002)"
+        14,
+        "14 stub subcommands (sync + run real — CFG-001/RT-001; install real — PKG-002; doctor real — CFG-002)"
     );
     for (argv, verb, phase) in CASES {
         let expected = format!("meow: not yet implemented — `{verb}` lands in PLAN {phase}");
@@ -82,6 +81,16 @@ fn every_subcommand_stub_is_honest() {
             .stdout(predicate::str::is_empty())
             .stderr(predicate::str::contains(expected));
     }
+}
+
+#[test]
+fn install_non_pnp_modes_remain_honest_stubs() {
+    meow()
+        .args(["install", "--mode", "materialize"])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("PKG-004"));
 }
 
 #[test]
@@ -274,6 +283,11 @@ fn run_imports_a_cached_dependency_with_no_node_modules() {
     lockfile
         .write_canonical(&proj.join("meow.lock.jsonl"))
         .expect("write lockfile");
+    std::fs::write(
+        proj.join("meow.config.json"),
+        br#"{ "dependencies": { "dep": "^1.0.0" } }"#,
+    )
+    .expect("write config");
 
     let entry = proj.join("main.ts");
     std::fs::write(
@@ -349,6 +363,11 @@ fn run_finds_root_lockfile_from_a_nested_entry() {
     lockfile
         .write_canonical(&proj.join("meow.lock.jsonl"))
         .expect("write lockfile");
+    std::fs::write(
+        proj.join("meow.config.json"),
+        br#"{ "dependencies": { "dep": "^1.0.0" } }"#,
+    )
+    .expect("write config");
 
     let src = proj.join("src");
     std::fs::create_dir_all(&src).expect("src dir");
@@ -410,6 +429,99 @@ fn run_rejects_a_lockfile_with_duplicate_package_names() {
         .stderr(predicate::str::contains("1.0.0"))
         .stderr(predicate::str::contains("2.0.0"))
         .stderr(predicate::str::contains("panicked").not());
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[test]
+#[ignore = "real network reality-check"]
+fn install_real_registry_package_and_run_without_node_modules() {
+    use meow_pkg::{resolve_roots, Lockfile, PackageName, VersionReq};
+
+    let proj = load_tmp("real-install");
+    let home = proj.join("home");
+    std::fs::create_dir_all(&home).expect("home dir");
+
+    let first = meow()
+        .env("HOME", &home)
+        .current_dir(&proj)
+        .args(["install", "camelcase-keys@^10"])
+        .output()
+        .expect("run install");
+    assert!(first.status.success(), "install failed: {first:?}");
+    let first_stdout = String::from_utf8_lossy(&first.stdout);
+    assert!(
+        first_stdout.contains("installed "),
+        "stdout was {first_stdout:?}"
+    );
+    assert!(
+        !proj.join("node_modules").exists(),
+        "install must not materialize node_modules"
+    );
+
+    let lock_path = proj.join("meow.lock.jsonl");
+    let first_lock = std::fs::read(&lock_path).expect("read lockfile");
+    let lockfile = Lockfile::read(&lock_path).expect("parse lockfile");
+    assert!(
+        lockfile
+            .iter()
+            .any(|entry| entry.name == PackageName::new("camelcase-keys")),
+        "root package pinned"
+    );
+    assert!(
+        lockfile
+            .iter()
+            .any(|entry| entry.name == PackageName::new("map-obj")),
+        "transitive dependency pinned"
+    );
+
+    let cfg = meow_config::MeowConfig::load(&proj).expect("load written config");
+    let roots = resolve_roots(&cfg.dependencies, &lockfile).expect("resolve roots");
+    assert!(
+        roots.contains_key(&PackageName::new("camelcase-keys")),
+        "config + lockfile derive the runtime root"
+    );
+    assert_eq!(
+        cfg.dependencies
+            .get(&PackageName::new("camelcase-keys"))
+            .expect("written dependency"),
+        &VersionReq::parse("^10").expect("req")
+    );
+
+    let entry = proj.join("main.ts");
+    std::fs::write(
+        &entry,
+        "import camelcaseKeys from \"camelcase-keys\";\n\
+         console.log(JSON.stringify(camelcaseKeys({\"foo-bar\": true})));\n",
+    )
+    .expect("write entry");
+
+    meow()
+        .env("HOME", &home)
+        .current_dir(&proj)
+        .arg("run")
+        .arg(&entry)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("{\"fooBar\":true}"));
+    assert!(
+        !proj.join("node_modules").exists(),
+        "run must resolve from the cache, not node_modules"
+    );
+
+    std::fs::remove_file(&lock_path).expect("remove first lockfile");
+    let second = meow()
+        .env("HOME", &home)
+        .current_dir(&proj)
+        .arg("install")
+        .output()
+        .expect("run reinstall");
+    assert!(second.status.success(), "reinstall failed: {second:?}");
+    let second_lock = std::fs::read(&lock_path).expect("read second lockfile");
+    assert_eq!(
+        first_lock, second_lock,
+        "lockfile bytes must be deterministic"
+    );
+
     std::fs::remove_dir_all(&proj).ok();
 }
 // === /LOAD-001 ===

@@ -6,10 +6,10 @@
 //! - I-11 (`honesty`): the TS-eval boundary is reported, never faked.
 
 use meow_config::{
-    classify_root_package_json, generate_root_package_json, generate_shadow_tsconfig,
-    render_root_package_json, write_root_tsconfig_shim, write_shadow_types, ConfigError,
-    MeowConfig, PackageJsonStatus, Publish, GENERATED_HEADER, PACKAGE_JSON_MARKER,
-    ROOT_TSCONFIG_SHIM,
+    add_dependency, classify_root_package_json, generate_root_package_json,
+    generate_shadow_tsconfig, remove_dependency, render_root_package_json,
+    write_root_tsconfig_shim, write_shadow_types, ConfigError, MeowConfig, PackageJsonStatus,
+    PackageName, Publish, VersionReq, GENERATED_HEADER, PACKAGE_JSON_MARKER, ROOT_TSCONFIG_SHIM,
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -217,6 +217,57 @@ fn load_minimal_config_takes_canon_defaults() {
     assert_eq!(cfg, MeowConfig::default());
     assert!(cfg.types.strict, "types.strict defaults true");
     assert!(cfg.test.isolate, "test.isolate defaults true");
+}
+
+#[test]
+fn load_dependencies_are_typed() {
+    let tmp = TempDir::new();
+    std::fs::write(
+        tmp.path().join("meow.config.json"),
+        br#"{ "dependencies": { "p-limit": "^5.0.0" } }"#,
+    )
+    .expect("seed deps");
+
+    let cfg = MeowConfig::load(tmp.path()).expect("config with deps loads");
+    assert_eq!(
+        cfg.dependencies
+            .get(&PackageName::new("p-limit"))
+            .expect("typed dep")
+            .as_str(),
+        "^5.0.0"
+    );
+    assert!(
+        MeowConfig::default().dependencies.is_empty(),
+        "default deps empty"
+    );
+}
+
+#[test]
+fn add_and_remove_dependency_round_trip_json_config() {
+    let tmp = TempDir::new();
+    let added = add_dependency(
+        tmp.path(),
+        PackageName::new("dep"),
+        VersionReq::parse("^1.2.3").expect("range"),
+    )
+    .expect("add dep");
+    assert_eq!(
+        added
+            .dependencies
+            .get(&PackageName::new("dep"))
+            .expect("added dep")
+            .as_str(),
+        "^1.2.3"
+    );
+
+    let loaded = MeowConfig::load(tmp.path()).expect("load added dep");
+    assert_eq!(loaded.dependencies, added.dependencies);
+
+    let removed = remove_dependency(tmp.path(), &PackageName::new("dep")).expect("remove dep");
+    assert!(
+        removed.dependencies.is_empty(),
+        "dependency removed from persisted config"
+    );
 }
 
 // --- mapping fidelity -------------------------------------------------------------

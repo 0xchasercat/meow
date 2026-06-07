@@ -19,14 +19,21 @@
 mod cache;
 mod error;
 mod hash;
+mod install;
 mod lockfile;
+mod registry;
 
 use std::path::{Path, PathBuf};
 
 pub use cache::Cache;
 pub use error::{CacheError, LockError, ParseHashError, ParseVersionError};
 pub use hash::{ContentHash, HashAlgo, PackageName, Version, VersionReq};
+pub use install::{resolve_roots, InstallError, Installer, PkgInstallError, RootResolveError};
 pub use lockfile::{CapabilityGrant, LockEntry, Lockfile, RegistryProvenance};
+pub use registry::{
+    DepSpec, DistInfo, FixtureRegistry, PackageMetadata, RegistryError, RegistrySource,
+    VersionMetadata,
+};
 
 /// Sibling temp path for an atomic write: write `<path>.tmp`, then `rename` it
 /// onto `<path>`. Shared by the lockfile writer and the cache store.

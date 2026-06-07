@@ -8,6 +8,7 @@
 //! is one closed schema). Maps use `BTreeMap` so serialization is deterministically
 //! key-sorted, which feeds byte-stable shadow regeneration.
 
+use meow_pkg::{PackageName, VersionReq};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -34,6 +35,13 @@ pub struct MeowConfig {
     pub test: TestConfig,
     #[serde(default)]
     pub permissions: Permissions,
+    // === PKG-002 ===
+    /// Direct dependencies: package name -> semver requirement. This is the SINGLE
+    /// human-edited dependency source; `meow install` resolves and pins it into
+    /// `meow.lock.jsonl`. `BTreeMap` keeps JSON key order byte-stable.
+    #[serde(default)]
+    pub dependencies: BTreeMap<PackageName, VersionReq>,
+    // === /PKG-002 ===
     // === CFG-002 ===
     /// Publishing metadata projected into the generated root `package.json` (ADR-8).
     /// `meow.config.ts` is the SOLE authority for that file; package.json is derived.
