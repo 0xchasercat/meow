@@ -45,11 +45,11 @@
     "strip-fidelity": { "status": "green", "at": "2026-06-07T17:30:00Z", "evidence_ref": "harness/reality-checks/strip-fidelity-1.md" },
     "types-fresh": { "status": "green", "at": "2026-06-08T01:45:00Z", "evidence_ref": "RT-005 meow types --check fresh; committed crates/runtime/types/meow" },
     "resolver-parity": { "status": "green", "at": "2026-06-08T01:45:00Z", "evidence_ref": "LOAD-003 resolution_corpus; one Resolver for runtime+LSP" },
-    "determinism": { "status": "green", "at": "2026-06-08T01:45:00Z", "evidence_ref": "RT-006 hermetic; meow run byte-identical (TZ/locale residual named)" }
+    "determinism": { "status": "green", "at": "2026-06-08T02:30:00Z", "evidence_ref": "RT-006 hermetic; meow run byte-identical incl. Date/Intl (TZ+locale pinned UTC/en-US, M3 closed b04cc91)" }
   },
   "drift_flags": [
     { "id": "DF-001", "severity": "low", "tag": "process", "summary": "Two autonomous builders ran wave-2 concurrently; all commits integrated, floor+craft green. Resolved - wave-2 converged; coordinate committers before P2.", "ref": "git 451855c,2a97cef,99415f8,b2c7500" },
-    { "id": "DF-002", "severity": "medium", "tag": "craft", "summary": "craft-7 majors (PASS): M1 condition fixed-priority vs Node order; M2 fetch/serve two cap handles (AllowAll, SEC-001 unifies); M3 TZ/locale not virtualized. Boundaries named; fixes follow-up.", "ref": "harness/reality-checks/craft-7.md" }
+    { "id": "DF-002", "severity": "low", "tag": "craft", "summary": "craft-7 majors (PASS): M3 TZ/locale determinism CLOSED (b04cc91, pin UTC+en-US). Follow-ups: M1 condition priority vs Node (documented divergence); M2 fetch/serve two cap handles (AllowAll, SEC-001 unifies).", "ref": "harness/reality-checks/craft-7.md" }
   ],
   "decisions": {
     "open": 0,
