@@ -55,6 +55,6 @@
       "harness/CANON.md"
     ],
     "active": "P0 COMPLETE — 8 wave-1 specs merged; meow run x.ts strips+runs through V8, deps from cache, no node_modules. Phase -> P1 (MVP).",
-    "next_pull_hint": "Draft wave-2 (P1/MVP) specs from PLAN: RT-004 strict-web Stateless-Edge globals, RT-005 meow:http + meow:* type-gen, RT-006 determinism harness, LOAD-003 full Node resolution, CFG-002 root package.json; then implement + gate each."
+    "next_pull_hint": "Draft wave-2 (P1/MVP) specs from PLAN: RT-004 strict-web globals, RT-005 meow:http + type-gen, RT-006 determinism, LOAD-003 Node resolution, CFG-002 root package.json; then implement+gate."
   }
 }
