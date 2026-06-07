@@ -413,3 +413,46 @@ fn run_rejects_a_lockfile_with_duplicate_package_names() {
     std::fs::remove_dir_all(&proj).ok();
 }
 // === /LOAD-001 ===
+
+// === RT-006 ===
+#[test]
+fn run_is_intl_deterministic_across_tz_and_locale() {
+    // craft-7 M3: under the default (virtual) clock, Date/Intl rendering must be
+    // identical regardless of the host timezone + locale (pin_deterministic_intl
+    // pins TZ=UTC + a fixed default locale before the isolate is created).
+    let tmp = load_tmp("intl");
+    let entry = tmp.join("intl.ts");
+    std::fs::write(
+        &entry,
+        "console.log(new Date().toString() + \"|\" + \
+         new Intl.DateTimeFormat().resolvedOptions().locale + \"|\" + \
+         (1234.5).toLocaleString());\n",
+    )
+    .expect("write entry");
+
+    let run = |tz: &str, lang: &str| -> String {
+        let out = meow()
+            .env("TZ", tz)
+            .env("LANG", lang)
+            .env("LC_ALL", lang)
+            .arg("run")
+            .arg(&entry)
+            .output()
+            .expect("run meow");
+        assert!(out.status.success(), "run failed: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    let ny_fr = run("America/New_York", "fr_FR.UTF-8");
+    let tokyo_ja = run("Asia/Tokyo", "ja_JP.UTF-8");
+    assert_eq!(
+        ny_fr, tokyo_ja,
+        "Date/Intl rendering must be deterministic across host TZ + locale"
+    );
+    assert!(
+        ny_fr.contains("GMT+0000") && ny_fr.contains("en-US"),
+        "default clock pins UTC + en-US, got: {ny_fr}"
+    );
+    std::fs::remove_dir_all(&tmp).ok();
+}
+// === /RT-006 ===

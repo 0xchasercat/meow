@@ -15,14 +15,13 @@
 //! the host). That soundness is tier-3 (CANON §24.3, SEC P7). The correct words
 //! are "hermetic by default" + "defense-in-depth," never "sandboxed"/"blocked".
 //!
-//! Honest boundary (I-11) — TIMEZONE/LOCALE: the virtual clock fixes the clock
-//! *value* (`Date.now`/`getTime`/`toISOString` are deterministic), but
-//! `Date.prototype.toString`/`getHours`/`toLocaleString` and `Intl` render in the
-//! host's local timezone/locale (V8 reads the OS). Local-rendered `Date` strings
-//! can therefore still differ across machines in different timezones. The
-//! determinism claim is scoped to clock *value* + RNG + env; TZ/locale rendering is
-//! a named P1 residual (CANON §24.3) — pinning V8 to UTC under the virtual clock is
-//! a follow-up, not done here.
+//! Timezone/locale (craft-7 M3, CLOSED): the virtual clock fixes the clock *value*,
+//! and [`pin_deterministic_intl`] additionally pins `TZ=UTC` + a fixed default
+//! locale before the V8 isolate is created, so `Date.prototype.toString`/`getHours`/
+//! `getTimezoneOffset` and locale-default `Intl`/`toLocaleString` render identically
+//! across host timezones + locales. Explicit-locale APIs (`Intl.NumberFormat("de-DE")`)
+//! are unaffected; `--allow-clock` opts into the real host environment (time + TZ +
+//! locale). The two-machine determinism claim now covers Date/Intl rendering.
 
 mod config;
 mod ops;
@@ -75,4 +74,25 @@ pub fn hermetic_config_extension(cfg: HermeticConfig) -> deno_core::Extension {
 /// is fully deterministic; grants flip individual sources.
 pub fn extensions(cfg: HermeticConfig) -> Vec<deno_core::Extension> {
     vec![meow_hermetic::init(), hermetic_config_extension(cfg)]
+}
+
+/// Pin the process timezone + default locale so V8 renders `Date`
+/// (`toString`/`getHours`/`getTimezoneOffset`) and `Intl` (`toLocaleString`,
+/// `Intl.*` with no explicit locale) deterministically under the virtual clock —
+/// closing the TZ/locale determinism residual (craft-7 M3). Without it, two
+/// machines in different host timezones/locales produce different output even with
+/// the clock value fixed (V8/ICU read `TZ` + `LC_ALL`/`LANG`).
+///
+/// MUST be called BEFORE the V8 isolate is created (ICU reads these at first use).
+/// No-op under the real clock — a `--allow-clock` grant deliberately opts into the
+/// real host environment (real time, timezone, and locale). Explicit-locale APIs
+/// (`Intl.NumberFormat("de-DE")`) are unaffected either way. The harness's one
+/// process-global host write, kept in the seam; a write, not an ambient *read*, so
+/// determinism holds.
+pub fn pin_deterministic_intl(cfg: &HermeticConfig) {
+    if matches!(cfg.clock, ClockSource::Virtual { .. }) {
+        std::env::set_var("TZ", "UTC");
+        std::env::set_var("LC_ALL", "en_US.UTF-8");
+        std::env::set_var("LANG", "en_US.UTF-8");
+    }
 }

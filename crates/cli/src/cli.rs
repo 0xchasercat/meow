@@ -551,6 +551,10 @@ fn cmd_run(
         // Determinism shadows AFTER the Web globals so they rebind the real
         // Date/crypto/performance. Deterministic by default; the --allow-* flags
         // built `hermetic` (A6). Append, never replace.
+        // Pin TZ=UTC + a fixed default locale under the virtual clock BEFORE the
+        // isolate is created, so V8 renders Date/Intl deterministically across host
+        // timezones + locales (craft-7 M3).
+        meow_runtime::hermetic::pin_deterministic_intl(&hermetic);
         extensions.extend(meow_runtime::hermetic::extensions(hermetic));
         // === /RT-006 ===
 
