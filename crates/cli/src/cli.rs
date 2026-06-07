@@ -164,6 +164,17 @@ pub struct BundleArgs {
 pub struct WhyDepArgs {
     /// Package to explain.
     pub pkg: String,
+    // === OBS-001 ===
+    /// Show one shortest chain per version instead of every chain.
+    #[arg(long)]
+    pub shortest: bool,
+    /// Emit machine-readable JSON (the serialized report) instead of prose.
+    #[arg(long)]
+    pub json: bool,
+    /// Max chains to enumerate per version before reporting truncation.
+    #[arg(long, default_value_t = meow_obs::DEFAULT_PATH_LIMIT)]
+    pub limit: usize,
+    // === /OBS-001 ===
 }
 
 impl Command {
@@ -221,6 +232,9 @@ impl Cli {
             // === CFG-002 ===
             Command::Doctor => cmd_doctor(),
             // === /CFG-002 ===
+            // === OBS-001 ===
+            Command::WhyDep(args) => cmd_why_dep(&args),
+            // === /OBS-001 ===
             other => {
                 let (verb, phase) = other.landing();
                 eprintln!("meow: not yet implemented — `{verb}` lands in PLAN {phase}");
@@ -419,6 +433,114 @@ fn cmd_doctor() -> ExitCode {
     }
 }
 // === /CFG-002 ===
+
+// === OBS-001 ===
+/// `meow why-dep <name>` — trace the dependency path(s) from the project's direct
+/// deps to <name>, read from meow.lock.jsonl (PKG-001). The binary edge owns the
+/// one ambient read (cwd); meow-obs stays host-pure + does no resolution (I-6, I-1).
+fn cmd_why_dep(args: &WhyDepArgs) -> ExitCode {
+    let root = match std::env::current_dir() {
+        Ok(dir) => find_project_root(&dir),
+        Err(err) => {
+            eprintln!("meow why-dep: cannot resolve the current directory: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let lockfile = match load_lockfile(&root) {
+        Ok(lf) => lf,
+        Err(err) => {
+            eprintln!("meow why-dep: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let config = match meow_config::MeowConfig::load(&root) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            eprintln!("meow why-dep: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let roots = match meow_pkg::resolve_roots(&config.dependencies, &lockfile) {
+        Ok(roots) => roots,
+        Err(err) => {
+            eprintln!("meow why-dep: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mode = if args.shortest {
+        meow_obs::PathMode::Shortest
+    } else {
+        meow_obs::PathMode::All
+    };
+    let target = meow_pkg::PackageName::new(args.pkg.clone());
+    let report = meow_obs::why_dep(&lockfile, &roots, &target, mode, args.limit);
+
+    if args.json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(json) => println!("{json}"),
+            Err(err) => {
+                eprintln!("meow why-dep: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+        return if report.found {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+
+    if !report.found {
+        eprintln!(
+            "meow: `{}` is not in the dependency tree (no path from any direct dependency in meow.lock.jsonl)",
+            args.pkg
+        );
+        return ExitCode::FAILURE;
+    }
+    render_why_dep(&report);
+    ExitCode::SUCCESS
+}
+
+/// Render a found `why-dep` report as prose chains (stdout).
+fn render_why_dep(report: &meow_obs::WhyDep) {
+    println!(
+        "{} is in the dependency tree — {} version(s).",
+        report.target,
+        report.versions.len()
+    );
+    println!("(each chain starts at a project direct dependency)");
+    for tv in &report.versions {
+        println!();
+        let integrity = match &tv.integrity {
+            Some(hash) => hash.to_sri(),
+            None => "none — referenced but not in lockfile".to_string(),
+        };
+        let direct = if tv.direct {
+            "  (direct dependency)"
+        } else {
+            ""
+        };
+        println!(
+            "{}@{}  integrity {integrity}{direct}",
+            tv.node.name, tv.node.version
+        );
+        for path in &tv.paths {
+            let chain: Vec<String> = path
+                .nodes
+                .iter()
+                .map(|n| format!("{}@{}", n.name, n.version))
+                .collect();
+            println!("  {}", chain.join(" → "));
+        }
+        if tv.truncated {
+            println!(
+                "  … showing first {} of more chains (raise with --limit)",
+                tv.paths.len()
+            );
+        }
+    }
+}
+// === /OBS-001 ===
 
 // === PKG-002 ===
 const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org";

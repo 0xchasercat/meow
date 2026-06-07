@@ -60,7 +60,6 @@ const CASES: &[(&[&str], &str, &str)] = &[
     (&["bundle", "x.ts"], "bundle", "P3"),
     (&["why-slow"], "why-slow", "P6"),
     (&["why-large"], "why-large", "P6"),
-    (&["why-dep", "p"], "why-dep", "P2"),
     (&["trace", "x.ts"], "trace", "P6"),
     (&["profile", "x.ts"], "profile", "P6"),
 ];
@@ -69,8 +68,8 @@ const CASES: &[(&[&str], &str, &str)] = &[
 fn every_subcommand_stub_is_honest() {
     assert_eq!(
         CASES.len(),
-        14,
-        "14 stub subcommands (sync + run real — CFG-001/RT-001; install real — PKG-002; doctor real — CFG-002)"
+        13,
+        "13 stub subcommands (sync/run — CFG-001/RT-001; install — PKG-002; doctor — CFG-002; why-dep — OBS-001)"
     );
     for (argv, verb, phase) in CASES {
         let expected = format!("meow: not yet implemented — `{verb}` lands in PLAN {phase}");
@@ -568,3 +567,132 @@ fn run_is_intl_deterministic_across_tz_and_locale() {
     std::fs::remove_dir_all(&tmp).ok();
 }
 // === /RT-006 ===
+
+// === OBS-001 ===
+fn why_dep_entry(name: &str, version: &str, deps: &[(&str, &str)]) -> meow_pkg::LockEntry {
+    meow_pkg::LockEntry {
+        name: meow_pkg::PackageName::new(name),
+        version: meow_pkg::Version::parse(version).expect("version"),
+        integrity: meow_pkg::ContentHash::of(format!("{name}@{version}").as_bytes()),
+        dependencies: deps
+            .iter()
+            .map(|(n, v)| {
+                (
+                    meow_pkg::PackageName::new(*n),
+                    meow_pkg::Version::parse(v).expect("dep version"),
+                )
+            })
+            .collect(),
+        registry: meow_pkg::RegistryProvenance::new("https://registry.npmjs.org"),
+        capabilities: vec![],
+        wasm: vec![],
+        meow: meow_pkg::VersionReq::parse(">=0.0.0").expect("req"),
+    }
+}
+
+/// Write a temp project: meow.config.json (declared deps) + a canonical lockfile.
+fn why_dep_project(
+    tag: &str,
+    config_deps: &[(&str, &str)],
+    entries: Vec<meow_pkg::LockEntry>,
+) -> std::path::PathBuf {
+    let proj = load_tmp(tag);
+    let deps_json: Vec<String> = config_deps
+        .iter()
+        .map(|(n, r)| format!("\"{n}\":\"{r}\""))
+        .collect();
+    std::fs::write(
+        proj.join("meow.config.json"),
+        format!("{{\"dependencies\":{{{}}}}}", deps_json.join(",")),
+    )
+    .expect("write config");
+    let mut lf = meow_pkg::Lockfile::new();
+    for e in entries {
+        lf.upsert(e);
+    }
+    lf.write_canonical(&proj.join("meow.lock.jsonl"))
+        .expect("write lockfile");
+    proj
+}
+
+#[test]
+fn why_dep_traces_the_chain() {
+    let proj = why_dep_project(
+        "whydep",
+        &[("a", "^1")],
+        vec![
+            why_dep_entry("a", "1.0.0", &[("target", "1.0.0")]),
+            why_dep_entry("target", "1.0.0", &[]),
+        ],
+    );
+    meow()
+        .current_dir(&proj)
+        .arg("why-dep")
+        .arg("target")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("a@1.0.0 → target@1.0.0"));
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[test]
+fn why_dep_not_found_exits_1_honestly() {
+    let proj = why_dep_project(
+        "whydepnf",
+        &[("a", "^1")],
+        vec![why_dep_entry("a", "1.0.0", &[])],
+    );
+    meow()
+        .current_dir(&proj)
+        .arg("why-dep")
+        .arg("ghost")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not in the dependency tree"))
+        .stderr(predicate::str::contains("panicked").not());
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[test]
+fn why_dep_malformed_lockfile_errors_without_panic() {
+    let proj = load_tmp("whydepbad");
+    std::fs::write(proj.join("meow.config.json"), "{\"dependencies\":{}}").expect("config");
+    std::fs::write(
+        proj.join("meow.lock.jsonl"),
+        "this is not canonical jsonl {{{\n",
+    )
+    .expect("lock");
+    meow()
+        .current_dir(&proj)
+        .arg("why-dep")
+        .arg("x")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("panicked").not());
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[test]
+fn why_dep_json_is_machine_readable() {
+    let proj = why_dep_project(
+        "whydepjson",
+        &[("a", "^1")],
+        vec![
+            why_dep_entry("a", "1.0.0", &[("target", "1.0.0")]),
+            why_dep_entry("target", "1.0.0", &[]),
+        ],
+    );
+    let out = meow()
+        .current_dir(&proj)
+        .arg("why-dep")
+        .arg("target")
+        .arg("--json")
+        .output()
+        .expect("run");
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json output");
+    assert_eq!(v["found"], true);
+    assert_eq!(v["versions"][0]["node"]["name"], "target");
+    std::fs::remove_dir_all(&proj).ok();
+}
+// === /OBS-001 ===

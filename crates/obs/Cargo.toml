@@ -1,0 +1,17 @@
+[package]
+name = "meow-obs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# OBS-001 `why-dep` reads the resolved dependency graph straight from the lockfile
+# (PKG-001) — no resolver, no cache, no network. `serde` only derives the report
+# shape for `--json`; the CLI owns the `serde_json` rendering + the cwd read (I-6).
+meow-pkg = { path = "../pkg" }
+serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+# Tests assert byte-stable `--json` output (determinism gate) over the report.
+serde_json = { workspace = true }

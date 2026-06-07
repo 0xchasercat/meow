@@ -33,6 +33,11 @@ semver = { workspace = true }
 ureq = { workspace = true }
 # === /PKG-002 ===
 # === /LOAD-001 ===
+# === OBS-001 ===
+# `meow why-dep` reuses the pure lockfile path-tracer; serde_json renders --json.
+meow-obs = { path = "../obs" }
+serde_json = { workspace = true }
+# === /OBS-001 ===
 
 [dev-dependencies]
 assert_cmd = { workspace = true }

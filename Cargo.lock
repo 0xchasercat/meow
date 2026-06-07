@@ -2743,10 +2743,12 @@ dependencies = [
  "meow-config",
  "meow-graph",
  "meow-loader",
+ "meow-obs",
  "meow-pkg",
  "meow-runtime",
  "predicates",
  "semver",
+ "serde_json",
  "tar",
  "thiserror 2.0.18",
  "tokio",
@@ -2793,6 +2795,15 @@ dependencies = [
  "tar",
  "thiserror 2.0.18",
  "tokio",
+]
+
+[[package]]
+name = "meow-obs"
+version = "0.0.0"
+dependencies = [
+ "meow-pkg",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
