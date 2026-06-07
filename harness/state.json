@@ -1,6 +1,6 @@
 {
   "version": 3,
-  "updated_at": "2026-06-07T23:30:00Z",
+  "updated_at": "2026-06-08T00:30:00Z",
   "mode": "incubating",
   "phase": {
     "id": "P1",
@@ -10,18 +10,18 @@
   "in_flight_agents": [],
   "subsystems": {
     "GRAPH": { "status": "active", "note": "GRAPH-001 + RT-003 merged: Oxc pipeline (single parser, I-1) + erasable type-strip (I-3)" },
-    "RT": { "status": "active", "note": "RT-001/002/004 merged: V8 embed, meow run, async I/O seam, strict-web globals (fetch/URL/crypto/TextEncoder)" },
-    "LOAD": { "status": "active", "note": "LOAD-001 merged: single resolver + cache-read + strip wiring; LOAD-003 (full Node resolution) next" },
+    "RT": { "status": "active", "note": "RT-001/002/004/006 merged: V8, meow run, async I/O seam, strict-web globals, determinism harness" },
+    "LOAD": { "status": "active", "note": "LOAD-001 merged: single resolver + cache-read + strip wiring; LOAD-003 (full Node resolution) remains" },
     "PKG": { "status": "active", "note": "PKG-001 merged: meow.lock.jsonl + content-addressed cache" },
     "WS": { "status": "planned", "note": "monorepo graph discovery + linking (P4)" },
     "TASK": { "status": "planned", "note": "typed tasks, in/out hashing, artifact->task (P4)" },
-    "TEST": { "status": "planned", "note": "isolate-per-file, deterministic clock (P6)" },
+    "TEST": { "status": "planned", "note": "isolate-per-file, deterministic clock (P6); RT-006 substrate ready" },
     "TOOL": { "status": "planned", "note": "lint/format/bundle over shared graph (P3)" },
     "CHK": { "status": "planned", "note": "delegated tsc/tsgo daemon (P3)" },
     "LSP": { "status": "planned", "note": "shared resolver + shadow symlink map (P2); enables resolver-parity gate" },
-    "SEC": { "status": "planned", "note": "capability tiers (RT-002/RT-004 seams ready), provenance (P6/P7)" },
+    "SEC": { "status": "planned", "note": "capability tiers (RT-002/004/006 seams ready), provenance (P6/P7)" },
     "OBS": { "status": "planned", "note": "why-slow/large/dep, trace, doctor (P6)" },
-    "CFG": { "status": "active", "note": "CFG-001 merged: defineMeow + shadow tsconfig + meow sync; CFG-002 (root package.json) next" },
+    "CFG": { "status": "active", "note": "CFG-001 + CFG-002 merged: defineMeow + shadow tsconfig + meow sync + root package.json projection" },
     "DIST": { "status": "active", "note": "DIST-001 merged: Cargo workspace + meow CLI skeleton" },
     "H": { "status": "planned", "note": "harness chores: hooks, CI, docs" }
   },
@@ -33,14 +33,18 @@
     { "id": 5, "specs": ["RT-003"], "outcome": "merged" },
     { "id": 6, "specs": ["LOAD-001"], "outcome": "merged" },
     { "id": 7, "specs": ["RT-002"], "outcome": "merged" },
-    { "id": 8, "specs": ["RT-004"], "outcome": "merged" }
+    { "id": 8, "specs": ["RT-004"], "outcome": "merged" },
+    { "id": 9, "specs": ["RT-006"], "outcome": "merged" },
+    { "id": 10, "specs": ["CFG-002"], "outcome": "merged" }
   ],
   "gates": {
     "footprint": { "status": "green", "at": "2026-06-07T23:30:00Z", "evidence_ref": "harness/reality-checks/footprint-3.md" },
     "craft": { "status": "green", "at": "2026-06-07T23:30:00Z", "evidence_ref": "harness/reality-checks/craft-7.md" },
     "strip-fidelity": { "status": "green", "at": "2026-06-07T17:30:00Z", "evidence_ref": "harness/reality-checks/strip-fidelity-1.md" }
   },
-  "drift_flags": [],
+  "drift_flags": [
+    { "id": "DF-001", "severity": "medium", "tag": "process", "summary": "RT-006 (451855c) + CFG-002 (2a97cef) were committed by a concurrent committer (a dispatched subagent oversteppped the no-commit rule; CFG-002 came from a source I did not dispatch). Floor-green + state reconciled, but NOT craft/reality-gated by the orchestrator. Post-hoc gate needed; coordinate the concurrent committer.", "ref": "git 451855c,2a97cef" }
+  ],
   "decisions": {
     "open": 0,
     "max_severity": "none",
@@ -55,7 +59,7 @@
       "harness/PLAN.md",
       "harness/CANON.md"
     ],
-    "active": "P1 — RT-004 merged: strict-web globals (fetch/URL/crypto.subtle/TextEncoder) on the default runtime; meow run runs web TS. 9 specs merged.",
-    "next_pull_hint": "Wave-2 cont (P1): RT-006 determinism (stray attempt was stripped; redo clean), RT-005 meow:http+type-gen, LOAD-003 Node resolution, CFG-002 root package.json; implement+gate each."
+    "active": "P1 — RT-006 + CFG-002 committed by a concurrent committer (ungated-by-orchestrator, floor-green); state reconciled. RT-004 last craft-gated. Coordination issue (DF-001) surfaced.",
+    "next_pull_hint": "RT-005 + LOAD-003 remain. Post-hoc craft-gate the ungated merges RT-006/CFG-002; coordinate the concurrent committer before more dispatch (conflict risk)."
   }
 }
