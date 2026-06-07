@@ -22,6 +22,11 @@ mod error;
 mod ext;
 mod loader;
 
+// === RT-002 ===
+/// Async host-I/O layer: tokio-backed ops + the capability seam (ADR-9, I-6).
+pub mod io;
+// === RT-002 ===
+
 use deno_core::{JsRuntime, ModuleId, PollEventLoopOptions, RuntimeOptions as DenoRuntimeOptions};
 
 // Re-exports: callers depend on `meow_runtime`, not `deno_core`, directly.
@@ -35,6 +40,12 @@ pub use deno_core::ModuleSpecifier;
 pub use error::{JsExceptionReport, RuntimeError};
 pub use ext::{print_sink_extension, PrintSink};
 pub use loader::TrivialModuleLoader;
+// === RT-002 ===
+pub use io::{
+    io_capability_extension, AllowAll, CapDenied, CapRequest, CapabilityCheck, RuntimeIoError,
+    TcpStreamResource,
+};
+// === RT-002 ===
 
 /// One V8 isolate + its event loop. Owns the embedding so no other crate touches
 /// `deno_core`. NOT `Send`/`Sync`: drive on a single thread (see crate docs).
@@ -57,6 +68,17 @@ pub struct RuntimeOptions {
 impl Runtime {
     /// Creates the isolate, prepending this crate's `meow_runtime` extension
     /// (ops + `console` bootstrap) to `options.extensions`. No host reads.
+    ///
+    /// The default extension set is intentionally **safe-by-default**: only the
+    /// `meow_runtime` console/print bootstrap is installed. The raw host-I/O ops
+    /// ([`io::meow_io`]) are NOT installed here, so a default runtime (what
+    /// `meow run` uses) cannot reach `op_read_file` / `op_tcp_connect` from user
+    /// JS — there is no ambient host FS/network authority (I-6, I-8). Callers
+    /// that need host I/O opt in explicitly by passing [`io::meow_io::init`]
+    /// (together with [`io::io_capability_extension`] for a non-default policy)
+    /// through `options.extensions`. Those raw ops are unmediated internal
+    /// plumbing; they only go live behind a mediated, capability-enforced API in
+    /// a later spec (meow:fs + SEC/P6).
     pub fn new(options: RuntimeOptions) -> Result<Runtime, RuntimeError> {
         let mut extensions = Vec::with_capacity(options.extensions.len() + 1);
         extensions.push(ext::meow_runtime::init());

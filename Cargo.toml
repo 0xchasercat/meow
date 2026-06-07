@@ -25,6 +25,12 @@ deno_core = "0.403"
 # rolldown = "..."
 # Async I/O — consumed by RT-002 (tokio; io_uring on Linux).
 tokio = { version = "1", features = ["rt-multi-thread", "fs", "io-util", "net", "macros"] }
+# === RT-002 ===
+# Typed op errors that cross into JS as exceptions (deno_core's op2 requires the
+# error type to impl `deno_error::JsErrorClass`). Pinned `=` to the exact version
+# deno_core 0.403 depends on so the trait/impls unify (deno_core does not re-export it).
+deno_error = "=0.7.1"
+# === /RT-002 ===
 # Serde — config / lockfile / wire types. Consumed by CFG/PKG/LOAD.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -1138,6 +1138,7 @@ name = "meow-runtime"
 version = "0.0.0"
 dependencies = [
  "deno_core",
+ "deno_error",
  "thiserror",
  "tokio",
 ]
