@@ -33,3 +33,8 @@ thiserror = { workspace = true }
 [dev-dependencies]
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
+# === LOAD-003 === build npm-style gzip-tar archives in the `meow run` e2e tests so
+# the cache holds real package tarballs (LOAD-003 resolves archives, not raw bytes).
+tar = { workspace = true }
+flate2 = { workspace = true }
+# === /LOAD-003 ===

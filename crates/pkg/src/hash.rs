@@ -119,6 +119,38 @@ impl ContentHash {
         p.push(to_hex(self.digest()));
         p
     }
+    // === LOAD-003 ===
+    /// Canonical URL-host form for `meow-cache://`: `"<algo>-<lowerhex>"`.
+    pub fn to_url_host(&self) -> String {
+        format!("{}-{}", self.algo.as_str(), to_hex(self.digest()))
+    }
+
+    /// Parse the canonical URL-host form `"<algo>-<lowerhex>"`.
+    pub fn from_url_host(s: &str) -> Result<ContentHash, ParseHashError> {
+        let (algo_str, hex) = s
+            .split_once('-')
+            .ok_or_else(|| ParseHashError::Malformed(s.to_owned()))?;
+        let algo = HashAlgo::parse(algo_str)
+            .ok_or_else(|| ParseHashError::UnknownAlgo(algo_str.to_owned()))?;
+        let expected = algo.digest_len();
+        if hex.len() != expected * 2 {
+            return Err(ParseHashError::BadLength {
+                algo: algo.as_str(),
+                expected,
+                got: hex.len() / 2,
+            });
+        }
+        let mut digest = [0u8; DIGEST_CAP];
+        for (idx, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+            let hi = decode_hex_nibble(chunk[0])
+                .ok_or_else(|| ParseHashError::Malformed(s.to_owned()))?;
+            let lo = decode_hex_nibble(chunk[1])
+                .ok_or_else(|| ParseHashError::Malformed(s.to_owned()))?;
+            digest[idx] = (hi << 4) | lo;
+        }
+        Ok(ContentHash { algo, digest })
+    }
+    // === /LOAD-003 ===
 }
 
 /// `Debug` renders the SRI so diagnostics and `assert_eq!` failures are legible.
@@ -151,6 +183,14 @@ fn to_hex(bytes: &[u8]) -> String {
         s.push(HEX[(b & 0x0f) as usize] as char);
     }
     s
+}
+
+fn decode_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
 }
 
 /// npm package name (`"lodash"`, `"@scope/pkg"`). `Ord` == byte order == the
@@ -287,6 +327,27 @@ mod tests {
             assert!(sri.starts_with("sha256-"));
             assert_eq!(ContentHash::from_sri(&sri).expect("round-trip"), h);
         }
+    }
+
+    #[test]
+    fn url_host_round_trips() {
+        for sample in [&b""[..], b"x", b"hello world", &[0u8; 64][..]] {
+            let hash = ContentHash::of(sample);
+            let host = hash.to_url_host();
+            assert!(host.starts_with("sha256-"));
+            assert_eq!(ContentHash::from_url_host(&host).expect("round-trip"), hash);
+        }
+    }
+
+    #[test]
+    fn from_url_host_rejects_non_lower_hex() {
+        let hash = ContentHash::of(b"url host");
+        let upper = hash.to_url_host().to_ascii_uppercase();
+        let err = ContentHash::from_url_host(&upper).unwrap_err();
+        assert!(matches!(
+            err,
+            ParseHashError::UnknownAlgo(_) | ParseHashError::Malformed(_)
+        ));
     }
 
     #[test]

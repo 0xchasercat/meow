@@ -31,9 +31,13 @@ tokio = { version = "1", features = ["rt-multi-thread", "fs", "io-util", "net", 
 # deno_core 0.403 depends on so the trait/impls unify (deno_core does not re-export it).
 deno_error = "=0.7.1"
 # === /RT-002 ===
-# Serde — config / lockfile / wire types. Consumed by CFG/PKG/LOAD.
+# === LOAD-003 ===
+# Package archives + manifests. Serde stays shared here because CFG/PKG/LOAD all consume it.
+flate2 = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tar = "0.4"
+# === /LOAD-003 ===
 # CLI — consumed HERE.
 clap = { version = "4", features = ["derive"] }
 # Errors — typed + causal (CRAFT): thiserror for libraries, anyhow for the binary edge.

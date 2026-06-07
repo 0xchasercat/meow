@@ -14,6 +14,25 @@ fn meow() -> Command {
     Command::cargo_bin("meow").expect("meow binary builds")
 }
 
+/// Build a minimal npm-style gzip-tar (members under `package/`) so the cache
+/// holds a real package archive — LOAD-003 reads tarballs, not raw module bytes.
+fn npm_tarball(files: &[(&str, &str)]) -> Vec<u8> {
+    use std::io::Write;
+    let mut builder = tar::Builder::new(Vec::new());
+    for (name, content) in files {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o644);
+        builder
+            .append_data(&mut header, format!("package/{name}"), content.as_bytes())
+            .expect("tar append");
+    }
+    let tar_bytes = builder.into_inner().expect("tar finish");
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(&tar_bytes).expect("gz write");
+    gz.finish().expect("gz finish")
+}
+
 #[test]
 fn version_and_help_succeed() {
     meow()
@@ -231,7 +250,13 @@ fn run_imports_a_cached_dependency_with_no_node_modules() {
 
     // Populate the cache (rooted at the host home) with the dependency's bytes.
     let hash = Cache::in_home(&home)
-        .store(b"export const greet = () => \"from cache\";\n")
+        .store(&npm_tarball(&[
+            (
+                "package.json",
+                "{\"name\":\"dep\",\"version\":\"1.0.0\",\"type\":\"module\",\"exports\":\"./index.js\"}",
+            ),
+            ("index.js", "export const greet = () => \"from cache\";\n"),
+        ]))
         .expect("store dep blob");
 
     // A canonical meow.lock.jsonl mapping `dep` → that content hash.
@@ -301,7 +326,13 @@ fn run_finds_root_lockfile_from_a_nested_entry() {
     std::fs::create_dir_all(&home).expect("home dir");
 
     let hash = Cache::in_home(&home)
-        .store(b"export const greet = () => \"from root lock\";\n")
+        .store(&npm_tarball(&[
+            (
+                "package.json",
+                "{\"name\":\"dep\",\"version\":\"1.0.0\",\"type\":\"module\",\"exports\":\"./index.js\"}",
+            ),
+            ("index.js", "export const greet = () => \"from root lock\";\n"),
+        ]))
         .expect("store dep blob");
 
     let mut lockfile = Lockfile::new();

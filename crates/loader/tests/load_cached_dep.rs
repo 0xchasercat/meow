@@ -1,12 +1,8 @@
-//! LOAD-001 behavior tests. Asserts invariants, not plumbing: a cached dependency
-//! resolves from the content-addressed cache and runs end-to-end through the real
-//! runtime with NO `node_modules` (I-5); one `Resolver` type/algorithm serves both
-//! relative files and bare specifiers (I-1); `.ts` is type-erased by the shared
-//! graph on load (I-1); a non-erasable TS construct and a tampered cache blob both
-//! surface as honest, typed errors (I-7) — never fabricated, never swallowed.
+//! Loader behavior tests. Exercise the real resolver + loader + runtime without any
+//! `node_modules` tree on disk.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,11 +15,11 @@ use deno_core::{
 };
 use meow_graph::GraphDb;
 use meow_loader::{MeowModuleLoader, ModuleLocator, ResolveError, Resolver};
-use meow_pkg::{Cache, CacheError, ContentHash};
+use meow_pkg::{
+    Cache, CacheError, LockEntry, Lockfile, PackageName, RegistryProvenance, Version, VersionReq,
+};
 use meow_runtime::{print_sink_extension, PrintSink, Runtime, RuntimeOptions};
 
-/// A unique temp directory per test, created eagerly. Uniqueness from pid + a
-/// monotonic counter — no `rand`, no clock (the P16 grep bans both even in tests).
 fn unique_dir(tag: &str) -> std::path::PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -40,14 +36,76 @@ fn cache_arc(root: &Path) -> Arc<Cache> {
 fn dir_url(dir: &Path) -> Url {
     Url::from_directory_path(dir).expect("dir → file URL")
 }
-
-fn bare_map(name: &str, hash: ContentHash) -> HashMap<String, ContentHash> {
-    let mut m = HashMap::new();
-    m.insert(name.to_owned(), hash);
-    m
+fn parsed_version(text: &str) -> Version {
+    Version::parse(text).expect("valid version")
 }
 
-/// A print sink that accumulates `console.log` output, plus the extension to install it.
+fn root_deps(entries: &[(&str, &str)]) -> BTreeMap<PackageName, Version> {
+    entries
+        .iter()
+        .map(|(name, ver)| (PackageName::new((*name).to_owned()), parsed_version(ver)))
+        .collect()
+}
+
+fn lock_entry(
+    name: &str,
+    version: &str,
+    integrity: meow_pkg::ContentHash,
+    deps: &[(&str, &str)],
+) -> LockEntry {
+    LockEntry {
+        name: PackageName::new(name.to_owned()),
+        version: Version::parse(version).expect("valid version"),
+        integrity,
+        dependencies: deps
+            .iter()
+            .map(|(name, version)| {
+                (
+                    PackageName::new((*name).to_owned()),
+                    Version::parse(version).expect("valid version"),
+                )
+            })
+            .collect(),
+        registry: RegistryProvenance::new("https://registry.npmjs.org"),
+        capabilities: Vec::new(),
+        wasm: Vec::new(),
+        meow: VersionReq::parse("*").expect("valid requirement"),
+    }
+}
+
+fn archive(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut builder = tar::Builder::new(encoder);
+    for (path, bytes) in files {
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(bytes.len() as u64);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, format!("package/{path}"), *bytes)
+            .expect("append tar member");
+    }
+    builder
+        .into_inner()
+        .expect("finish tar")
+        .finish()
+        .expect("finish gzip")
+}
+
+fn resolver_with(
+    cache_root: &Path,
+    lockfile: Lockfile,
+    root_deps: BTreeMap<PackageName, Version>,
+    project_root: &Path,
+) -> Resolver {
+    Resolver::new(
+        cache_arc(cache_root),
+        Arc::new(lockfile),
+        root_deps,
+        dir_url(project_root),
+    )
+}
+
 fn capture() -> (Rc<RefCell<String>>, deno_core::Extension) {
     let out = Rc::new(RefCell::new(String::new()));
     let o = out.clone();
@@ -67,7 +125,6 @@ fn sync_options() -> ModuleLoadOptions {
     }
 }
 
-/// Drive `load` synchronously and unwrap the returned source code (asserts `Sync`).
 fn load_code(loader: &MeowModuleLoader, spec: &ModuleSpecifier) -> Result<String, String> {
     match loader.load(spec, None, sync_options()) {
         ModuleLoadResponse::Sync(Ok(source)) => match source.code {
@@ -79,18 +136,45 @@ fn load_code(loader: &MeowModuleLoader, spec: &ModuleSpecifier) -> Result<String
     }
 }
 
-// I-5 + I-1: a local `.ts` entry imports a bare dependency that lives ONLY in the
-// content-addressed cache; the program runs to completion through V8 and the dep's
-// exported behavior is observed — and no `node_modules` is created anywhere.
 #[tokio::test]
 async fn cached_dep_runs_end_to_end_with_no_node_modules() {
     let proj = unique_dir("e2e");
     let cache_root = proj.join("cache");
-    let hash = Cache::with_root(&cache_root)
-        .store(b"export const greet = () => \"from cache\";\n")
-        .expect("store dep blob");
+    let cache = Cache::with_root(&cache_root);
 
-    // The first-party entry: a `.ts` annotation (erasable) + a bare import of the dep.
+    let dep_hash = cache
+        .store(&archive(&[
+            (
+                "package.json",
+                br#"{"name":"dep","version":"1.0.0","type":"module","exports":{".":{"import":"./esm/index.js","require":"./cjs/index.cjs","default":"./fallback.js"}}}"#,
+            ),
+            (
+                "esm/index.js",
+                b"import { value } from \"nested\";\nexport const greet = () => `from ${value}`;\n",
+            ),
+            ("cjs/index.cjs", b"module.exports = { greet() { return 'wrong'; } };\n"),
+            ("fallback.js", b"export const greet = () => 'fallback';\n"),
+        ]))
+        .expect("store dep blob");
+    let nested_hash = cache
+        .store(&archive(&[
+            (
+                "package.json",
+                br#"{"name":"nested","version":"1.0.0","exports":"./index.js","type":"module"}"#,
+            ),
+            ("index.js", b"export const value = 'cache';\n"),
+        ]))
+        .expect("store nested blob");
+
+    let mut lockfile = Lockfile::new();
+    lockfile.upsert(lock_entry(
+        "dep",
+        "1.0.0",
+        dep_hash.clone(),
+        &[("nested", "1.0.0")],
+    ));
+    lockfile.upsert(lock_entry("nested", "1.0.0", nested_hash, &[]));
+
     let entry = proj.join("main.ts");
     std::fs::write(
         &entry,
@@ -98,11 +182,7 @@ async fn cached_dep_runs_end_to_end_with_no_node_modules() {
     )
     .expect("write entry");
 
-    let resolver = Resolver::new(
-        cache_arc(&cache_root),
-        bare_map("dep", hash),
-        dir_url(&proj),
-    );
+    let resolver = resolver_with(&cache_root, lockfile, root_deps(&[("dep", "1.0.0")]), &proj);
     let graph = Rc::new(RefCell::new(GraphDb::new()));
     let loader = Rc::new(MeowModuleLoader::new(resolver, graph));
 
@@ -118,33 +198,33 @@ async fn cached_dep_runs_end_to_end_with_no_node_modules() {
         .await
         .expect("module runs to completion");
 
-    assert_eq!(
-        *out.borrow(),
-        "from cache\n",
-        "dep's exported behavior is observed"
-    );
+    assert_eq!(*out.borrow(), "from cache\n");
     assert!(
         !proj.join("node_modules").exists(),
-        "no node_modules is created (I-5)"
+        "no node_modules is created"
     );
     std::fs::remove_dir_all(&proj).ok();
 }
 
-// I-1: ONE `Resolver` type + algorithm serves both a relative file and a bare
-// specifier — there is no second resolver.
 #[test]
 fn one_resolver_handles_relative_and_bare() {
     let proj = unique_dir("single");
     let cache_root = proj.join("cache");
-    let hash = Cache::with_root(&cache_root)
-        .store(b"export const v = 1;\n")
-        .expect("store");
+    let cache = Cache::with_root(&cache_root);
+    let dep_hash = cache
+        .store(&archive(&[
+            (
+                "package.json",
+                br#"{"name":"dep","version":"1.0.0","exports":"./index.js","type":"module"}"#,
+            ),
+            ("index.js", b"export const v = 1;\n"),
+        ]))
+        .expect("store dep blob");
+    std::fs::write(proj.join("a.ts"), "export const a = 1;\n").expect("write local file");
 
-    let resolver = Resolver::new(
-        cache_arc(&cache_root),
-        bare_map("dep", hash.clone()),
-        dir_url(&proj),
-    );
+    let mut lockfile = Lockfile::new();
+    lockfile.upsert(lock_entry("dep", "1.0.0", dep_hash.clone(), &[]));
+    let resolver = resolver_with(&cache_root, lockfile, root_deps(&[("dep", "1.0.0")]), &proj);
 
     let referrer = Url::from_file_path(proj.join("main.ts")).expect("referrer URL");
     let (rel_url, rel_loc) = resolver
@@ -154,28 +234,27 @@ fn one_resolver_handles_relative_and_bare() {
     assert!(matches!(rel_loc, ModuleLocator::LocalFile(_)));
 
     let (bare_url, bare_loc) = resolver.locate("dep", &referrer).expect("bare resolves");
-    assert_eq!(bare_url.scheme(), "meow-cache");
+    assert_eq!(
+        bare_url,
+        meow_loader::encode_cache_url(&dep_hash, "index.js")
+    );
     match bare_loc {
-        ModuleLocator::Cached(h) => assert_eq!(h, hash),
+        ModuleLocator::Cached { package, member } => {
+            assert_eq!(package, dep_hash);
+            assert_eq!(member, "index.js");
+        }
         other => panic!("expected Cached, got {other:?}"),
     }
     std::fs::remove_dir_all(&proj).ok();
 }
 
-// I-1: a `.ts` module with a type annotation is type-erased by the shared graph on
-// load — the annotation is gone, the runtime code is kept (the loader feeds the
-// graph, never hands raw `.ts` to V8).
 #[test]
 fn ts_source_is_stripped_on_load() {
     let proj = unique_dir("strip");
     let entry = proj.join("typed.ts");
     std::fs::write(&entry, "export const n: number = 41 + 1;\n").expect("write");
 
-    let resolver = Resolver::new(
-        cache_arc(&proj.join("cache")),
-        HashMap::new(),
-        dir_url(&proj),
-    );
+    let resolver = resolver_with(&proj.join("cache"), Lockfile::new(), BTreeMap::new(), &proj);
     let loader = MeowModuleLoader::new(resolver, Rc::new(RefCell::new(GraphDb::new())));
 
     let spec = ModuleSpecifier::from_file_path(&entry).expect("file URL");
@@ -185,20 +264,13 @@ fn ts_source_is_stripped_on_load() {
     std::fs::remove_dir_all(&proj).ok();
 }
 
-// I-1 (honesty): a non-erasable TS construct (`enum`) cannot be whitespace-stripped
-// to correct JS, so load fails with the GRAPH diagnostic — never fabricated as
-// "runnable".
 #[test]
 fn non_erasable_ts_enum_is_a_load_error() {
     let proj = unique_dir("enum");
     let entry = proj.join("bad.ts");
     std::fs::write(&entry, "enum E { A }\nexport const e = E.A;\n").expect("write");
 
-    let resolver = Resolver::new(
-        cache_arc(&proj.join("cache")),
-        HashMap::new(),
-        dir_url(&proj),
-    );
+    let resolver = resolver_with(&proj.join("cache"), Lockfile::new(), BTreeMap::new(), &proj);
     let loader = MeowModuleLoader::new(resolver, Rc::new(RefCell::new(GraphDb::new())));
 
     let spec = ModuleSpecifier::from_file_path(&entry).expect("file URL");
@@ -210,23 +282,26 @@ fn non_erasable_ts_enum_is_a_load_error() {
     std::fs::remove_dir_all(&proj).ok();
 }
 
-// I-7: a tampered cache blob fails `Cache::read`'s integrity recompute, and the
-// resolver propagates it as `ResolveError::Cache` — never serves the bytes.
 #[test]
 fn tampered_cache_blob_surfaces_integrity_error() {
     let proj = unique_dir("tamper");
     let cache_root = proj.join("cache");
     let cache = Cache::with_root(&cache_root);
-    let hash = cache.store(b"export const v = 1;\n").expect("store");
+    let dep_hash = cache
+        .store(&archive(&[
+            (
+                "package.json",
+                br#"{"name":"dep","version":"1.0.0","exports":"./index.js","type":"module"}"#,
+            ),
+            ("index.js", b"export const v = 1;\n"),
+        ]))
+        .expect("store dep blob");
 
-    // Tamper: overwrite the on-disk blob with different bytes (its hash no longer matches).
-    std::fs::write(cache.path_for(&hash), b"export const v = 999;\n").expect("tamper blob");
+    std::fs::write(cache.path_for(&dep_hash), b"not a valid tarball anymore").expect("tamper blob");
 
-    let resolver = Resolver::new(
-        cache_arc(&cache_root),
-        bare_map("dep", hash),
-        dir_url(&proj),
-    );
+    let mut lockfile = Lockfile::new();
+    lockfile.upsert(lock_entry("dep", "1.0.0", dep_hash.clone(), &[]));
+    let resolver = resolver_with(&cache_root, lockfile, root_deps(&[("dep", "1.0.0")]), &proj);
 
     let referrer = Url::from_file_path(proj.join("main.ts")).expect("referrer");
     let err = resolver
@@ -237,7 +312,7 @@ fn tampered_cache_blob_surfaces_integrity_error() {
             err,
             ResolveError::Cache(CacheError::IntegrityMismatch { .. })
         ),
-        "integrity failure surfaces (I-7), got: {err:?}"
+        "integrity failure surfaces, got: {err:?}"
     );
     std::fs::remove_dir_all(&proj).ok();
 }

@@ -18,6 +18,12 @@ meow-graph = { path = "../graph" }
 # The content-addressed cache + lockfile types (I-7). Depend, never redefine.
 meow-pkg = { path = "../pkg" }
 thiserror = { workspace = true }
+# === LOAD-003 ===
+flate2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tar = { workspace = true }
+# === /LOAD-003 ===
 
 [dev-dependencies]
 # End-to-end: run a resolved+stripped module through V8 with this loader installed.

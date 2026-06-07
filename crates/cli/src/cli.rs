@@ -286,7 +286,11 @@ fn cmd_doctor() -> ExitCode {
             match status {
                 Fresh => println!("package.json: in sync"),
                 Missing => println!("package.json: missing — run `meow sync`"),
-                Stale => println!("package.json: stale vs meow.config — run `meow sync`"),
+                Stale => eprintln!(
+                    "warning: root package.json is out of sync with meow.config; meow owns it \
+                     (ADR-8) and `meow sync` will regenerate it, overwriting any manual edits. \
+                     Edit publishing metadata in meow.config.ts."
+                ),
                 HandEdited => eprintln!(
                     "warning: root package.json was hand-edited; meow owns it (ADR-8) and \
                      `meow sync` will overwrite it. Move publishing metadata into meow.config.ts."
@@ -376,14 +380,12 @@ fn cmd_run(
         };
 
         // === LOAD-001 ===
-        // Build THE resolver + content-addressed cache loader (replaces RT-001's
-        // TrivialModuleLoader). The binary edge owns ambient reads (I-6): it resolves
-        // the project root + host home and translates meow.lock.jsonl into the
-        // resolver's name->hash stand-in map (full lockfile-driven resolution is
-        // LOAD-003). The graph is shared (I-1); no node_modules is ever touched (I-5).
+        // Build THE resolver + content-addressed cache loader. The binary edge owns
+        // ambient reads (I-6): it resolves the project root + host home and reads
+        // meow.lock.jsonl. P1 does not yet have a root-entry mechanism, so the
+        // direct-dependency map is empty by default; LOAD-003 still owns all real
+        // package resolution once the caller supplies that map.
         let entry_dir = abs.parent().unwrap_or(&abs);
-        // Walk UP to the nearest meow.lock.jsonl so `meow run src/main.ts` finds the
-        // repo-root lockfile, not `src/meow.lock.jsonl` (host-pure path walk, I-6).
         let project_dir = find_project_root(entry_dir);
         let project_root = match meow_runtime::ModuleSpecifier::from_directory_path(&project_dir) {
             Ok(url) => url,
@@ -395,8 +397,15 @@ fn cmd_run(
                 return ExitCode::FAILURE;
             }
         };
-        let bare = match load_bare_map(&project_dir) {
-            Ok(map) => map,
+        let lockfile = match load_lockfile(&project_dir) {
+            Ok(lockfile) => lockfile,
+            Err(err) => {
+                eprintln!("meow run: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let root_deps = match root_deps_from_lockfile(&lockfile) {
+            Ok(deps) => deps,
             Err(err) => {
                 eprintln!("meow run: {err}");
                 return ExitCode::FAILURE;
@@ -406,7 +415,8 @@ fn cmd_run(
             std::rc::Rc::new(meow_loader::MeowModuleLoader::new(
                 meow_loader::Resolver::new(
                     std::sync::Arc::new(meow_pkg::Cache::in_home(crate::host::host_home())),
-                    bare,
+                    std::sync::Arc::new(lockfile),
+                    root_deps,
                     project_root,
                 ),
                 std::rc::Rc::new(std::cell::RefCell::new(meow_graph::GraphDb::new())),
@@ -475,55 +485,39 @@ fn find_project_root(start: &std::path::Path) -> PathBuf {
     }
 }
 
-/// Honest failure translating a lockfile into the resolver's bare map. Either the
-/// lockfile itself is malformed ([`Lock`]) or it pins two versions of one package
-/// — which the name-keyed map cannot represent until LOAD-003 adds real version
-/// selection, so it fails loudly rather than silently dropping a version.
-///
-/// [`Lock`]: BareMapError::Lock
-#[derive(Debug, thiserror::Error)]
-enum BareMapError {
-    #[error(transparent)]
-    Lock(#[from] meow_pkg::LockError),
-    #[error(
-        "lockfile has multiple versions of `{name}` ({versions}); \
-         version selection lands in LOAD-003"
-    )]
-    AmbiguousVersion { name: String, versions: String },
-}
-
-/// Read `meow.lock.jsonl` (if present) from the project root and translate it into
-/// the resolver's `name -> ContentHash` stand-in map. The edge does the lockfile
-/// I/O; the resolver stays a pure `name -> hash` lookup (full lockfile-driven
-/// resolution is LOAD-003). A missing lockfile is an empty map (local-only run); a
-/// malformed lockfile is an honest error, never silently ignored (I-7). Two
-/// entries sharing a package name is an honest [`BareMapError::AmbiguousVersion`]
-/// (not a silent collapse to one).
-fn load_bare_map(
+/// Read `meow.lock.jsonl` from the project root when present. A missing lockfile is
+/// the empty execution contract (local-only run); a malformed lockfile is an honest
+/// error, never silently ignored (I-7).
+fn load_lockfile(
     project_root: &std::path::Path,
-) -> Result<std::collections::HashMap<String, meow_pkg::ContentHash>, BareMapError> {
+) -> Result<meow_pkg::Lockfile, meow_pkg::LockError> {
     let lock_path = project_root.join("meow.lock.jsonl");
     if !lock_path.exists() {
-        return Ok(std::collections::HashMap::new());
+        return Ok(meow_pkg::Lockfile::new());
     }
-    let lockfile = meow_pkg::Lockfile::read(&lock_path)?;
-    let mut map: std::collections::HashMap<String, meow_pkg::ContentHash> =
-        std::collections::HashMap::with_capacity(lockfile.len());
+    meow_pkg::Lockfile::read(&lock_path)
+}
+
+/// Derive the project's direct-dependency map from the lockfile as a P1 stand-in:
+/// real direct-vs-transitive tracking arrives with `meow install` (PKG-002/P2).
+/// Each name maps to its single pinned version; a name pinned at multiple versions
+/// is an ambiguous root (which is the direct dependency?) and fails honestly rather
+/// than silently picking one (LOAD-003 supports multi-version transitively, but a
+/// root must be unambiguous).
+fn root_deps_from_lockfile(
+    lockfile: &meow_pkg::Lockfile,
+) -> Result<std::collections::BTreeMap<meow_pkg::PackageName, meow_pkg::Version>, String> {
+    let mut deps = std::collections::BTreeMap::new();
     for entry in lockfile.iter() {
-        let name = entry.name.to_string();
-        if map.insert(name.clone(), entry.integrity.clone()).is_some() {
-            // Two lines share a name: collapsing them would silently drop a
-            // version. Gather every pinned version of this name for the diagnostic.
-            let versions = lockfile
-                .iter()
-                .filter(|other| other.name == entry.name)
-                .map(|other| other.version.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(BareMapError::AmbiguousVersion { name, versions });
+        if let Some(prev) = deps.insert(entry.name.clone(), entry.version.clone()) {
+            return Err(format!(
+                "lockfile pins multiple versions of `{}` ({prev}, {}) — which is the \
+                 direct dependency is ambiguous; `meow install` will pin it (P2)",
+                entry.name, entry.version
+            ));
         }
     }
-    Ok(map)
+    Ok(deps)
 }
 // === /LOAD-001 ===
 
