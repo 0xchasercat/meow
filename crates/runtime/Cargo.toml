@@ -1,0 +1,23 @@
+[package]
+name = "meow-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# The ONE V8 edge in the workspace (I-10, ADR-1): unmodified upstream deno_core,
+# pinned in [workspace.dependencies] by DIST-001. No direct `v8` dep — use
+# `deno_core::v8` (re-exported here as `meow_runtime::v8`).
+deno_core = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Tests drive the async run path on a current-thread runtime (A5); deno_core also
+# requires an active tokio context at isolate creation.
+tokio = { workspace = true }
+# The test-only echo op (T2) + capture extensions use the `op2`/`extension!`
+# macros, which emit absolute `::deno_core` paths — so the test target needs the
+# crate in scope. The edge still originates ONLY from crates/runtime (the sole
+# embedding owner; I-10), never from another workspace crate.
+deno_core = { workspace = true }

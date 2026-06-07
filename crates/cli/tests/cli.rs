@@ -30,7 +30,6 @@ fn version_and_help_succeed() {
 
 /// `(argv, verb, phase)` for every subcommand, with minimal valid args.
 const CASES: &[(&[&str], &str, &str)] = &[
-    (&["run", "x.ts"], "run", "P1"),
     (&["dev", "x.ts"], "dev", "P1"),
     (&["install"], "install", "P2"),
     (&["add", "p"], "add", "P2"),
@@ -53,8 +52,8 @@ const CASES: &[(&[&str], &str, &str)] = &[
 fn every_subcommand_stub_is_honest() {
     assert_eq!(
         CASES.len(),
-        17,
-        "all 17 stub subcommands covered (sync is real — CFG-001)"
+        16,
+        "all 16 stub subcommands covered (sync is real — CFG-001; run is real — RT-001)"
     );
     for (argv, verb, phase) in CASES {
         let expected = format!("meow: not yet implemented — `{verb}` lands in PLAN {phase}");
@@ -82,6 +81,75 @@ fn sync_generates_shadow_configs() {
         tmp.join("tsconfig.json").is_file(),
         "root tsconfig.json shim generated"
     );
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[test]
+fn run_executes_a_trivial_mjs_module() {
+    // `meow run` is real (RT-001): a plain ESM file runs through V8 and prints.
+    let tmp = std::env::temp_dir().join(format!("meow-run-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).expect("temp dir");
+    let entry = tmp.join("hello.mjs");
+    std::fs::write(&entry, r#"console.log("hello from meow")"#).expect("write entry");
+    meow()
+        .arg("run")
+        .arg(&entry)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hello from meow"));
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[test]
+fn run_surfaces_uncaught_errors_without_panicking() {
+    // An uncaught JS error is a rendered diagnostic on stderr + non-zero exit,
+    // never a Rust panic / backtrace.
+    let tmp = std::env::temp_dir().join(format!("meow-run-err-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).expect("temp dir");
+    let entry = tmp.join("boom.mjs");
+    std::fs::write(&entry, r#"throw new Error("boom")"#).expect("write entry");
+    meow()
+        .arg("run")
+        .arg(&entry)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("boom"))
+        .stderr(predicate::str::contains("panicked").not());
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[test]
+fn run_refuses_first_party_cjs() {
+    // First-party CommonJS is refused in every mode (I-2 / ADR-3) — never executed.
+    let tmp = std::env::temp_dir().join(format!("meow-run-cjs-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).expect("temp dir");
+    let entry = tmp.join("app.cjs");
+    std::fs::write(&entry, r#"console.log("nope")"#).expect("write entry");
+    meow()
+        .arg("run")
+        .arg(&entry)
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("nope").not())
+        .stderr(predicate::str::contains("CommonJS"));
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[test]
+fn run_rejects_unwired_argv_instead_of_dropping_it() {
+    // Forwarding program args (after `--`) is not wired yet — reject, never silently drop.
+    let tmp = std::env::temp_dir().join(format!("meow-run-argv-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).expect("temp dir");
+    let entry = tmp.join("noop.mjs");
+    std::fs::write(&entry, "").expect("write entry");
+    meow()
+        .arg("run")
+        .arg(&entry)
+        .arg("--")
+        .arg("foo")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not yet supported"));
     std::fs::remove_dir_all(&tmp).ok();
 }
 

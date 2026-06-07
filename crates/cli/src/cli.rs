@@ -72,7 +72,7 @@ pub enum Command {
 pub struct RunArgs {
     /// Entry module to execute.
     pub entry: PathBuf,
-    /// Arguments forwarded to the program (everything after `--`).
+    /// Arguments after `--`, to forward to the program (forwarding is not yet wired).
     #[arg(last = true)]
     pub argv: Vec<String>,
 }
@@ -171,6 +171,9 @@ impl Cli {
             // === CFG-001 ===
             Command::Sync => cmd_sync(),
             // === /CFG-001 ===
+            // === RT-001 ===
+            Command::Run(args) => cmd_run(&args.entry, &args.argv),
+            // === /RT-001 ===
             // HONEST stub (CRAFT — "the action must DO the work"): no fake success path.
             // Structured, single-line, machine-greppable; stderr only; non-zero exit.
             other => {
@@ -213,3 +216,66 @@ fn cmd_sync() -> ExitCode {
     ExitCode::SUCCESS
 }
 // === /CFG-001 ===
+
+// === RT-001 ===
+/// `meow run <file>`: canonicalize the named entry -> `file:` URL -> drive one
+/// ESM module to completion through V8. The binary edge owns host access (cwd via
+/// canonicalize) and error rendering; `meow-runtime` stays free of ambient reads
+/// (I-6). Plain JS/ESM (`.js`/`.mjs`) executes; a `.ts` entry fails honestly
+/// (TypeScript needs the type-strip, RT-003) via a `RuntimeError::Module`.
+fn cmd_run(entry: &std::path::Path, argv: &[String]) -> ExitCode {
+    if !argv.is_empty() {
+        eprintln!("meow run: forwarding program arguments (after `--`) is not yet supported");
+        return ExitCode::FAILURE;
+    }
+    let async_rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(err) => {
+            eprintln!("meow run: cannot start the async runtime: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    async_rt.block_on(async {
+        // Explicit: the program the user named (canonicalize against the real cwd).
+        let abs = match std::fs::canonicalize(entry) {
+            Ok(path) => path,
+            Err(err) => {
+                eprintln!("meow run: cannot find {}: {err}", entry.display());
+                return ExitCode::FAILURE;
+            }
+        };
+        let spec = match meow_runtime::ModuleSpecifier::from_file_path(&abs) {
+            Ok(spec) => spec,
+            Err(()) => {
+                eprintln!("meow run: invalid entry path {}", abs.display());
+                return ExitCode::FAILURE;
+            }
+        };
+
+        let mut runtime = match meow_runtime::Runtime::new(meow_runtime::RuntimeOptions {
+            // P0 loader (LOAD-001 replaces it with the real resolver + cache).
+            module_loader: std::rc::Rc::new(meow_runtime::TrivialModuleLoader::new()),
+            extensions: vec![],
+        }) {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                eprintln!("meow run: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        // A typed error renders as a diagnostic; never a panic / backtrace.
+        match runtime.run_main_module(&spec).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("meow run: {err}");
+                ExitCode::FAILURE
+            }
+        }
+    })
+}
+// === /RT-001 ===

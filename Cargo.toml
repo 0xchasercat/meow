@@ -17,9 +17,9 @@ version = "0.0.0"
 # footprint audit a single read).
 [workspace.dependencies]
 # === DIST-001 ===
-# V8 — unmodified upstream, never a git fork (I-10, CANON §26.2, ADR-1). Consumed by RT-* only; NOT here.
-deno_core = "0.340"
-v8 = "130"
+# V8 — unmodified upstream `deno_core` (re-exports `v8`), never forked (I-10, CANON §26.2, ADR-1).
+# Pin confirmed by RT-001's V8 build; consumed by RT-* (use `deno_core::v8`, no direct v8 dep).
+deno_core = "0.403"
 # Parse/semantic/transform — Oxc, pinned as sub-crates in the GRAPH-001 fence below (I-1).
 # Bundler — declared when TOOL-003 (P3) lands:
 # rolldown = "..."

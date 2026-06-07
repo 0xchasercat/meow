@@ -14,6 +14,11 @@ clap = { workspace = true }
 # === CFG-001 === intra-workspace: the CLI dispatches `meow sync` to the config library.
 meow-config = { path = "../config" }
 # === /CFG-001 ===
+# === RT-001 === `meow run` drives one ESM module to completion through V8.
+meow-runtime = { path = "../runtime" }
+# Current-thread runtime to drive the (async) module run on the binary edge.
+tokio = { workspace = true }
+# === /RT-001 ===
 
 [dev-dependencies]
 assert_cmd = { workspace = true }
