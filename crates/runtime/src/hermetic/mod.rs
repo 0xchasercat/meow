@@ -39,12 +39,6 @@ deno_core::extension!(
     ],
     esm_entry_point = "ext:meow_hermetic/hermetic.js",
     esm = [dir "src/hermetic/js", "hermetic.js"],
-    // Seed a deterministic state by default so the ops always find one (mirrors
-    // `meow_io`'s default `AllowAll`). A grant overrides it via
-    // `hermetic_config_extension`, placed AFTER this in the extension list.
-    state = |state: &mut OpState| {
-        state.put(Rc::new(RefCell::new(HermeticState::new(&HermeticConfig::default()))));
-    },
 );
 
 /// Build an [`Extension`](deno_core::Extension) that installs a configured

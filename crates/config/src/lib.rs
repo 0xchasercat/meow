@@ -16,13 +16,22 @@
 mod load;
 mod schema;
 mod shadow;
+// === CFG-002 ===
+mod package;
+// === /CFG-002 ===
 
 pub use load::ConfigError;
 pub use schema::{
     Clock, Format, FormatStyle, Install, InstallMode, Lint, MeowConfig, Mode, Network, Permissions,
-    Runtime, Severity, TestConfig, TsHandling, Types, Workspace,
+    Publish, Runtime, Severity, TestConfig, TsHandling, Types, Workspace,
 };
 pub use shadow::{
     generate_shadow_tsconfig, write_root_tsconfig_shim, write_shadow_types, GENERATED_HEADER,
     ROOT_TSCONFIG_SHIM, STRICT_WEB_DTS_FILE,
 };
+// === CFG-002 ===
+pub use package::{
+    classify_root_package_json, generate_root_package_json, render_root_package_json,
+    PackageJsonStatus, PACKAGE_JSON_MARKER,
+};
+// === /CFG-002 ===

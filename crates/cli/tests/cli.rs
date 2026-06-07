@@ -45,15 +45,14 @@ const CASES: &[(&[&str], &str, &str)] = &[
     (&["why-dep", "p"], "why-dep", "P2"),
     (&["trace", "x.ts"], "trace", "P6"),
     (&["profile", "x.ts"], "profile", "P6"),
-    (&["doctor"], "doctor", "P6"),
 ];
 
 #[test]
 fn every_subcommand_stub_is_honest() {
     assert_eq!(
         CASES.len(),
-        16,
-        "all 16 stub subcommands covered (sync is real — CFG-001; run is real — RT-001)"
+        15,
+        "15 stub subcommands (sync + run real — CFG-001/RT-001; doctor real — CFG-002)"
     );
     for (argv, verb, phase) in CASES {
         let expected = format!("meow: not yet implemented — `{verb}` lands in PLAN {phase}");

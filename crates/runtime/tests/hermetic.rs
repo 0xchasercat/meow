@@ -8,11 +8,13 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use meow_runtime::hermetic::{extensions, HermeticConfig, RngSource};
+use meow_runtime::web::{extensions as web_extensions, NetCaps, WebOptions};
 use meow_runtime::{
-    print_sink_extension, ModuleSpecifier, PrintSink, Runtime, RuntimeError, RuntimeOptions,
-    TrivialModuleLoader,
+    print_sink_extension, AllowAll, ModuleSpecifier, PrintSink, Runtime, RuntimeError,
+    RuntimeOptions, TrivialModuleLoader,
 };
 
 /// Capture sink + the captured buffer (console output; deterministic, no OS).
@@ -60,10 +62,14 @@ const PROBE: &str = r#"
 #[tokio::test]
 async fn hermetic_reproducible_default() {
     let (out1, mut rt1) = hermetic_runtime(HermeticConfig::default());
-    run_src(&mut rt1, "file:///a.js", PROBE).await.expect("run 1");
+    run_src(&mut rt1, "file:///a.js", PROBE)
+        .await
+        .expect("run 1");
 
     let (out2, mut rt2) = hermetic_runtime(HermeticConfig::default());
-    run_src(&mut rt2, "file:///b.js", PROBE).await.expect("run 2");
+    run_src(&mut rt2, "file:///b.js", PROBE)
+        .await
+        .expect("run 2");
 
     let a = out1.borrow().clone();
     let b = out2.borrow().clone();
@@ -194,5 +200,60 @@ async fn hermetic_seed_drives_math_random() {
         a.borrow().trim(),
         b.borrow().trim(),
         "a different seed must produce a different Math.random stream"
+    );
+}
+
+/// A runtime with RT-004's Web globals (so `crypto` exists) THEN the hermetic
+/// shadows appended after — exactly the `meow run` order, so `hermetic.js` rebinds
+/// the real `crypto.getRandomValues`.
+fn web_hermetic_runtime(cfg: HermeticConfig) -> (Rc<RefCell<String>>, Runtime) {
+    let (out, sink_ext) = capture();
+    let caps: NetCaps = Arc::new(AllowAll);
+    let mut exts = web_extensions(WebOptions {
+        caps,
+        user_agent: "meow/test".to_string(),
+    });
+    exts.extend(extensions(cfg));
+    exts.push(sink_ext);
+    let rt = Runtime::new(RuntimeOptions {
+        module_loader: Rc::new(TrivialModuleLoader::new()),
+        extensions: exts,
+    })
+    .expect("runtime initializes with web + hermetic");
+    (out, rt)
+}
+
+// `crypto.getRandomValues` is routed through the hermetic op: deterministic under
+// the seeded default (identical across two runs, and it actually fills bytes),
+// and real OS entropy under the `--allow-random` grant (so it diverges).
+#[tokio::test]
+async fn hermetic_crypto_get_random_values_deterministic_default_real_on_grant() {
+    let probe = r#"
+        const a = new Uint8Array(8);
+        crypto.getRandomValues(a);
+        console.log(Array.from(a).join(","));
+    "#;
+
+    let (o1, mut r1) = web_hermetic_runtime(HermeticConfig::default());
+    run_src(&mut r1, "file:///cg1.js", probe).await.expect("1");
+    let (o2, mut r2) = web_hermetic_runtime(HermeticConfig::default());
+    run_src(&mut r2, "file:///cg2.js", probe).await.expect("2");
+    let seeded = o1.borrow().trim().to_string();
+    assert_eq!(
+        seeded,
+        o2.borrow().trim(),
+        "seeded crypto.getRandomValues must be reproducible"
+    );
+    assert_ne!(
+        seeded, "0,0,0,0,0,0,0,0",
+        "getRandomValues must actually fill the buffer (not a no-op)"
+    );
+
+    let (o3, mut r3) = web_hermetic_runtime(HermeticConfig::default().with_os_rng());
+    run_src(&mut r3, "file:///cg3.js", probe).await.expect("3");
+    assert_ne!(
+        o3.borrow().trim(),
+        seeded,
+        "the --allow-random grant must use OS entropy, not the seeded stream"
     );
 }

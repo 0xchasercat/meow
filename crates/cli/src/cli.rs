@@ -193,6 +193,9 @@ impl Cli {
             // === /RT-001 ===
             // HONEST stub (CRAFT — "the action must DO the work"): no fake success path.
             // Structured, single-line, machine-greppable; stderr only; non-zero exit.
+            // === CFG-002 ===
+            Command::Doctor => cmd_doctor(),
+            // === /CFG-002 ===
             other => {
                 let (verb, phase) = other.landing();
                 eprintln!("meow: not yet implemented — `{verb}` lands in PLAN {phase}");
@@ -244,12 +247,62 @@ fn cmd_sync() -> ExitCode {
         return ExitCode::FAILURE;
     }
     // === /RT-004 ===
+    // === CFG-002 ===
+    // Generate the OWNED root package.json projection from meow.config (ADR-8) —
+    // the surface npm/pnpm/IDEs/`npm publish` read. `meow` owns + overwrites it.
+    if let Err(err) = meow_config::generate_root_package_json(&cfg, &root) {
+        eprintln!("meow sync: {err}");
+        return ExitCode::FAILURE;
+    }
+    // === /CFG-002 ===
     println!(
-        "meow sync: regenerated .meow/tsconfig.json + .meow/strict-web.d.ts + tsconfig.json shim"
+        "meow sync: regenerated .meow/tsconfig.json + .meow/strict-web.d.ts + tsconfig.json shim + package.json"
     );
     ExitCode::SUCCESS
 }
 // === /CFG-001 ===
+
+// === CFG-002 ===
+/// `meow doctor` — CFG-002 owns ONLY the root package.json staleness/hand-edit
+/// check (the full doctor surface is a later spec). Read-only; never mutates.
+fn cmd_doctor() -> ExitCode {
+    let root = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            eprintln!("meow doctor: cannot resolve the current directory: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let cfg = match meow_config::MeowConfig::load(&root) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            eprintln!("meow doctor: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match meow_config::classify_root_package_json(&cfg, &root) {
+        Ok(status) => {
+            use meow_config::PackageJsonStatus::{Fresh, HandEdited, Missing, Stale};
+            match status {
+                Fresh => println!("package.json: in sync"),
+                Missing => println!("package.json: missing — run `meow sync`"),
+                Stale => println!("package.json: stale vs meow.config — run `meow sync`"),
+                HandEdited => eprintln!(
+                    "warning: root package.json was hand-edited; meow owns it (ADR-8) and \
+                     `meow sync` will overwrite it. Move publishing metadata into meow.config.ts."
+                ),
+            }
+            // NOTE: package.json staleness is the ONLY check CFG-002's doctor performs;
+            // the full environment/config/lockfile health surface is a later spec.
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("meow doctor: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+// === /CFG-002 ===
 
 // === RT-006 ===
 /// Build the hermetic (clock/rng/env) config from the `meow run` grant flags. No

@@ -120,9 +120,7 @@ impl HermeticState {
                 rng.fill_bytes(buf);
                 Ok(())
             }
-            RngState::Os => {
-                getrandom::fill(buf).map_err(|e| HermeticError::Entropy(e.to_string()))
-            }
+            RngState::Os => getrandom::fill(buf).map_err(|e| HermeticError::Entropy(e.to_string())),
         }
     }
 

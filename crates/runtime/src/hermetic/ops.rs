@@ -1,12 +1,11 @@
 //! The hermetic ops (RT-006 · A3): the four governed edges JS uses for time,
 //! entropy, and env. Each borrows the shared [`HermeticState`] out of `OpState`.
 //!
-//! `OpState` holds `Rc<RefCell<HermeticState>>`. [`install_hermetic`] seeds the
-//! configured state before a run; if a caller never seeds it, [`hermetic_state`]
-//! installs the fully-deterministic default — so the ops are deterministic by
-//! default and NEVER panic on a missing seed.
-//!
-//! [`install_hermetic`]: crate::Runtime::install_hermetic
+//! `OpState` holds `Rc<RefCell<HermeticState>>`, seeded by
+//! [`extensions`](super::extensions) / [`hermetic_config_extension`](super::hermetic_config_extension).
+//! If a caller wires `meow_hermetic` without a config extension, [`hermetic_state`]
+//! installs the fully-deterministic default on first touch — so the ops are
+//! deterministic by default and NEVER panic on a missing seed.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -20,18 +19,14 @@ use super::state::{HermeticError, HermeticState};
 /// mutate across draws). Type alias keeps the op signatures legible.
 pub type SharedHermeticState = Rc<RefCell<HermeticState>>;
 
-/// Get the shared state, installing the deterministic default on first touch.
-/// Deterministic-by-default without a panic when [`install_hermetic`] was not
-/// called.
-///
-/// [`install_hermetic`]: crate::Runtime::install_hermetic
+/// Get the shared state, installing the deterministic default on first touch so
+/// the ops are deterministic-by-default and never panic on a missing seed.
 fn hermetic_state(state: &mut OpState) -> SharedHermeticState {
     if let Some(st) = state.try_borrow::<SharedHermeticState>() {
         return st.clone();
     }
-    let st: SharedHermeticState = Rc::new(RefCell::new(HermeticState::new(
-        &HermeticConfig::default(),
-    )));
+    let st: SharedHermeticState =
+        Rc::new(RefCell::new(HermeticState::new(&HermeticConfig::default())));
     state.put(st.clone());
     st
 }
