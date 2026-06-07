@@ -167,10 +167,49 @@ impl Command {
 
 impl Cli {
     pub fn run(self) -> ExitCode {
-        let (verb, phase) = self.command.landing();
-        // HONEST stub (CRAFT — "the action must DO the work"): no fake success path.
-        // Structured, single-line, machine-greppable; stderr only; non-zero exit.
-        eprintln!("meow: not yet implemented — `{verb}` lands in PLAN {phase}");
-        ExitCode::from(EXIT_UNIMPLEMENTED)
+        match self.command {
+            // === CFG-001 ===
+            Command::Sync => cmd_sync(),
+            // === /CFG-001 ===
+            // HONEST stub (CRAFT — "the action must DO the work"): no fake success path.
+            // Structured, single-line, machine-greppable; stderr only; non-zero exit.
+            other => {
+                let (verb, phase) = other.landing();
+                eprintln!("meow: not yet implemented — `{verb}` lands in PLAN {phase}");
+                ExitCode::from(EXIT_UNIMPLEMENTED)
+            }
+        }
     }
 }
+
+// === CFG-001 ===
+/// `meow sync` — regenerate the shadow configs from `meow.config.json` (ADR-8).
+/// The binary edge owns host access (cwd) and error rendering; the library
+/// (`meow-config`) stays free of ambient reads (I-6).
+fn cmd_sync() -> ExitCode {
+    let root = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            eprintln!("meow sync: cannot resolve the current directory: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let cfg = match meow_config::MeowConfig::load(&root) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            eprintln!("meow sync: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(err) = meow_config::generate_shadow_tsconfig(&cfg, &root) {
+        eprintln!("meow sync: {err}");
+        return ExitCode::FAILURE;
+    }
+    if let Err(err) = meow_config::write_root_tsconfig_shim(&root) {
+        eprintln!("meow sync: {err}");
+        return ExitCode::FAILURE;
+    }
+    println!("meow sync: regenerated .meow/tsconfig.json + tsconfig.json shim");
+    ExitCode::SUCCESS
+}
+// === /CFG-001 ===

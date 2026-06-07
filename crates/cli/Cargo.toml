@@ -11,6 +11,9 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { workspace = true }
+# === CFG-001 === intra-workspace: the CLI dispatches `meow sync` to the config library.
+meow-config = { path = "../config" }
+# === /CFG-001 ===
 
 [dev-dependencies]
 assert_cmd = { workspace = true }

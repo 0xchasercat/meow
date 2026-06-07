@@ -1,6 +1,6 @@
 {
   "version": 3,
-  "updated_at": "2026-06-07T10:05:00Z",
+  "updated_at": "2026-06-07T11:30:00Z",
   "mode": "incubating",
   "phase": {
     "id": "P0",
@@ -9,10 +9,10 @@
   "active_task": null,
   "in_flight_agents": [],
   "subsystems": {
-    "GRAPH": { "status": "planned", "note": "spec GRAPH-001 drafted; build in wave 1b" },
+    "GRAPH": { "status": "planned", "note": "spec GRAPH-001 drafted; oxc+salsa pipeline — wave 1c" },
     "RT": { "status": "planned", "note": "specs RT-001/002/003 drafted; RT-001 (V8) next" },
     "LOAD": { "status": "planned", "note": "spec LOAD-001 drafted; needs GRAPH+PKG" },
-    "PKG": { "status": "planned", "note": "spec PKG-001 drafted; build in wave 1b" },
+    "PKG": { "status": "active", "note": "PKG-001 merged: meow.lock.jsonl + content-addressed cache" },
     "WS": { "status": "planned", "note": "monorepo graph discovery + linking (P4)" },
     "TASK": { "status": "planned", "note": "typed tasks, in/out hashing, artifact->task (P4)" },
     "TEST": { "status": "planned", "note": "isolate-per-file, deterministic clock (P6)" },
@@ -21,15 +21,17 @@
     "LSP": { "status": "planned", "note": "shared resolver + shadow symlink map (P2)" },
     "SEC": { "status": "planned", "note": "capability tiers, provenance (P6/P7)" },
     "OBS": { "status": "planned", "note": "why-slow/large/dep, trace, doctor (P6)" },
-    "CFG": { "status": "planned", "note": "spec CFG-001 drafted; build in wave 1b" },
+    "CFG": { "status": "active", "note": "CFG-001 merged: defineMeow + shadow tsconfig + meow sync" },
     "DIST": { "status": "active", "note": "DIST-001 merged: Cargo workspace + meow CLI skeleton" },
     "H": { "status": "planned", "note": "harness chores: hooks, CI, docs" }
   },
   "waves": [
-    { "id": 1, "specs": ["DIST-001"], "outcome": "merged" }
+    { "id": 1, "specs": ["DIST-001"], "outcome": "merged" },
+    { "id": 2, "specs": ["PKG-001", "CFG-001"], "outcome": "merged" }
   ],
   "gates": {
-    "footprint": { "status": "green", "at": "2026-06-07T10:05:00Z", "evidence_ref": "harness/reality-checks/footprint-1.md" }
+    "footprint": { "status": "green", "at": "2026-06-07T10:05:00Z", "evidence_ref": "harness/reality-checks/footprint-1.md" },
+    "craft": { "status": "green", "at": "2026-06-07T11:30:00Z", "evidence_ref": "harness/reality-checks/craft-1.md" }
   },
   "drift_flags": [],
   "decisions": {
@@ -46,7 +48,7 @@
       "harness/PLAN.md",
       "harness/CANON.md"
     ],
-    "active": "P0 Foundations — DIST-001 merged (Cargo workspace + meow CLI, full floor green). 7 wave-1 specs drafted + queued.",
-    "next_pull_hint": "Dispatch wave 1b: GRAPH-001, PKG-001, CFG-001 (no V8) in parallel; then RT-001 (de-risk rusty_v8 fetch first). Run craft+reality+intent ceiling on the wave."
+    "active": "P0 Foundations — DIST/PKG/CFG-001 merged (workspace, lockfile+cache, config+sync). Floor + craft green.",
+    "next_pull_hint": "Build GRAPH-001 (oxc+salsa pipeline) and RT-001 (V8 — de-risk rusty_v8 fetch), wave 1c; then RT-003 + LOAD-001 (need GRAPH/PKG). Craft-gate each."
   }
 }

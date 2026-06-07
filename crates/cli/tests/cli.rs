@@ -47,12 +47,15 @@ const CASES: &[(&[&str], &str, &str)] = &[
     (&["trace", "x.ts"], "trace", "P6"),
     (&["profile", "x.ts"], "profile", "P6"),
     (&["doctor"], "doctor", "P6"),
-    (&["sync"], "sync", "P1"),
 ];
 
 #[test]
 fn every_subcommand_stub_is_honest() {
-    assert_eq!(CASES.len(), 18, "all 18 subcommands covered");
+    assert_eq!(
+        CASES.len(),
+        17,
+        "all 17 stub subcommands covered (sync is real — CFG-001)"
+    );
     for (argv, verb, phase) in CASES {
         let expected = format!("meow: not yet implemented — `{verb}` lands in PLAN {phase}");
         meow()
@@ -62,6 +65,24 @@ fn every_subcommand_stub_is_honest() {
             .stdout(predicate::str::is_empty())
             .stderr(predicate::str::contains(expected));
     }
+}
+
+#[test]
+fn sync_generates_shadow_configs() {
+    // `meow sync` is real (CFG-001): regenerates the shadow tsconfig + root shim.
+    let tmp = std::env::temp_dir().join(format!("meow-sync-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).expect("temp dir");
+    std::fs::write(tmp.join("meow.config.json"), "{}").expect("write config");
+    meow().current_dir(&tmp).arg("sync").assert().success();
+    assert!(
+        tmp.join(".meow/tsconfig.json").is_file(),
+        "shadow .meow/tsconfig.json generated"
+    );
+    assert!(
+        tmp.join("tsconfig.json").is_file(),
+        "root tsconfig.json shim generated"
+    );
+    std::fs::remove_dir_all(&tmp).ok();
 }
 
 #[test]

@@ -38,3 +38,9 @@ anyhow = "1"
 assert_cmd = "2"
 predicates = "3"
 # === /DIST-001 ===
+# === PKG-001 ===
+# Content hashing for the cache + lockfile SRI (sha256-<base64>). Consumed by PKG (and later LOAD/SEC).
+sha2 = "0.10"
+base64 = "0.22"
+semver = "1"
+# === /PKG-001 ===
