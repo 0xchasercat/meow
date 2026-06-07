@@ -227,10 +227,20 @@ fn no_ambient_host_reads_in_src() {
         concat!("SystemTime", "::now"),
         concat!("Instant", "::now"),
         concat!("rand", "::"),
+        concat!("getr", "andom"),
     ];
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut offenders = Vec::new();
     visit(&src, &mut |path, contents| {
+        // === RT-006 ===
+        // src/hermetic/ is the ONE sanctioned home for host clock/entropy/env
+        // reads (mirrors principles-check.sh P16's /hermetic/ allowlist). A banned
+        // token ANYWHERE ELSE is the I-6 violation this guards (the single-seam
+        // invariant: the only SystemTime/Instant/getrandom/env edges live there).
+        if path.components().any(|c| c.as_os_str() == "hermetic") {
+            return;
+        }
+        // === /RT-006 ===
         for pat in BANNED {
             if contents.contains(pat) {
                 offenders.push(format!("{}: {pat}", path.display()));

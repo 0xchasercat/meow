@@ -1,13 +1,16 @@
 //! `fetch` capability gate + the permission glue deno_fetch requires (RT-004 · A3).
 //!
-//! deno_fetch (this pin) reads a concrete [`deno_permissions::PermissionsContainer`]
-//! out of `OpState` and resolves hosts through a pluggable [`deno_fetch::dns::Resolve`]
-//! DNS resolver. There is no per-request permission *trait* to implement anymore
-//! (the upstream model became concrete since the spec's `[INFERENCE]` sketch). We
-//! therefore wire meow's capability seam at the resolver: every hostname `fetch`
-//! resolves is checked against the RT-002 [`CapabilityCheck`] BEFORE any socket is
-//! opened (the resolver runs ahead of the connector). A denied host fails
-//! resolution → the `fetch` promise rejects with a `TypeError`, never a panic.
+//! `fetch` is the one host-touching global, so it routes through meow's single
+//! network seam — RT-002's [`CapabilityCheck`], reusing its existing
+//! [`CapRequest::NetConnect`] variant. The gate fires at the `fetch` *entry*: the
+//! committed `fetch` global is a thin JS wrapper (see `js/bootstrap.js`) that, for
+//! `http(s)` requests, parses the URL and calls [`op_meow_fetch_check`] with the
+//! connect target BEFORE the request op runs — i.e. before any socket. A denial
+//! rejects the `fetch` promise with a `TypeError`, never a Rust panic.
+//!
+//! The target carries the full **host:port** (e.g. `example.com:8443`), matching
+//! RT-002's `op_tcp_connect` — a policy can distinguish `:80` from `:8443`, not
+//! just the bare host.
 //!
 //! Honest boundaries (Operator notes, I-11):
 //! - The bytes flow through deno_fetch's own hyper/rustls client — NOT RT-002's
@@ -17,15 +20,17 @@
 //!   second-guesses meow's gate; meow's [`CapabilityCheck`] is the single network
 //!   authority. At P1 that seam defaults to `AllowAll` (seam, not enforcement —
 //!   SEC-001/P6); `fetch` is NOT sandboxed.
-//! - hyper-util's connector resolves IP-literal hosts (e.g. `127.0.0.1`) without
-//!   consulting a DNS resolver, so the gate fires for named hosts; tiered,
-//!   complete enforcement (incl. literals) is SEC-001/P6.
+//! - IP-literal hosts (e.g. `127.0.0.1`, `[::1]`) bypass the gate, unchanged from
+//!   the prior pre-DNS gate: hyper-util resolves literals without DNS, so meow's
+//!   pre-connection seam never saw them. Tiered, complete enforcement (incl.
+//!   literals, and the raw-op path the committed wrapper fronts) is SEC-001/P6.
 
 use std::borrow::Cow;
 use std::io;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::IpAddr;
 use std::path::Path;
 
+use deno_core::{op2, OpState};
 use deno_permissions::{
     AllowRunDescriptorParseResult, DenyRunDescriptor, EnvDescriptor, EnvDescriptorParseError,
     FfiDescriptor, ImportDescriptor, NetDescriptor, NetDescriptorParseError, PathQueryDescriptor,
@@ -33,50 +38,55 @@ use deno_permissions::{
     RunQueryDescriptor, SpecialFilePathQueryDescriptor, SysDescriptor, SysDescriptorParseError,
     WriteDescriptor,
 };
-use hyper_util::client::legacy::connect::dns::Name;
 
-use crate::io::CapRequest;
+use crate::io::{CapDenied, CapRequest};
 
 use super::NetCaps;
 
-/// deno_fetch DNS resolver that consults meow's capability seam before resolving
-/// (hence before connecting). On allow it performs ordinary name resolution; on
-/// deny it returns a permission error so `fetch` rejects without opening a socket.
-pub struct CapResolver {
-    caps: NetCaps,
+/// Typed failure when the capability seam refuses a `fetch` connect target.
+/// Implements `deno_error::JsError` so it crosses into JS as a thrown `TypeError`
+/// (the WHATWG fetch network-error class) — a rejected promise, never a panic.
+#[derive(Debug, thiserror::Error, deno_error::JsError)]
+pub enum FetchAuthError {
+    /// The network capability denied the connect target (host:port).
+    #[class(type)]
+    #[error("{0}")]
+    Denied(#[from] CapDenied),
 }
 
-impl CapResolver {
-    pub fn new(caps: NetCaps) -> Self {
-        Self { caps }
+/// Authorize a `fetch` connect target through meow's network seam. `host` is the
+/// URL hostname (possibly `[..]`-bracketed for IPv6) and `port` the resolved
+/// destination port (URL port or the scheme default). IP-literal hosts bypass the
+/// gate (see module docs); every named host is checked as the full `host:port`
+/// target, allocating only on the checked path.
+pub(crate) fn authorize_fetch(
+    state: &OpState,
+    host: &str,
+    port: u16,
+) -> Result<(), FetchAuthError> {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if bare.parse::<IpAddr>().is_ok() {
+        return Ok(());
     }
+    let target = format!("{host}:{port}");
+    state
+        .borrow::<NetCaps>()
+        .check(&CapRequest::NetConnect(&target))
+        .map_err(FetchAuthError::Denied)
 }
 
-impl std::fmt::Debug for CapResolver {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("CapResolver")
-    }
-}
-
-impl deno_fetch::dns::Resolve for CapResolver {
-    fn resolve(&self, name: Name) -> deno_fetch::dns::Resolving {
-        let host = name.as_str().to_string();
-        let caps = self.caps.clone();
-        Box::pin(async move {
-            // Authorization gate FIRST — before any socket (I-6 governed entry).
-            caps.check(&CapRequest::NetConnect(&host))
-                .map_err(|denied| io::Error::new(io::ErrorKind::PermissionDenied, denied.0))?;
-            // getaddrinfo is blocking; keep it off the event-loop thread.
-            let resolved = tokio::task::spawn_blocking(move || {
-                (host.as_str(), 0u16)
-                    .to_socket_addrs()
-                    .map(|it| it.collect::<Vec<SocketAddr>>())
-            })
-            .await
-            .map_err(io::Error::other)??;
-            Ok(resolved.into_iter())
-        })
-    }
+/// Sync op the committed `fetch` wrapper calls before the request op runs. Throws
+/// (rejecting the `fetch` promise) iff the seam denies the host:port target.
+#[op2(fast)]
+pub fn op_meow_fetch_check(
+    state: &mut OpState,
+    #[string] host: &str,
+    port: u16,
+) -> Result<(), FetchAuthError> {
+    authorize_fetch(state, host, port)
 }
 
 /// A no-op [`PermissionDescriptorParser`]. deno_fetch's `PermissionsContainer`

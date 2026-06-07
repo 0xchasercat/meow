@@ -1,23 +1,29 @@
-// strict-web ambient globals (RT-004 · CANON §8.1).
+// strict-web ambient globals — base (RT-004 · CANON §8.1).
 //
-// The committed P1 "Stateless Edge" global surface, typed for editors + `meow
-// check`. CURATED from the upstream WHATWG/WinterTC declarations (the same shapes
-// TypeScript's lib.dom.d.ts and Deno's .d.ts expose); NOT generated from Rust
-// (I-9's generate-from-impl applies to the `meow:*` modules — RT-005). Scoped to
-// EXACTLY the §8.1 set: the shadow tsconfig pins `lib: ["esnext"]` (no DOM), so
-// `window`/`document`/`localStorage`/`WebSocket` are intentionally absent here —
-// the types match the runtime surface, nothing more (CRAFT: prose matches code).
+// The always-present part of the committed P1 "Stateless Edge" global surface,
+// typed for editors + `meow check`. CURATED from the upstream WHATWG/WinterTC
+// declarations (the same shapes TypeScript's lib.dom.d.ts and Deno's .d.ts
+// expose); NOT generated from Rust (I-9's generate-from-impl applies to the
+// `meow:*` modules — RT-005). Scoped to EXACTLY the §8.1 set: the shadow tsconfig
+// pins `lib: ["esnext"]` (no DOM), so `window`/`document`/`localStorage`/
+// `WebSocket` are intentionally absent here — the types match the runtime
+// surface, nothing more (CRAFT: prose matches code).
+//
+// The `fetch` group (`fetch`/`Headers`/`Request`/`Response`/`FormData`) lives in
+// the sibling `strict-web.fetch.d.ts`, appended ONLY when the runtime is built
+// with the default-on `web-fetch` feature (meow_runtime::web::STRICT_WEB_DTS). A
+// no-fetch build omits those globals at runtime, so it must omit their types too,
+// or code typechecks then throws `ReferenceError` (honest typing, I-9/I-11).
 //
 // Honest boundary: the runtime exposes a SUPERSET transitively (streams beyond
 // fetch bodies, EventTarget, structuredClone, atob/btoa, performance,
 // crypto.getRandomValues). Those are present-but-uncommitted: not declared here,
-// not promised. `ReadableStream` is declared minimally only because `Request`/
-// `Response` bodies reference it; stream construction is not a committed surface.
+// not promised. `ReadableStream` is declared minimally only because `Blob.stream`
+// (and the fetch bodies, when present) reference it; stream construction is not a
+// committed surface.
 
 // --- shared helper types (not globals; underpin the declarations below) ---
 type BufferSource = ArrayBufferView | ArrayBuffer;
-type BodyInit = string | Blob | BufferSource | FormData | URLSearchParams | ReadableStream<Uint8Array>;
-type HeadersInit = Headers | Record<string, string> | [string, string][];
 type AlgorithmIdentifier = string | { readonly name: string };
 type BlobPart = BufferSource | Blob | string;
 
@@ -83,7 +89,11 @@ interface AbortController {
 }
 declare var AbortController: { prototype: AbortController; new (): AbortController };
 
-// --- blob / file (deno_web) ---
+// --- blob (deno_web) ---
+// `File` is NOT a committed global (CANON §8.1 commits only `Blob`/`FormData`);
+// it ships transitively but is not promised here. Its interface is declared
+// minimally in `strict-web.fetch.d.ts` only because `FormData` entries reference
+// it — there is no `File` value binding, so it is not constructable as committed API.
 interface Blob {
   readonly size: number;
   readonly type: string;
@@ -96,15 +106,6 @@ interface Blob {
 declare var Blob: {
   prototype: Blob;
   new (parts?: BlobPart[], options?: { type?: string; endings?: "transparent" | "native" }): Blob;
-};
-
-interface File extends Blob {
-  readonly name: string;
-  readonly lastModified: number;
-}
-declare var File: {
-  prototype: File;
-  new (parts: BlobPart[], name: string, options?: { type?: string; lastModified?: number }): File;
 };
 
 // --- url / urlpattern (deno_web) ---
@@ -219,93 +220,6 @@ interface Crypto {
 }
 declare var Crypto: { prototype: Crypto };
 declare var crypto: Crypto;
-
-// --- fetch group (deno_fetch): Headers / Request / Response / FormData / fetch ---
-interface Headers {
-  append(name: string, value: string): void;
-  delete(name: string): void;
-  get(name: string): string | null;
-  getSetCookie(): string[];
-  has(name: string): boolean;
-  set(name: string, value: string): void;
-  forEach(callback: (value: string, key: string, parent: Headers) => void): void;
-  entries(): IterableIterator<[string, string]>;
-  keys(): IterableIterator<string>;
-  values(): IterableIterator<string>;
-  [Symbol.iterator](): IterableIterator<[string, string]>;
-}
-declare var Headers: { prototype: Headers; new (init?: HeadersInit): Headers };
-
-type FormDataEntryValue = File | string;
-interface FormData {
-  append(name: string, value: string): void;
-  delete(name: string): void;
-  get(name: string): FormDataEntryValue | null;
-  getAll(name: string): FormDataEntryValue[];
-  has(name: string): boolean;
-  set(name: string, value: string): void;
-  forEach(callback: (value: FormDataEntryValue, key: string, parent: FormData) => void): void;
-  entries(): IterableIterator<[string, FormDataEntryValue]>;
-  keys(): IterableIterator<string>;
-  values(): IterableIterator<FormDataEntryValue>;
-  [Symbol.iterator](): IterableIterator<[string, FormDataEntryValue]>;
-}
-declare var FormData: { prototype: FormData; new (): FormData };
-
-type RequestMethod = string;
-interface RequestInit {
-  method?: RequestMethod;
-  headers?: HeadersInit;
-  body?: BodyInit | null;
-  signal?: AbortSignal | null;
-  redirect?: "follow" | "error" | "manual";
-}
-interface Body {
-  readonly body: ReadableStream<Uint8Array> | null;
-  readonly bodyUsed: boolean;
-  arrayBuffer(): Promise<ArrayBuffer>;
-  bytes(): Promise<Uint8Array>;
-  blob(): Promise<Blob>;
-  formData(): Promise<FormData>;
-  json(): Promise<unknown>;
-  text(): Promise<string>;
-}
-interface Request extends Body {
-  readonly method: string;
-  readonly url: string;
-  readonly headers: Headers;
-  readonly redirect: "follow" | "error" | "manual";
-  readonly signal: AbortSignal;
-  clone(): Request;
-}
-declare var Request: {
-  prototype: Request;
-  new (input: string | URL | Request, init?: RequestInit): Request;
-};
-
-interface ResponseInit {
-  status?: number;
-  statusText?: string;
-  headers?: HeadersInit;
-}
-interface Response extends Body {
-  readonly ok: boolean;
-  readonly status: number;
-  readonly statusText: string;
-  readonly headers: Headers;
-  readonly redirected: boolean;
-  readonly url: string;
-  clone(): Response;
-}
-declare var Response: {
-  prototype: Response;
-  new (body?: BodyInit | null, init?: ResponseInit): Response;
-  error(): Response;
-  json(data: unknown, init?: ResponseInit): Response;
-  redirect(url: string | URL, status?: number): Response;
-};
-
-declare function fetch(input: string | URL | Request, init?: RequestInit): Promise<Response>;
 
 // --- timers (deno_web) ---
 declare function setTimeout(handler: (...args: unknown[]) => void, timeout?: number, ...args: unknown[]): number;

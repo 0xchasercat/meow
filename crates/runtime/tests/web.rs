@@ -150,6 +150,62 @@ async fn web_no_dom() {
     );
 }
 
+// `File` ships transitively via deno_web but is NOT a committed §8.1 global
+// (which commits only `Blob`/`FormData`): the bootstrap must not bind it, so it
+// stays `undefined` while `Blob` (committed) is present (I-11 superset honesty).
+#[tokio::test]
+async fn web_file_is_not_a_global() {
+    let (out, mut rt) = web_runtime(allow_all());
+    run_src(
+        &mut rt,
+        "file:///file.js",
+        r#"console.log(typeof File, typeof Blob);"#,
+    )
+    .await
+    .expect("file probe runs");
+    assert_eq!(out.borrow().trim(), "undefined function");
+}
+
+// The curated ambient decl `meow sync` writes (and threads into the shadow
+// tsconfig) tracks the `web-fetch` feature: a no-fetch build must not type a
+// global that throws `ReferenceError` at runtime. Asserted in both build configs
+// so `cargo test -p meow-runtime [--no-default-features]` both hold (finding 2).
+#[test]
+fn strict_web_dts_tracks_web_fetch_feature() {
+    let dts = meow_runtime::web::STRICT_WEB_DTS;
+    // Base globals are present regardless of feature.
+    assert!(dts.contains("declare var Blob"), "Blob is always committed");
+    assert!(dts.contains("declare var URL"), "URL is always committed");
+    // `File` is never a committed global in either build.
+    assert!(
+        !dts.contains("declare var File"),
+        "File must not be a committed global"
+    );
+
+    let fetch_decls = [
+        "declare function fetch",
+        "declare var Headers",
+        "declare var Request",
+        "declare var Response",
+        "declare var FormData",
+    ];
+    if cfg!(feature = "web-fetch") {
+        for d in fetch_decls {
+            assert!(
+                dts.contains(d),
+                "default build must type the fetch group: {d}"
+            );
+        }
+    } else {
+        for d in fetch_decls {
+            assert!(
+                !dts.contains(d),
+                "no-fetch build must omit the fetch group: {d}"
+            );
+        }
+    }
+}
+
 // --- fetch: end-to-end + capability gate -----------------------------------
 
 #[cfg(feature = "web-fetch")]
@@ -300,9 +356,12 @@ mod fetch {
             recorder.net_checks.load(Ordering::SeqCst) >= 1,
             "the capability seam must be consulted on the fetch path"
         );
+        // The seam must see the FULL connect target — host:port, not just the host
+        // (parity with op_tcp_connect): a policy can distinguish :80 from :8443.
+        let expected = format!("localhost:{port}");
         assert!(
-            recorder.targets.lock().iter().any(|t| t == "localhost"),
-            "the seam saw the connect target: {:?}",
+            recorder.targets.lock().contains(&expected),
+            "the seam saw the host:port connect target {expected:?}, got: {:?}",
             recorder.targets.lock()
         );
     }

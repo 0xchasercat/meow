@@ -19,8 +19,15 @@ pub const GENERATED_HEADER: &str = "// GENERATED — do not edit (run: meow sync
 
 /// Exact, byte-stable content of the committed root `tsconfig.json` shim (ADR-8).
 /// Pure JSON (no header) so every legacy tool reads it; trailing newline included.
-pub const ROOT_TSCONFIG_SHIM: &str =
-    "{ \"extends\": \"./.meow/tsconfig.json\", \"include\": [\".\"] }\n";
+///
+/// MINIMAL on purpose — `extends` only, NO `include`/`files`. The shadow base
+/// (`.meow/tsconfig.json`) owns the entire file set: project sources via its
+/// `include` and the ambient strict-web decl via its `files`. A derived config's
+/// own `include`/`files` do NOT merge with the base's (they replace per key), so
+/// any list here would shadow the base's; keeping the shim list-free lets the
+/// generated base govern both. See [`render_tsconfig`] for why the decl needs an
+/// explicit `files` entry (TS globs skip dot-dirs like `.meow/`, RT-004).
+pub const ROOT_TSCONFIG_SHIM: &str = "{ \"extends\": \"./.meow/tsconfig.json\" }\n";
 
 // === RT-004 ===
 /// File name of the curated strict-web ambient decl inside `.meow/`, referenced
@@ -40,7 +47,7 @@ pub const STRICT_WEB_DTS_FILE: &str = "strict-web.d.ts";
 ///
 /// `workspace.packages` deliberately produces no `paths`/`references` here — the
 /// `paths` map into `.meow/deps/` is LSP-001's job (CANON §20.1, Q8). CFG-001 emits
-/// only `compilerOptions` + `include` so the file is correct-and-minimal.
+/// `compilerOptions` + the RT-004 `files`/`include` set so the file is correct-and-minimal.
 fn render_tsconfig(cfg: &MeowConfig) -> String {
     // Mapping table (the only mapping P0 owns):
     //   types.strict                       -> "strict"
@@ -70,11 +77,21 @@ fn render_tsconfig(cfg: &MeowConfig) -> String {
             // === /RT-004 ===
         },
         // === RT-004 ===
-        // Load the ambient strict-web decl into every program; `meow sync` writes it
-        // next to this file (write_shadow_types). `include` lives in the committed
-        // ROOT shim (resolved relative to the project root) — placed here in `.meow/`
-        // it would resolve to `.meow/` and find no project source.
-        "files": [format!("./{STRICT_WEB_DTS_FILE}")]
+        // The file set lives HERE (the base), not in the committed root shim — the
+        // shim is a list-free `extends`, so this base governs the whole program.
+        //
+        // `files`: load the ambient strict-web decl into every program. `meow sync`
+        // writes it next to this file (write_shadow_types). The path is relative to
+        // THIS config's dir (`.meow/`), so `./strict-web.d.ts` resolves correctly. It
+        // MUST be a `files` entry, not picked up by `include`: TS file globs skip
+        // dot-directories, so `.meow/strict-web.d.ts` would never be globbed.
+        //
+        // `include: [".."]`: the project root, relative to `.meow/`. TS recurses it
+        // for sources (excluding dot-dirs + node_modules), so the user's own files
+        // are typechecked — without the shim needing its own `include`. The base's
+        // `files` + `include` both flow into the minimal root via `extends`.
+        "files": [format!("./{STRICT_WEB_DTS_FILE}")],
+        "include": [".."]
         // === /RT-004 ===
     });
 

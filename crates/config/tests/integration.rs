@@ -77,12 +77,43 @@ fn root_shim_content_is_exact() {
 
     let bytes = std::fs::read(tmp.path().join("tsconfig.json")).expect("read shim");
     assert_eq!(bytes, ROOT_TSCONFIG_SHIM.as_bytes());
-    // The shim carries `include` (resolved relative to the project root) so tools that
-    // read the root tsconfig actually see project source; placing it in the shadow would
-    // resolve it to `.meow/` and find nothing (RT-004).
+    // The shim is MINIMAL — a list-free `extends`. The shadow base owns the file
+    // set (project sources + the ambient decl); a derived `include`/`files` here
+    // would replace (not merge with) the base's, dropping one or the other (RT-004).
     assert_eq!(
         ROOT_TSCONFIG_SHIM,
-        "{ \"extends\": \"./.meow/tsconfig.json\", \"include\": [\".\"] }\n"
+        "{ \"extends\": \"./.meow/tsconfig.json\" }\n"
+    );
+    assert!(
+        !ROOT_TSCONFIG_SHIM.contains("include") && !ROOT_TSCONFIG_SHIM.contains("files"),
+        "the shim must not carry its own file set"
+    );
+}
+
+// --- RT-004: the shadow base references the ambient decl + project sources --------
+
+#[test]
+fn shadow_base_references_ambient_decl_and_project_sources() {
+    let tmp = TempDir::new();
+    generate_shadow_tsconfig(&MeowConfig::default(), tmp.path()).expect("generate shadow");
+
+    let raw = std::fs::read_to_string(shadow_path(tmp.path())).expect("read shadow");
+    let body = &raw[raw.find('\n').expect("header newline") + 1..];
+    let json: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
+
+    // The ambient strict-web decl is loaded via top-level `files` (relative to
+    // `.meow/`, so it survives TS's dot-dir glob exclusion) — NOT via `include`.
+    assert_eq!(
+        json["files"],
+        serde_json::json!(["./strict-web.d.ts"]),
+        "ambient decl must be referenced from the base via `files`"
+    );
+    // Project sources come from `include: [".."]` (the project root, relative to
+    // `.meow/`), so the minimal root shim need carry no file set of its own.
+    assert_eq!(
+        json["include"],
+        serde_json::json!([".."]),
+        "base must include the project root for the user's own sources"
     );
 }
 
@@ -215,12 +246,14 @@ fn strict_false_propagates_and_erasable_flags_always_present() {
             "erasable-only flag {flag} must always be present and true (I-3)"
         );
     }
-    // RT-004: `include` moved to the root shim (resolved relative to the project root);
-    // the shadow carries `lib: ["esnext"]` (no DOM) + a top-level `files` referencing the
-    // curated strict-web ambient decl loaded into every program.
-    assert!(
-        json.get("include").is_none(),
-        "shadow must NOT carry `include` (it would resolve to .meow/ — RT-004)"
+    // RT-004: the shadow base owns the whole file set. `include: [".."]` (the project
+    // root, relative to `.meow/`) pulls the user's sources; the ambient strict-web
+    // decl loads via the top-level `files` (an explicit path survives TS's dot-dir
+    // glob exclusion). The committed root shim stays a list-free `extends`.
+    assert_eq!(
+        json["include"],
+        serde_json::json!([".."]),
+        "shadow base must include the project root for the user's sources (RT-004)"
     );
     assert_eq!(opts["lib"], serde_json::json!(["esnext"]));
     assert_eq!(json["files"], serde_json::json!(["./strict-web.d.ts"]));

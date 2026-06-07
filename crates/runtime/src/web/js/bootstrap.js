@@ -54,9 +54,11 @@ const abortSignal = load("ext:deno_web/03_abort_signal.js");
 def("AbortController", abortSignal.AbortController);
 def("AbortSignal", abortSignal.AbortSignal);
 
+// `09_file.js` exports both `Blob` and `File`; we bind ONLY `Blob`. `File` is a
+// transitive deno_web global but NOT in the committed 8.1 set (which commits only
+// `Blob`/`FormData`), so it must not ship as committed API (I-11 superset honesty).
 const file = load("ext:deno_web/09_file.js");
 def("Blob", file.Blob);
-def("File", file.File);
 
 const url = load("ext:deno_web/00_url.js");
 def("URL", url.URL);
@@ -120,9 +122,40 @@ if (typeof core.ops.op_fetch === "function") {
   const response = load("ext:deno_fetch/23_response.js");
   def("Response", response.Response);
 
-  const fetch = load("ext:deno_fetch/26_fetch.js");
+  // `fetch` is the one host-touching global, so the committed `fetch` is a thin
+  // wrapper that authorizes the connect target through meow's single network seam
+  // BEFORE the request op runs (op_meow_fetch_check -> RT-002 CapabilityCheck). For
+  // http(s) it passes the full host:port (parity with op_tcp_connect); IP-literal
+  // hosts bypass on the Rust side (SEC-001/P6). A denial rejects the returned
+  // promise with a TypeError; non-http(s) and unparseable inputs fall through so
+  // deno_fetch produces its own standard error (we add no behavior).
+  const fetchImpl = load("ext:deno_fetch/26_fetch.js").fetch;
+  function authorizeTarget(input) {
+    let urlStr;
+    if (typeof input === "string") urlStr = input;
+    else if (input instanceof URL) urlStr = input.href;
+    else if (input && typeof input.url === "string") urlStr = input.url;
+    if (urlStr === undefined) return;
+    let u;
+    try {
+      u = new URL(urlStr);
+    } catch {
+      return; // let deno_fetch reject with its own URL error
+    }
+    if (u.protocol !== "http:" && u.protocol !== "https:") return;
+    const port = u.port || (u.protocol === "https:" ? "443" : "80");
+    core.ops.op_meow_fetch_check(u.hostname, Number(port));
+  }
+  function meowFetch(input, init) {
+    try {
+      authorizeTarget(input);
+    } catch (e) {
+      return Promise.reject(e); // WHATWG: network failures reject, never throw sync
+    }
+    return fetchImpl(input, init);
+  }
   Object.defineProperty(globalThis, "fetch", {
-    value: fetch.fetch,
+    value: meowFetch,
     writable: true,
     enumerable: true,
     configurable: true,

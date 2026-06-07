@@ -27,22 +27,38 @@ use deno_core::Extension;
 pub mod perms;
 
 /// The curated strict-web ambient global declarations (CANON §8.1), embedded in
-/// the binary. `meow sync` writes this verbatim into `.meow/types/strict-web.d.ts`
-/// so editors + `meow check` resolve the §8.1 globals with nothing installed (I-9).
+/// the binary. `meow sync` writes this verbatim into `.meow/strict-web.d.ts` so
+/// editors + `meow check` resolve the §8.1 globals with nothing installed (I-9).
 /// Curated from the upstream WHATWG/Deno `.d.ts`, scoped to exactly the committed
 /// set; the shadow tsconfig pins `lib: ["esnext"]` so no DOM leaks in.
-pub const STRICT_WEB_DTS: &str = include_str!("lib/strict-web.d.ts");
+///
+/// FEATURE-CORRECT: the `fetch` group (`fetch`/`Headers`/`Request`/`Response`/
+/// `FormData`) lives in `strict-web.fetch.d.ts` and is appended ONLY under the
+/// default-on `web-fetch` feature — the same feature that wires `deno_fetch`. A
+/// `--no-default-features` build omits the extension AND these types together, so
+/// the typed surface never promises a global that would throw `ReferenceError`
+/// (I-9/I-11). The CLI links this crate with its real features, so the bytes it
+/// threads into `meow_config`'s shadow-gen already track the build.
+#[cfg(feature = "web-fetch")]
+pub const STRICT_WEB_DTS: &str = concat!(
+    include_str!("lib/strict-web.base.d.ts"),
+    include_str!("lib/strict-web.fetch.d.ts"),
+);
+/// See the `web-fetch` variant above. No-fetch build: base globals only.
+#[cfg(not(feature = "web-fetch"))]
+pub const STRICT_WEB_DTS: &str = include_str!("lib/strict-web.base.d.ts");
 
-/// The `fetch` network capability handle. `Send + Sync` because deno_fetch's DNS
-/// resolver runs in `tokio::spawn`; it reuses RT-002's [`CapabilityCheck`] seam
-/// (and its [`CapRequest::NetConnect`](crate::io::CapRequest::NetConnect) variant)
-/// behind an `Arc`. At P1 the default is RT-002's `AllowAll` (seam, not
-/// enforcement — SEC-001/P6).
+/// The `fetch` network capability handle, seeded into `OpState` for the
+/// `op_meow_fetch_check` gate. It reuses RT-002's [`CapabilityCheck`] seam (and its
+/// [`CapRequest::NetConnect`](crate::io::CapRequest::NetConnect) variant) behind an
+/// `Arc`. At P1 the default is RT-002's `AllowAll` (seam, not enforcement —
+/// SEC-001/P6). `Send + Sync` so the same handle composes with deno_fetch's
+/// `Send`-bound machinery; the gate itself runs synchronously on the op thread.
 pub type NetCaps = Arc<dyn crate::io::CapabilityCheck + Send + Sync>;
 
 /// Inputs needed to stand up the Web globals.
 pub struct WebOptions {
-    /// The network gate `fetch` consults before resolving a host (A3).
+    /// The network gate `fetch` consults before connecting (full host:port, A3).
     pub caps: NetCaps,
     /// `User-Agent` the fetch client sends — a fixed build-time string (no host
     /// read, I-6), e.g. `"meow/<version>"`.
@@ -54,6 +70,12 @@ deno_core::extension!(
     esm_entry_point = "ext:meow_web/bootstrap.js",
     esm = [dir "src/web/js", "bootstrap.js"],
 );
+
+// The `fetch` capability gate op. Registered only with `web-fetch` (it borrows the
+// fetch-only `NetCaps` seed); the committed `fetch` wrapper in `bootstrap.js` calls
+// it before the request op runs.
+#[cfg(feature = "web-fetch")]
+deno_core::extension!(meow_web_fetch, ops = [perms::op_meow_fetch_check],);
 
 /// Build the ordered Stateless-Edge extension list (CANON §8.1) to append to
 /// RT-001's `RuntimeOptions.extensions`. Order: `deno_webidl` → `deno_web` →
@@ -82,9 +104,10 @@ pub fn extensions(opts: WebOptions) -> Vec<Extension> {
     exts
 }
 
-/// The `deno_fetch` extension plus the `OpState` seed for the concrete
-/// `PermissionsContainer` it reads (set to `allow_all` — meow's own capability
-/// gate is the DNS resolver, see [`perms`]).
+/// The `deno_fetch` extension, the `op_meow_fetch_check` capability gate, and the
+/// `OpState` seeds both consume: the concrete `PermissionsContainer` deno_fetch
+/// reads (set to `allow_all` — meow's gate is the single authority) and the
+/// [`NetCaps`] the gate checks (see [`perms`]).
 #[cfg(feature = "web-fetch")]
 fn fetch_extensions(caps: NetCaps, user_agent: String) -> Vec<Extension> {
     use deno_permissions::PermissionsContainer;
@@ -94,8 +117,10 @@ fn fetch_extensions(caps: NetCaps, user_agent: String) -> Vec<Extension> {
 
     let options = deno_fetch::Options {
         user_agent,
-        // meow's capability seam runs ahead of the connector (A3, I-6).
-        resolver: deno_fetch::dns::Resolver::custom(Arc::new(perms::CapResolver::new(caps))),
+        // Default GAI resolver: meow's gate runs at the `fetch` entry (the bootstrap
+        // wrapper → op_meow_fetch_check), not at DNS, so the seam sees the full
+        // host:port connect target (A3, I-6). deno_fetch's own permission container
+        // is allow_all, so meow's seam is the sole authority.
         // Default `file:` handler errors for every request — `file:` fetch is out
         // of scope at P1, denied without touching the disk (no FS authority, I-6).
         ..Default::default()
@@ -103,10 +128,13 @@ fn fetch_extensions(caps: NetCaps, user_agent: String) -> Vec<Extension> {
     vec![
         deno_net::deno_net::init(None, None),
         deno_fetch::deno_fetch::init(options),
+        meow_web_fetch::init(),
         Extension {
             name: "meow_web_fetch_perms",
             op_state_fn: Some(Box::new(move |state| {
                 state.put::<PermissionsContainer>(perms_container.clone());
+                // The network seam the gate consults (op_meow_fetch_check).
+                state.put::<NetCaps>(caps.clone());
             })),
             ..Default::default()
         },
