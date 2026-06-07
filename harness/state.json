@@ -1,6 +1,6 @@
 {
   "version": 3,
-  "updated_at": "2026-06-08T00:30:00Z",
+  "updated_at": "2026-06-08T02:00:00Z",
   "mode": "incubating",
   "phase": {
     "id": "P1",
@@ -10,8 +10,8 @@
   "in_flight_agents": [],
   "subsystems": {
     "GRAPH": { "status": "active", "note": "GRAPH-001 + RT-003 merged: Oxc pipeline (single parser, I-1) + erasable type-strip (I-3)" },
-    "RT": { "status": "active", "note": "RT-001/002/004/006 merged: V8, meow run, async I/O seam, strict-web globals, determinism harness" },
-    "LOAD": { "status": "active", "note": "LOAD-001 merged: single resolver + cache-read + strip wiring; LOAD-003 (full Node resolution) remains" },
+    "RT": { "status": "active", "note": "RT-001/002/004/005/006 merged: V8, meow run, async I/O seam, strict-web globals, meow:http serve + typegen, determinism harness" },
+    "LOAD": { "status": "active", "note": "LOAD-001 + LOAD-003 merged: the single resolver with full Node resolution (exports/imports/conditions/patterns/self-ref), no node_modules" },
     "PKG": { "status": "active", "note": "PKG-001 merged: meow.lock.jsonl + content-addressed cache" },
     "WS": { "status": "planned", "note": "monorepo graph discovery + linking (P4)" },
     "TASK": { "status": "planned", "note": "typed tasks, in/out hashing, artifact->task (P4)" },
@@ -35,15 +35,21 @@
     { "id": 7, "specs": ["RT-002"], "outcome": "merged" },
     { "id": 8, "specs": ["RT-004"], "outcome": "merged" },
     { "id": 9, "specs": ["RT-006"], "outcome": "merged" },
-    { "id": 10, "specs": ["CFG-002"], "outcome": "merged" }
+    { "id": 10, "specs": ["CFG-002"], "outcome": "merged" },
+    { "id": 11, "specs": ["LOAD-003"], "outcome": "merged" },
+    { "id": 12, "specs": ["RT-005"], "outcome": "merged" }
   ],
   "gates": {
-    "footprint": { "status": "green", "at": "2026-06-07T23:30:00Z", "evidence_ref": "harness/reality-checks/footprint-3.md" },
-    "craft": { "status": "green", "at": "2026-06-07T23:30:00Z", "evidence_ref": "harness/reality-checks/craft-7.md" },
-    "strip-fidelity": { "status": "green", "at": "2026-06-07T17:30:00Z", "evidence_ref": "harness/reality-checks/strip-fidelity-1.md" }
+    "footprint": { "status": "green", "at": "2026-06-08T01:45:00Z", "evidence_ref": "harness/reality-checks/footprint-3.md" },
+    "craft": { "status": "green", "at": "2026-06-08T01:15:00Z", "evidence_ref": "harness/reality-checks/craft-7.md" },
+    "strip-fidelity": { "status": "green", "at": "2026-06-07T17:30:00Z", "evidence_ref": "harness/reality-checks/strip-fidelity-1.md" },
+    "types-fresh": { "status": "green", "at": "2026-06-08T01:45:00Z", "evidence_ref": "RT-005 meow types --check fresh; committed crates/runtime/types/meow" },
+    "resolver-parity": { "status": "green", "at": "2026-06-08T01:45:00Z", "evidence_ref": "LOAD-003 resolution_corpus; one Resolver for runtime+LSP" },
+    "determinism": { "status": "green", "at": "2026-06-08T01:45:00Z", "evidence_ref": "RT-006 hermetic; meow run byte-identical (TZ/locale residual named)" }
   },
   "drift_flags": [
-    { "id": "DF-001", "severity": "medium", "tag": "process", "summary": "RT-006 (451855c)+CFG-002 (2a97cef) reached main via a concurrent committer, ungated by the orchestrator; floor-green + state reconciled; craft/reality gate owed; coordinate before more dispatch.", "ref": "git 451855c,2a97cef" }
+    { "id": "DF-001", "severity": "low", "tag": "process", "summary": "Two autonomous builders ran wave-2 concurrently; all commits integrated, floor+craft green. Resolved - wave-2 converged; coordinate committers before P2.", "ref": "git 451855c,2a97cef,99415f8,b2c7500" },
+    { "id": "DF-002", "severity": "medium", "tag": "craft", "summary": "craft-7 majors (PASS): M1 condition fixed-priority vs Node order; M2 fetch/serve two cap handles (AllowAll, SEC-001 unifies); M3 TZ/locale not virtualized. Boundaries named; fixes follow-up.", "ref": "harness/reality-checks/craft-7.md" }
   ],
   "decisions": {
     "open": 0,
@@ -59,7 +65,7 @@
       "harness/PLAN.md",
       "harness/CANON.md"
     ],
-    "active": "P1 — RT-006 + CFG-002 committed by a concurrent committer (ungated-by-orchestrator, floor-green); state reconciled. RT-004 last craft-gated. Coordination issue (DF-001) surfaced.",
-    "next_pull_hint": "RT-005 + LOAD-003 remain. Post-hoc craft-gate the ungated merges RT-006/CFG-002; coordinate the concurrent committer before more dispatch (conflict risk)."
+    "active": "P1 (MVP) COMPLETE - all 5 wave-2 specs merged + gated (RT-004/006/CFG-002/LOAD-003/RT-005). meow run a TS meow:http web server end-to-end, no node_modules, deterministic by default; floor + craft(7 PASS) + footprint(25MB gzip) + types-fresh + resolver-parity green. MVP exit met.",
+    "next_pull_hint": "P2 Packages & Resolution: PKG-002 install+integrity, PKG-003 PnP + --materialize, LSP-001 shared resolver. Follow-ups: craft DF-002 (unify cap handle; pin V8 UTC)."
   }
 }
