@@ -2,7 +2,7 @@
 spec_id: DIST-001
 title: "Cargo workspace + meow CLI skeleton; upstream V8 pins"
 subsystem: crates/cli (+ workspace root)
-status: drafting
+status: merged
 blast_radius: high
 plan_ref: "Initial spec backlog · Wave 1 (DIST-001); Build sequence · P0 Foundations"
 constitution_ref: [I-10]

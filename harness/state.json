@@ -1,6 +1,6 @@
 {
   "version": 3,
-  "updated_at": "2026-06-07T09:10:00Z",
+  "updated_at": "2026-06-07T10:05:00Z",
   "mode": "incubating",
   "phase": {
     "id": "P0",
@@ -9,24 +9,28 @@
   "active_task": null,
   "in_flight_agents": [],
   "subsystems": {
-    "GRAPH": { "status": "planned", "note": "Oxc CST/semantic/module/IR pipeline; incremental query system" },
-    "RT": { "status": "planned", "note": "V8 embedding, event loop, ops, Web globals, meow:* surface" },
-    "LOAD": { "status": "planned", "note": "ESM resolution, CJS->ESM wrap, the one shared resolver" },
-    "PKG": { "status": "planned", "note": "content-addressed cache, meow.lock.jsonl, install modes" },
-    "WS": { "status": "planned", "note": "monorepo graph discovery + linking" },
-    "TASK": { "status": "planned", "note": "typed meow.tasks.ts, in/out hashing, artifact->task" },
-    "TEST": { "status": "planned", "note": "isolate-per-file, deterministic clock + fake net" },
-    "TOOL": { "status": "planned", "note": "lint/format/bundle over the shared graph" },
-    "CHK": { "status": "planned", "note": "delegated tsc/tsgo daemon + fast-preview linter" },
-    "LSP": { "status": "planned", "note": "shared resolver, meow:* types, shadow symlink map" },
-    "SEC": { "status": "planned", "note": "capability tiers, provenance (Sigstore/OSV), anomaly detect" },
-    "OBS": { "status": "planned", "note": "why-slow/large/dep, trace, profile, doctor" },
-    "CFG": { "status": "planned", "note": "defineMeow + shadow config generation + sync" },
-    "DIST": { "status": "planned", "note": "static binary, upstream V8 pinning, SemVer" },
+    "GRAPH": { "status": "planned", "note": "spec GRAPH-001 drafted; build in wave 1b" },
+    "RT": { "status": "planned", "note": "specs RT-001/002/003 drafted; RT-001 (V8) next" },
+    "LOAD": { "status": "planned", "note": "spec LOAD-001 drafted; needs GRAPH+PKG" },
+    "PKG": { "status": "planned", "note": "spec PKG-001 drafted; build in wave 1b" },
+    "WS": { "status": "planned", "note": "monorepo graph discovery + linking (P4)" },
+    "TASK": { "status": "planned", "note": "typed tasks, in/out hashing, artifact->task (P4)" },
+    "TEST": { "status": "planned", "note": "isolate-per-file, deterministic clock (P6)" },
+    "TOOL": { "status": "planned", "note": "lint/format/bundle over shared graph (P3)" },
+    "CHK": { "status": "planned", "note": "delegated tsc/tsgo daemon (P3)" },
+    "LSP": { "status": "planned", "note": "shared resolver + shadow symlink map (P2)" },
+    "SEC": { "status": "planned", "note": "capability tiers, provenance (P6/P7)" },
+    "OBS": { "status": "planned", "note": "why-slow/large/dep, trace, doctor (P6)" },
+    "CFG": { "status": "planned", "note": "spec CFG-001 drafted; build in wave 1b" },
+    "DIST": { "status": "active", "note": "DIST-001 merged: Cargo workspace + meow CLI skeleton" },
     "H": { "status": "planned", "note": "harness chores: hooks, CI, docs" }
   },
-  "waves": [],
-  "gates": {},
+  "waves": [
+    { "id": 1, "specs": ["DIST-001"], "outcome": "merged" }
+  ],
+  "gates": {
+    "footprint": { "status": "green", "at": "2026-06-07T10:05:00Z", "evidence_ref": "harness/reality-checks/footprint-1.md" }
+  },
   "drift_flags": [],
   "decisions": {
     "open": 0,
@@ -40,10 +44,9 @@
       "harness/CHANGELOG.md",
       "harness/decisions.json",
       "harness/PLAN.md",
-      "harness/CONSTITUTION.md",
       "harness/CANON.md"
     ],
-    "active": "Autonomous execution — P0 Foundations. Planning complete; full foundation set + traceable.",
-    "next_pull_hint": "Draft specs from PLAN Initial backlog wave 1 (DIST-001, RT-001/002/003, GRAPH-001, LOAD-001, PKG-001, CFG-001), then dispatch wave 1."
+    "active": "P0 Foundations — DIST-001 merged (Cargo workspace + meow CLI, full floor green). 7 wave-1 specs drafted + queued.",
+    "next_pull_hint": "Dispatch wave 1b: GRAPH-001, PKG-001, CFG-001 (no V8) in parallel; then RT-001 (de-risk rusty_v8 fetch first). Run craft+reality+intent ceiling on the wave."
   }
 }

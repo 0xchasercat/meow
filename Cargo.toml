@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/meow-rs/meow"
+version = "0.0.0"
+
+# Externals are DECLARED centrally so consuming crates inherit one pin each.
+# A pin here costs nothing until a crate lists it under its own [dependencies];
+# this skeleton consumes ONLY clap (+ dev assert_cmd/predicates), so cargo builds
+# nothing heavy. Each later spec that introduces an external appends its pin under
+# its own `# === <SPEC-ID> ===` marker (keeps fence-balance meaningful, makes the
+# footprint audit a single read).
+[workspace.dependencies]
+# === DIST-001 ===
+# V8 — unmodified upstream, never a git fork (I-10, CANON §26.2, ADR-1). Consumed by RT-* only; NOT here.
+deno_core = "0.340"
+v8 = "130"
+# Parse / semantic / transform — the ONE parser (I-1). Consumed by GRAPH/RT/TOOL.
+oxc = "0.40"
+# Bundler — declared when TOOL-003 (P3) lands:
+# rolldown = "..."
+# Async I/O — consumed by RT-002 (tokio; io_uring on Linux).
+tokio = { version = "1", features = ["rt-multi-thread", "fs", "io-util", "net", "macros"] }
+# Serde — config / lockfile / wire types. Consumed by CFG/PKG/LOAD.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# CLI — consumed HERE.
+clap = { version = "4", features = ["derive"] }
+# Errors — typed + causal (CRAFT): thiserror for libraries, anyhow for the binary edge.
+thiserror = "2"
+anyhow = "1"
+# Dev-only (integration tests of the binary).
+assert_cmd = "2"
+predicates = "3"
+# === /DIST-001 ===
