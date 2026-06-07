@@ -184,41 +184,54 @@ impl Resource for ResponseSlotResource {
 
 #[op2]
 #[serde]
-pub async fn op_http_serve(
-    state: Rc<RefCell<OpState>>,
+pub fn op_http_serve(
+    state: &mut OpState,
     #[string] hostname: String,
     #[smi] port: u16,
 ) -> Result<ServeHandle, HttpError> {
     let requested = format!("{hostname}:{port}");
-    let addr = parse_bind_addr(&hostname, port).ok_or_else(|| HttpError::BadAddr {
-        addr: requested.clone(),
-    })?;
-    capabilities(&state)
-        .check(&CapRequest::NetListen(&addr))
+    let addr = parse_bind_addr(&hostname, port).ok_or(HttpError::BadAddr { addr: requested })?;
+    // The network capability is checked BEFORE any socket (I-6 governed entry).
+    let caps = state
+        .try_borrow::<Rc<dyn CapabilityCheck>>()
+        .cloned()
+        .unwrap_or_else(|| Rc::new(AllowAll));
+    caps.check(&CapRequest::NetListen(&addr))
         .map_err(|_| HttpError::Denied {
             addr: addr.to_string(),
         })?;
-
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
+    // SYNC bind so `serve()` returns the RESOLVED address immediately (Server.addr,
+    // A1): port 0 becomes the OS-assigned port before serve() returns, matching the
+    // spec + Deno. Only listen() is synchronous; the accept loop stays async.
+    let std_listener = std::net::TcpListener::bind(addr).map_err(|source| HttpError::Bind {
+        addr: addr.to_string(),
+        source,
+    })?;
+    std_listener
+        .set_nonblocking(true)
         .map_err(|source| HttpError::Bind {
             addr: addr.to_string(),
             source,
         })?;
-    let bound = listener.local_addr().map_err(|source| HttpError::Bind {
-        addr: addr.to_string(),
-        source,
-    })?;
+    let bound = std_listener
+        .local_addr()
+        .map_err(|source| HttpError::Bind {
+            addr: addr.to_string(),
+            source,
+        })?;
+    let listener =
+        tokio::net::TcpListener::from_std(std_listener).map_err(|source| HttpError::Bind {
+            addr: addr.to_string(),
+            source,
+        })?;
 
     let (request_tx, request_rx) = mpsc::channel(64);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let accept_task = tokio::spawn(run_server(listener, bound, request_tx, shutdown_rx));
 
-    let rid = state.borrow_mut().resource_table.add(ServerResource::new(
-        request_rx,
-        shutdown_tx,
-        accept_task,
-    ));
+    let rid = state
+        .resource_table
+        .add(ServerResource::new(request_rx, shutdown_tx, accept_task));
     Ok(ServeHandle {
         rid,
         addr: bound.into(),
@@ -394,14 +407,6 @@ async fn handle_request(
         },
         Err(_) => response_with(StatusCode::INTERNAL_SERVER_ERROR, b"Internal Server Error"),
     }
-}
-
-fn capabilities(state: &Rc<RefCell<OpState>>) -> Rc<dyn CapabilityCheck> {
-    state
-        .borrow()
-        .try_borrow::<Rc<dyn CapabilityCheck>>()
-        .cloned()
-        .unwrap_or_else(|| Rc::new(AllowAll))
 }
 
 fn parse_bind_addr(hostname: &str, port: u16) -> Option<SocketAddr> {

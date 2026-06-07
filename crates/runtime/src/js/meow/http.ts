@@ -21,7 +21,7 @@ interface NativeIncomingRequest {
 }
 
 interface NativeHttpOps {
-  op_http_serve(hostname: string, port: number): Promise<NativeServeHandle>;
+  op_http_serve(hostname: string, port: number): NativeServeHandle;
   op_http_next(rid: number): Promise<NativeIncomingRequest | null>;
   op_http_respond(
     slot: number,
@@ -109,7 +109,6 @@ export function serve(handler: Handler, options: ServeOptions = {}): Server {
   const port = options.port ?? 8000;
   const addr: { hostname: string; port: number } = { hostname, port };
 
-  let rid: number | null = null;
   let shutdownRequested = false;
   let shutdownOp: Promise<void> | null = null;
   const inFlight = new Set<Promise<void>>();
@@ -121,13 +120,29 @@ export function serve(handler: Handler, options: ServeOptions = {}): Server {
     rejectFinished = reject;
   });
 
+  // Bind synchronously so `server.addr` carries the RESOLVED port the moment serve()
+  // returns (A1: port 0 -> the OS-assigned port). A bind failure (e.g. a denied
+  // network capability) rejects `finished` with a fix-pointing error rather than
+  // throwing from serve() — the documented contract, observed via `server.finished`.
+  let rid: number;
+  try {
+    const handle = ops.op_http_serve(hostname, port);
+    rid = handle.rid;
+    addr.hostname = handle.addr.hostname;
+    addr.port = handle.addr.port;
+  } catch (error) {
+    rejectFinished(error);
+    return {
+      addr,
+      shutdown: () => finished.catch(() => {}),
+      finished,
+    };
+  }
+
   async function requestShutdown(): Promise<void> {
     shutdownRequested = true;
     if (shutdownOp !== null) {
       return shutdownOp;
-    }
-    if (rid === null) {
-      return Promise.resolve();
     }
     shutdownOp = ops.op_http_shutdown(rid).catch((error: unknown) => {
       shutdownOp = null;
@@ -140,24 +155,18 @@ export function serve(handler: Handler, options: ServeOptions = {}): Server {
     void requestShutdown();
   };
 
+  options.onListen?.(addr);
+
   const run = (async () => {
     try {
-      const handle = await ops.op_http_serve(hostname, port);
-      rid = handle.rid;
-      addr.hostname = handle.addr.hostname;
-      addr.port = handle.addr.port;
-      options.onListen?.(addr);
-
       if (shutdownRequested) {
         await requestShutdown();
       }
-
       while (true) {
-        const next = await ops.op_http_next(handle.rid);
+        const next = await ops.op_http_next(rid);
         if (next === null) {
           break;
         }
-
         const task = (async () => {
           let response = internalErrorResponse();
           try {
@@ -170,7 +179,6 @@ export function serve(handler: Handler, options: ServeOptions = {}): Server {
           } catch (error) {
             reportHandlerError(error);
           }
-
           try {
             const wire = await responseToWire(response);
             await ops.op_http_respond(next.slot, wire.status, wire.headers, wire.body);
@@ -189,7 +197,6 @@ export function serve(handler: Handler, options: ServeOptions = {}): Server {
           inFlight.delete(task);
         });
       }
-
       if (inFlight.size > 0) {
         await Promise.allSettled([...inFlight]);
       }
