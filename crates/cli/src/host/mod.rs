@@ -10,6 +10,7 @@
 //! (I-6): the cache is content-addressed, so the *path* only changes where bytes
 //! are read from, never *which* (hash-pinned) bytes are loaded.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 /// The host home directory (to locate `~/.meow`), falling back to the cwd.
@@ -17,4 +18,9 @@ pub(crate) fn host_home() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Optional override for the reference TypeScript compiler path (`meow types`).
+pub(crate) fn host_meow_tsc() -> Option<OsString> {
+    std::env::var_os("MEOW_TSC")
 }

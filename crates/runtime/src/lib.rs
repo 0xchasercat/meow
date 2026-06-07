@@ -21,6 +21,13 @@
 mod error;
 mod ext;
 mod loader;
+pub mod native;
+pub mod typegen;
+// === RT-005 ===
+/// Host-access edge for `meow types` typegen (the one env-reading spot in this
+/// crate outside `hermetic/`; P16 + the floor test allowlist `/host/`).
+pub mod host;
+// === /RT-005 ===
 
 // === RT-002 ===
 /// Async host-I/O layer: tokio-backed ops + the capability seam (ADR-9, I-6).
@@ -54,7 +61,8 @@ pub use deno_core::ModuleCodeString;
 pub use deno_core::ModuleSpecifier;
 
 pub use error::{JsExceptionReport, RuntimeError};
-pub use ext::{print_sink_extension, PrintSink};
+pub use ext::http::ops::HttpError;
+pub use ext::{http_extension, print_sink_extension, PrintSink};
 pub use loader::TrivialModuleLoader;
 // === RT-002 ===
 pub use io::{

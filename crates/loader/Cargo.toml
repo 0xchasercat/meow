@@ -23,6 +23,10 @@ flate2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tar = { workspace = true }
+# === RT-005 ===
+# Native `meow:*` source registry contract. No web/fetch surface needed here.
+meow-runtime = { path = "../runtime", default-features = false }
+# === /RT-005 ===
 # === /LOAD-003 ===
 
 [dev-dependencies]

@@ -24,7 +24,7 @@ deno_core = "0.403"
 # Bundler — declared when TOOL-003 (P3) lands:
 # rolldown = "..."
 # Async I/O — consumed by RT-002 (tokio; io_uring on Linux).
-tokio = { version = "1", features = ["rt-multi-thread", "fs", "io-util", "net", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "fs", "io-util", "net", "macros", "sync", "time"] }
 # === RT-002 ===
 # Typed op errors that cross into JS as exceptions (deno_core's op2 requires the
 # error type to impl `deno_error::JsErrorClass`). Pinned `=` to the exact version
@@ -100,6 +100,12 @@ deno_fetch = "0.274.0"
 deno_net = "0.242.0"
 deno_permissions = "0.109.0"
 hyper-util = { version = "0.1", features = ["client-legacy"] }
+# === RT-005 ===
+# meow:http server-side HTTP/1.1 over tokio. `hyper-util`'s client features stay
+# from RT-004; the runtime crate extends the same pin with server/tokio features.
+hyper = { version = "1", features = ["server", "http1"] }
+http-body-util = "0.1"
+# === /RT-005 ===
 # === /RT-004 ===
 # === RT-006 ===
 # Determinism harness (I-6): a seeded CSPRNG for reproducible Math.random /

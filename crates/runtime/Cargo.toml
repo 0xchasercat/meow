@@ -33,7 +33,15 @@ deno_crypto = { workspace = true }
 deno_fetch = { workspace = true, optional = true }
 deno_net = { workspace = true, optional = true }
 deno_permissions = { workspace = true, optional = true }
-hyper-util = { workspace = true, optional = true }
+# === RT-005 ===
+# `meow:http` reuses the same Hyper generation already in the tree: hyper itself,
+# the body adapters, and the existing hyper-util pin extended with server/tokio
+# features. `serde` drives the op2 `#[serde]` request/handle structs only.
+serde = { workspace = true, features = ["derive"] }
+hyper = { workspace = true }
+hyper-util = { workspace = true, features = ["server-auto", "server-graceful", "service", "tokio"] }
+http-body-util = { workspace = true }
+# === /RT-005 ===
 # === /RT-004 ===
 # === RT-006 ===
 # Determinism harness (I-6): seeded ChaCha20 (reproducible RNG) + the OS entropy
@@ -56,7 +64,12 @@ deno_core = { workspace = true }
 # The `web_fetch_denied` test installs a Send+Sync recording capability check; a
 # lock without poisoning is the right tool (parking_lot, per the workspace rule).
 parking_lot = "0.12"
-# === /RT-004 ===
+# === /RT-005 ===
+meow-config = { path = "../config" }
+meow-graph = { path = "../graph" }
+meow-loader = { path = "../loader" }
+meow-pkg = { path = "../pkg" }
+# === /RT-005 ===
 
 # === RT-004 ===
 [features]
@@ -65,5 +78,5 @@ default = ["web-fetch"]
 # `Request`/`Response`/`Headers`/`FormData` globals and the capability-gated
 # network seam. Default-on; the footprint gate may turn it off (RT-004a) if the
 # HTTP client tree blows the I-10 budget, shipping the lighter globals alone.
-web-fetch = ["dep:deno_fetch", "dep:deno_net", "dep:deno_permissions", "dep:hyper-util"]
+web-fetch = ["dep:deno_fetch", "dep:deno_net", "dep:deno_permissions"]
 # === /RT-004 ===

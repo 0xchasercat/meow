@@ -144,6 +144,11 @@ fn graph_path_for(url: &Url, module_specifier: &ModuleSpecifier) -> PathBuf {
             .join(package.to_url_host())
             .join(member);
     }
+    // === RT-005 ===
+    if url.scheme() == "meow" {
+        return PathBuf::from("meow-native").join(format!("{}.ts", url.path()));
+    }
+    // === /RT-005 ===
     PathBuf::from(format!("{}.mjs", module_specifier.as_str()))
 }
 

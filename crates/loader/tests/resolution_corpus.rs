@@ -89,6 +89,7 @@ fn resolver_with(
         Arc::new(lockfile),
         root_deps,
         Url::from_directory_path(project_root).expect("project root URL"),
+        meow_runtime::native::native_module_registry(),
     )
 }
 

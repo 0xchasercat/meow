@@ -17,6 +17,8 @@ use std::sync::Arc;
 use deno_core::url::Url;
 use meow_pkg::{Cache, CacheError, ContentHash, Lockfile, PackageName, Version};
 
+use meow_runtime::native::NativeModuleSource;
+
 use crate::package::{Exports, ExportsTarget, PackageFs, PackageJson};
 use crate::url as virtual_url;
 
@@ -38,6 +40,11 @@ pub enum ModuleLocator {
         package: ContentHash,
         member: String,
     },
+    // === RT-005 ===
+    Native {
+        name: String,
+    },
+    // === /RT-005 ===
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +100,12 @@ pub enum ResolveError {
     InvalidArchive { package: String, reason: String },
     #[error("dependency {package:?} module {member:?} is CommonJS; CJS interop lands in LOAD-004")]
     CjsDependencyUnsupported { package: String, member: String },
+    // === RT-005 ===
+    #[error(
+        "unknown meow:{name} — available meow:* modules: {available}; fix the import or run on a meow runtime that provides it"
+    )]
+    UnknownNativeModule { name: String, available: String },
+    // === /RT-005 ===
     #[error(transparent)]
     Cache(#[from] CacheError),
 }
@@ -104,6 +117,9 @@ pub struct Resolver {
     by_integrity: HashMap<ContentHash, (PackageName, Version)>,
     packages: RefCell<HashMap<ContentHash, Arc<PackageFs>>>,
     project_root: Url,
+    // === RT-005 ===
+    native: Arc<dyn NativeModuleSource>,
+    // === /RT-005 ===
 }
 
 impl Resolver {
@@ -112,6 +128,9 @@ impl Resolver {
         lockfile: Arc<Lockfile>,
         root_deps: BTreeMap<PackageName, Version>,
         project_root: Url,
+        // === RT-005 ===
+        native: Arc<dyn NativeModuleSource>,
+        // === /RT-005 ===
     ) -> Resolver {
         let by_integrity = lockfile
             .iter()
@@ -129,6 +148,7 @@ impl Resolver {
             by_integrity,
             packages: RefCell::new(HashMap::new()),
             project_root,
+            native,
         }
     }
 
@@ -142,6 +162,34 @@ impl Resolver {
             .map(|(name, _version)| name.to_string())
             .unwrap_or_else(|| hash.to_sri())
     }
+    // === RT-005 ===
+    fn locate_native(&self, name: &str) -> Result<(Url, ModuleLocator), ResolveError> {
+        if self.native.source(name).is_none() {
+            let available = self
+                .native
+                .modules()
+                .iter()
+                .map(|module| format!("meow:{module}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(ResolveError::UnknownNativeModule {
+                name: name.to_owned(),
+                available,
+            });
+        }
+        let url =
+            Url::parse(&format!("meow:{name}")).map_err(|_| ResolveError::SpecifierNotFound {
+                specifier: format!("meow:{name}"),
+                referrer: self.project_root.clone(),
+            })?;
+        Ok((
+            url,
+            ModuleLocator::Native {
+                name: name.to_owned(),
+            },
+        ))
+    }
+    // === /RT-005 ===
 
     pub fn locate(
         &self,
@@ -149,6 +197,11 @@ impl Resolver {
         referrer: &Url,
     ) -> Result<(Url, ModuleLocator), ResolveError> {
         if let Ok(url) = Url::parse(specifier) {
+            // === RT-005 ===
+            if url.scheme() == "meow" {
+                return self.locate_native(url.path());
+            }
+            // === /RT-005 ===
             return self.locate_url(url);
         }
         if specifier.starts_with("./") || specifier.starts_with("../") || specifier.starts_with('/')
@@ -164,6 +217,11 @@ impl Resolver {
         if specifier.starts_with('#') {
             return self.locate_package_import(specifier, referrer);
         }
+        // === RT-005 ===
+        if let Some(name) = specifier.strip_prefix("meow:") {
+            return self.locate_native(name);
+        }
+        // === /RT-005 ===
         self.locate_bare(specifier, referrer)
     }
 
@@ -187,6 +245,28 @@ impl Resolver {
                     })?;
                 (bytes.as_ref().to_vec(), cached_file_kind(member, &fs))
             }
+            // === RT-005 ===
+            ModuleLocator::Native { name } => {
+                let bytes = self
+                    .native
+                    .source(name)
+                    .ok_or_else(|| {
+                        let available = self
+                            .native
+                            .modules()
+                            .iter()
+                            .map(|module| format!("meow:{module}"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        ResolveError::UnknownNativeModule {
+                            name: name.clone(),
+                            available,
+                        }
+                    })?
+                    .as_bytes()
+                    .to_vec();
+                (bytes, ModuleKind::Esm)
+            } // === /RT-005 ===
         };
         let source =
             String::from_utf8(bytes).map_err(|_| ResolveError::NotUtf8 { url: url.clone() })?;
@@ -994,6 +1074,7 @@ mod tests {
             Arc::new(Lockfile::new()),
             BTreeMap::new(),
             Url::from_directory_path(project_root).expect("project root URL"),
+            meow_runtime::native::native_module_registry(),
         )
     }
 

@@ -13,6 +13,7 @@ use std::io::Write;
 use std::rc::Rc;
 
 use deno_core::{op2, OpState};
+pub mod http;
 
 /// The print callback `(message, is_err)` — a type alias keeps [`PrintSink`]
 /// legible (clippy::type_complexity).
@@ -55,6 +56,7 @@ deno_core::extension!(
     esm_entry_point = "ext:meow_runtime/bootstrap.js",
     esm = [dir "src/js", "bootstrap.js"],
 );
+pub use http::http_extension;
 
 /// Build an [`Extension`](deno_core::Extension) that seeds a [`PrintSink`] into
 /// `OpState`. Pass it through `RuntimeOptions.extensions` to redirect

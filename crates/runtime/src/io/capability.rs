@@ -22,6 +22,11 @@ pub enum CapRequest<'a> {
     ReadFile(&'a Path),
     /// Open a TCP connection to this address string (as supplied by JS).
     NetConnect(&'a str),
+    // === RT-005 ===
+    /// Bind a listening socket (`meow:http` serve). The seam is on the path now;
+    /// scoped/tiered enforcement still lands later (SEC-001 / RT-006).
+    NetListen(&'a std::net::SocketAddr),
+    // === /RT-005 ===
 }
 
 /// Denial returned by a [`CapabilityCheck`]. Carries a human-readable subject

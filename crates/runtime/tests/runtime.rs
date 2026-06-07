@@ -237,7 +237,12 @@ fn no_ambient_host_reads_in_src() {
         // reads (mirrors principles-check.sh P16's /hermetic/ allowlist). A banned
         // token ANYWHERE ELSE is the I-6 violation this guards (the single-seam
         // invariant: the only SystemTime/Instant/getrandom/env edges live there).
-        if path.components().any(|c| c.as_os_str() == "hermetic") {
+        // `host/` (RT-005 typegen env edge) joins `hermetic/` as a sanctioned home
+        // for ambient reads — mirrors principles-check P16's `/(host|hermetic)/`.
+        if path
+            .components()
+            .any(|c| matches!(c.as_os_str().to_str(), Some("hermetic") | Some("host")))
+        {
             return;
         }
         // === /RT-006 ===

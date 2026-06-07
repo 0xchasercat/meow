@@ -66,6 +66,8 @@ pub enum Command {
     Doctor,
     /// Regenerate shadow configs (.meow/tsconfig.json, root package.json) — ADR-8.
     Sync,
+    /// Regenerate or verify the committed `meow:*` declarations (RT-005 / types-fresh).
+    Types(TypesArgs),
 }
 
 #[derive(Debug, Args)]
@@ -94,6 +96,16 @@ pub struct InstallArgs {
     /// Virtual-store install mode (CANON §18; PKG owns the final flag surface).
     #[arg(long, value_enum, default_value_t = InstallMode::Pnp)]
     pub mode: InstallMode,
+}
+
+#[derive(Debug, Args)]
+pub struct TypesArgs {
+    /// Regenerate `crates/runtime/types/meow/*.d.ts`.
+    #[arg(long, conflicts_with = "check")]
+    pub emit: bool,
+    /// Verify the committed declarations are fresh (default).
+    #[arg(long, conflicts_with = "emit")]
+    pub check: bool,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -173,6 +185,7 @@ impl Command {
             Command::Profile(_) => ("profile", "P6"),
             Command::Doctor => ("doctor", "P6"),
             Command::Sync => ("sync", "P1"),
+            Command::Types(_) => ("types", "P1"),
         }
     }
 }
@@ -183,6 +196,9 @@ impl Cli {
             // === CFG-001 ===
             Command::Sync => cmd_sync(),
             // === /CFG-001 ===
+            // === RT-005 ===
+            Command::Types(args) => cmd_types(&args),
+            // === /RT-005 ===
             // === RT-001 ===
             Command::Run(args) => {
                 // === RT-006 ===
@@ -204,6 +220,90 @@ impl Cli {
         }
     }
 }
+
+// === RT-005 ===
+fn shadow_type_files() -> Vec<(String, &'static str)> {
+    let mut files = Vec::with_capacity(1 + meow_runtime::native::NATIVE_MODULES.len());
+    files.push((
+        meow_config::STRICT_WEB_DTS_FILE.to_owned(),
+        meow_runtime::web::STRICT_WEB_DTS,
+    ));
+    for name in meow_runtime::native::NATIVE_MODULES {
+        if let Some(decl) = meow_runtime::native::native_module_declaration(name) {
+            files.push((format!("types/meow/{name}.d.ts"), decl));
+        }
+    }
+    files
+}
+
+fn find_runtime_workspace_root(start: &std::path::Path) -> Option<PathBuf> {
+    let mut dir = Some(start);
+    while let Some(current) = dir {
+        if current.join("Cargo.toml").is_file()
+            && current.join("crates/runtime/Cargo.toml").is_file()
+        {
+            return Some(current.to_path_buf());
+        }
+        dir = current.parent();
+    }
+    None
+}
+
+fn cmd_types(args: &TypesArgs) -> ExitCode {
+    let cwd = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            eprintln!("meow types: cannot resolve the current directory: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let workspace_root = match find_runtime_workspace_root(&cwd) {
+        Some(root) => root,
+        None => {
+            eprintln!(
+                "meow types: cannot find the meow workspace root from {}; run this inside the repo checkout",
+                cwd.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let runtime_root = workspace_root.join("crates/runtime");
+    let source_dir = runtime_root.join("src/js/meow");
+    let committed_types_dir = runtime_root.join("types/meow");
+    let home_dir = crate::host::host_home();
+    let meow_tsc = crate::host::host_meow_tsc();
+    let env = meow_runtime::typegen::TypegenEnv {
+        project_root: &workspace_root,
+        home_dir: &home_dir,
+        meow_tsc: meow_tsc.as_deref(),
+    };
+    let layout = meow_runtime::typegen::TypegenLayout {
+        source_dir: &source_dir,
+        committed_types_dir: &committed_types_dir,
+    };
+
+    let result = if args.emit {
+        meow_runtime::typegen::emit_to_dir(&env, &layout, &committed_types_dir).map(|_| ())
+    } else {
+        meow_runtime::typegen::check_against_dir(&env, &layout)
+    };
+
+    match result {
+        Ok(()) => {
+            if args.emit {
+                println!("meow types: regenerated crates/runtime/types/meow/*.d.ts");
+            } else {
+                println!("meow types: declarations are fresh");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("meow types: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+// === /RT-005 ===
 
 // === CFG-001 ===
 /// `meow sync` — regenerate the shadow configs from `meow.config.json` (ADR-8).
@@ -236,16 +336,19 @@ fn cmd_sync() -> ExitCode {
     // Drop the curated strict-web ambient decl into `.meow/` so editors + `meow check`
     // resolve the §8.1 globals (fetch/URL/crypto.subtle/…) with nothing installed. The
     // runtime owns the content (I-9, curated-from-upstream); config owns the shadow dir.
-    if let Err(err) = meow_config::write_shadow_types(
-        &root,
-        &[(
-            meow_config::STRICT_WEB_DTS_FILE,
-            meow_runtime::web::STRICT_WEB_DTS,
-        )],
-    ) {
+    // === RT-005 ===
+    // `meow sync` also refreshes the shipped `meow:*` declarations into `.meow/types/`
+    // so editors resolve `meow:http` without any registry package or install step.
+    let shadow_types = shadow_type_files();
+    let shadow_refs = shadow_types
+        .iter()
+        .map(|(path, content)| (path.as_str(), *content))
+        .collect::<Vec<_>>();
+    if let Err(err) = meow_config::write_shadow_types(&root, &shadow_refs) {
         eprintln!("meow sync: {err}");
         return ExitCode::FAILURE;
     }
+    // === /RT-005 ===
     // === /RT-004 ===
     // === CFG-002 ===
     // Generate the OWNED root package.json projection from meow.config (ADR-8) —
@@ -256,7 +359,7 @@ fn cmd_sync() -> ExitCode {
     }
     // === /CFG-002 ===
     println!(
-        "meow sync: regenerated .meow/tsconfig.json + .meow/strict-web.d.ts + tsconfig.json shim + package.json"
+        "meow sync: regenerated .meow/tsconfig.json + .meow/strict-web.d.ts + .meow/types/meow/*.d.ts + tsconfig.json shim + package.json"
     );
     ExitCode::SUCCESS
 }
@@ -418,6 +521,9 @@ fn cmd_run(
                     std::sync::Arc::new(lockfile),
                     root_deps,
                     project_root,
+                    // === RT-005 ===
+                    meow_runtime::native::native_module_registry(),
+                    // === /RT-005 ===
                 ),
                 std::rc::Rc::new(std::cell::RefCell::new(meow_graph::GraphDb::new())),
             ));
@@ -434,6 +540,11 @@ fn cmd_run(
             caps,
             user_agent: format!("meow/{}", env!("CARGO_PKG_VERSION")),
         });
+        // === RT-005 ===
+        // The `meow:http` native module resolves through the shared loader; append
+        // its op layer here so `serve()` can bind, accept, respond, and shut down.
+        extensions.push(meow_runtime::http_extension());
+        // === /RT-005 ===
         // === /RT-004 ===
 
         // === RT-006 ===

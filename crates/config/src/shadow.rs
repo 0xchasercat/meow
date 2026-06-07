@@ -73,8 +73,16 @@ fn render_tsconfig(cfg: &MeowConfig) -> String {
             // §8.1 globals come from the curated strict-web decl, loaded via the
             // top-level `files` below — NOT `compilerOptions.types`, which takes
             // @types package names, not a file path (I-1, I-9).
-            "lib": ["esnext"]
+            "lib": ["esnext"],
             // === /RT-004 ===
+            // === RT-005 ===
+            // Bundled `meow:*` declarations live under `.meow/types/meow/*.d.ts`;
+            // `meow sync` refreshes those files so editors resolve `meow:http`
+            // without any install step.
+            "paths": {
+                "meow:*": ["./types/meow/*"]
+            }
+            // === /RT-005 ===
         },
         // === RT-004 ===
         // The file set lives HERE (the base), not in the committed root shim — the

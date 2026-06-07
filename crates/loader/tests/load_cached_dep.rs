@@ -103,6 +103,7 @@ fn resolver_with(
         Arc::new(lockfile),
         root_deps,
         dir_url(project_root),
+        meow_runtime::native::native_module_registry(),
     )
 }
 
@@ -245,6 +246,44 @@ fn one_resolver_handles_relative_and_bare() {
         }
         other => panic!("expected Cached, got {other:?}"),
     }
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[test]
+fn meow_import_resolves() {
+    let proj = unique_dir("meow-native");
+    let resolver = resolver_with(&proj.join("cache"), Lockfile::new(), BTreeMap::new(), &proj);
+    let referrer = Url::from_file_path(proj.join("main.ts")).expect("referrer URL");
+
+    let (url, locator) = resolver
+        .locate("meow:http", &referrer)
+        .expect("meow:http resolves");
+    assert_eq!(url.as_str(), "meow:http");
+    match locator {
+        ModuleLocator::Native { name } => assert_eq!(name, "http"),
+        other => panic!("expected Native locator, got {other:?}"),
+    }
+
+    let resolved = resolver
+        .resolve("meow:http", &referrer)
+        .expect("native module source resolves");
+    assert_eq!(resolved.kind, meow_loader::ModuleKind::Esm);
+    assert!(
+        resolved.source.contains("export function serve"),
+        "native source served from the runtime registry"
+    );
+
+    let err = resolver
+        .locate("meow:nope", &referrer)
+        .expect_err("unknown meow module is refused");
+    assert!(
+        matches!(err, ResolveError::UnknownNativeModule { .. }),
+        "typed native-module error, got: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("meow:http"),
+        "diagnostic points at the fix, got: {err}"
+    );
     std::fs::remove_dir_all(&proj).ok();
 }
 
