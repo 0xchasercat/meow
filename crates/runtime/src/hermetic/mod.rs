@@ -14,6 +14,15 @@
 //! reference, reaching an unshadowed intrinsic, or using `eval`/FFI can still read
 //! the host). That soundness is tier-3 (CANON §24.3, SEC P7). The correct words
 //! are "hermetic by default" + "defense-in-depth," never "sandboxed"/"blocked".
+//!
+//! Honest boundary (I-11) — TIMEZONE/LOCALE: the virtual clock fixes the clock
+//! *value* (`Date.now`/`getTime`/`toISOString` are deterministic), but
+//! `Date.prototype.toString`/`getHours`/`toLocaleString` and `Intl` render in the
+//! host's local timezone/locale (V8 reads the OS). Local-rendered `Date` strings
+//! can therefore still differ across machines in different timezones. The
+//! determinism claim is scoped to clock *value* + RNG + env; TZ/locale rendering is
+//! a named P1 residual (CANON §24.3) — pinning V8 to UTC under the virtual clock is
+//! a follow-up, not done here.
 
 mod config;
 mod ops;

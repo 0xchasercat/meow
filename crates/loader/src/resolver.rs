@@ -22,6 +22,15 @@ use meow_runtime::native::NativeModuleSource;
 use crate::package::{Exports, ExportsTarget, PackageFs, PackageJson};
 use crate::url as virtual_url;
 
+/// Active ESM import conditions, applied in a FIXED meow priority order.
+///
+/// Honest divergence from Node (I-11): Node selects the first matching key in the
+/// package.json conditions object in *author insertion order*; meow instead applies
+/// this fixed priority and stores condition maps in a key-sorted `BTreeMap` (author
+/// order is not preserved). For an object listing both `node` and `import`, meow
+/// deterministically prefers `import` regardless of the authored order — a
+/// deliberate, documented choice (LOAD-003 Operator note 2), not byte-for-byte Node
+/// ESM. `require` is intentionally excluded (CJS context, LOAD-004).
 const CONDITIONS: [&str; 4] = ["meow", "import", "node", "default"];
 const EXTENSIONS: [&str; 4] = [".js", ".mjs", ".cjs", ".json"];
 const INDEX_FILES: [&str; 4] = ["index.js", "index.mjs", "index.cjs", "index.json"];
