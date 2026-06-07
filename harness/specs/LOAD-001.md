@@ -2,7 +2,7 @@
 spec_id: LOAD-001
 title: "ESM loader + content-addressed cache read (single dependency)"
 subsystem: crates/loader
-status: drafting
+status: merged
 blast_radius: medium
 plan_ref: "Initial spec backlog · Wave 1 (LOAD-001); Build sequence · P0 Foundations"
 constitution_ref: [I-1, I-5]

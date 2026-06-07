@@ -1075,8 +1075,12 @@ dependencies = [
  "assert_cmd",
  "clap",
  "meow-config",
+ "meow-graph",
+ "meow-loader",
+ "meow-pkg",
  "meow-runtime",
  "predicates",
+ "thiserror",
  "tokio",
 ]
 
@@ -1103,6 +1107,18 @@ dependencies = [
  "rustc-hash",
  "self_cell",
  "thiserror",
+]
+
+[[package]]
+name = "meow-loader"
+version = "0.0.0"
+dependencies = [
+ "deno_core",
+ "meow-graph",
+ "meow-pkg",
+ "meow-runtime",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

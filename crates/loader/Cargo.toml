@@ -1,0 +1,25 @@
+[package]
+name = "meow-loader"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+# LOAD-001 — THE single module resolver + content-addressed cache read, exposed as a
+# `deno_core::ModuleLoader`. Feeds the shared graph (I-1); never constructs a parser,
+# never consults `node_modules` (I-5). Footprint (I-10): inherited workspace pins only.
+[dependencies]
+# V8 module-loader trait + `url::Url` (re-exported, so the `Url`/`ModuleSpecifier`
+# types unify with the runtime's). No direct `url` pin — avoids a second version.
+deno_core = { workspace = true }
+# The ONE parser/graph (I-1): feed text in, pull type-erased runtime IR out.
+meow-graph = { path = "../graph" }
+# The content-addressed cache + lockfile types (I-7). Depend, never redefine.
+meow-pkg = { path = "../pkg" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# End-to-end: run a resolved+stripped module through V8 with this loader installed.
+meow-runtime = { path = "../runtime" }
+tokio = { workspace = true }

@@ -256,9 +256,46 @@ fn cmd_run(entry: &std::path::Path, argv: &[String]) -> ExitCode {
             }
         };
 
+        // === LOAD-001 ===
+        // Build THE resolver + content-addressed cache loader (replaces RT-001's
+        // TrivialModuleLoader). The binary edge owns ambient reads (I-6): it resolves
+        // the project root + host home and translates meow.lock.jsonl into the
+        // resolver's name->hash stand-in map (full lockfile-driven resolution is
+        // LOAD-003). The graph is shared (I-1); no node_modules is ever touched (I-5).
+        let entry_dir = abs.parent().unwrap_or(&abs);
+        // Walk UP to the nearest meow.lock.jsonl so `meow run src/main.ts` finds the
+        // repo-root lockfile, not `src/meow.lock.jsonl` (host-pure path walk, I-6).
+        let project_dir = find_project_root(entry_dir);
+        let project_root = match meow_runtime::ModuleSpecifier::from_directory_path(&project_dir) {
+            Ok(url) => url,
+            Err(()) => {
+                eprintln!(
+                    "meow run: invalid project directory {}",
+                    project_dir.display()
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        let bare = match load_bare_map(&project_dir) {
+            Ok(map) => map,
+            Err(err) => {
+                eprintln!("meow run: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let loader: std::rc::Rc<dyn meow_runtime::deno_core::ModuleLoader> =
+            std::rc::Rc::new(meow_loader::MeowModuleLoader::new(
+                meow_loader::Resolver::new(
+                    std::sync::Arc::new(meow_pkg::Cache::in_home(crate::host::host_home())),
+                    bare,
+                    project_root,
+                ),
+                std::rc::Rc::new(std::cell::RefCell::new(meow_graph::GraphDb::new())),
+            ));
+        // === /LOAD-001 ===
+
         let mut runtime = match meow_runtime::Runtime::new(meow_runtime::RuntimeOptions {
-            // P0 loader (LOAD-001 replaces it with the real resolver + cache).
-            module_loader: std::rc::Rc::new(meow_runtime::TrivialModuleLoader::new()),
+            module_loader: loader,
             extensions: vec![],
         }) {
             Ok(runtime) => runtime,
@@ -279,3 +316,116 @@ fn cmd_run(entry: &std::path::Path, argv: &[String]) -> ExitCode {
     })
 }
 // === /RT-001 ===
+
+// === LOAD-001 ===
+
+/// Walk UP from `start` to the nearest directory holding a `meow.lock.jsonl` (the
+/// project-root marker) and return it; fall back to `start` when none exists (a
+/// local-only run). Host-pure: it inspects only the given path, reads no env
+/// (`$HOME` stays in `host/`, I-6).
+fn find_project_root(start: &std::path::Path) -> PathBuf {
+    let mut dir = start;
+    loop {
+        if dir.join("meow.lock.jsonl").is_file() {
+            return dir.to_path_buf();
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => return start.to_path_buf(),
+        }
+    }
+}
+
+/// Honest failure translating a lockfile into the resolver's bare map. Either the
+/// lockfile itself is malformed ([`Lock`]) or it pins two versions of one package
+/// — which the name-keyed map cannot represent until LOAD-003 adds real version
+/// selection, so it fails loudly rather than silently dropping a version.
+///
+/// [`Lock`]: BareMapError::Lock
+#[derive(Debug, thiserror::Error)]
+enum BareMapError {
+    #[error(transparent)]
+    Lock(#[from] meow_pkg::LockError),
+    #[error(
+        "lockfile has multiple versions of `{name}` ({versions}); \
+         version selection lands in LOAD-003"
+    )]
+    AmbiguousVersion { name: String, versions: String },
+}
+
+/// Read `meow.lock.jsonl` (if present) from the project root and translate it into
+/// the resolver's `name -> ContentHash` stand-in map. The edge does the lockfile
+/// I/O; the resolver stays a pure `name -> hash` lookup (full lockfile-driven
+/// resolution is LOAD-003). A missing lockfile is an empty map (local-only run); a
+/// malformed lockfile is an honest error, never silently ignored (I-7). Two
+/// entries sharing a package name is an honest [`BareMapError::AmbiguousVersion`]
+/// (not a silent collapse to one).
+fn load_bare_map(
+    project_root: &std::path::Path,
+) -> Result<std::collections::HashMap<String, meow_pkg::ContentHash>, BareMapError> {
+    let lock_path = project_root.join("meow.lock.jsonl");
+    if !lock_path.exists() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let lockfile = meow_pkg::Lockfile::read(&lock_path)?;
+    let mut map: std::collections::HashMap<String, meow_pkg::ContentHash> =
+        std::collections::HashMap::with_capacity(lockfile.len());
+    for entry in lockfile.iter() {
+        let name = entry.name.to_string();
+        if map.insert(name.clone(), entry.integrity.clone()).is_some() {
+            // Two lines share a name: collapsing them would silently drop a
+            // version. Gather every pinned version of this name for the diagnostic.
+            let versions = lockfile
+                .iter()
+                .filter(|other| other.name == entry.name)
+                .map(|other| other.version.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(BareMapError::AmbiguousVersion { name, versions });
+        }
+    }
+    Ok(map)
+}
+// === /LOAD-001 ===
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh, unique temp dir (pid + monotonic counter — no rand/clock, P16).
+    fn unit_tmp(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("meow-cli-unit-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    #[test]
+    fn find_project_root_walks_up_to_the_nearest_lockfile() {
+        // Lockfile at the ROOT, entry nested two levels down: discovery must climb
+        // to the root, not stop at the entry's own directory (finding 1).
+        let root = unit_tmp("root");
+        std::fs::write(root.join("meow.lock.jsonl"), "").expect("write lockfile");
+        let nested = root.join("src").join("inner");
+        std::fs::create_dir_all(&nested).expect("nested dirs");
+
+        let found = find_project_root(&nested);
+        assert_eq!(
+            std::fs::canonicalize(&found).expect("canon found"),
+            std::fs::canonicalize(&root).expect("canon root"),
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn find_project_root_falls_back_to_start_without_a_lockfile() {
+        // No lockfile anywhere on the way up: a local-only run uses the entry dir.
+        let dir = unit_tmp("nolock");
+        let found = find_project_root(&dir);
+        assert_eq!(found, dir);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

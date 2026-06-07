@@ -19,6 +19,16 @@ meow-runtime = { path = "../runtime" }
 # Current-thread runtime to drive the (async) module run on the binary edge.
 tokio = { workspace = true }
 # === /RT-001 ===
+# === LOAD-001 ===
+# `meow run` installs the real resolver + content-addressed cache loader. The
+# binary edge translates the lockfile into the resolver's name->hash map and
+# resolves the host home for the cache (I-6: ambient reads live at the edge only).
+meow-loader = { path = "../loader" }
+meow-pkg = { path = "../pkg" }
+meow-graph = { path = "../graph" }
+# Typed, causal edge errors (lockfile ambiguity surfaced honestly to `meow run`).
+thiserror = { workspace = true }
+# === /LOAD-001 ===
 
 [dev-dependencies]
 assert_cmd = { workspace = true }
