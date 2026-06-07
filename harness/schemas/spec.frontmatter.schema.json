@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://0xos.dev/schemas/spec.frontmatter.schema.json",
+  "title": "0xos spec YAML frontmatter",
+  "description": "Every spec MUST trace the spine. plan_ref and constitution_ref are required and non-empty — this is what makes the traceability matrix renderable and is enforced by principles-check.sh. status flips at merge via the post-merge git hook, never by hand.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["spec_id", "title", "subsystem", "status", "blast_radius", "plan_ref", "constitution_ref", "depends_on", "estimate"],
+  "properties": {
+    "spec_id": { "type": "string", "description": "PREFIX-NNN, e.g. W-014" },
+    "title": { "type": "string" },
+    "subsystem": { "type": "string", "description": "e.g. crates/wallet or a service name" },
+    "status": { "enum": ["drafting", "approved", "in_progress", "in_review", "merged"] },
+    "blast_radius": { "enum": ["low", "medium", "high"] },
+    "plan_ref": { "type": "string", "minLength": 1, "description": "REQUIRED — section of PLAN.md, e.g. §2.3" },
+    "constitution_ref": {
+      "type": "array", "minItems": 1,
+      "items": { "type": "string" },
+      "description": "REQUIRED non-empty — invariant ids and/or DR ids, e.g. [I-1, DR-0007]"
+    },
+    "depends_on": { "type": "array", "items": { "type": "string" } },
+    "estimate": { "enum": ["small", "medium", "large"] },
+    "backend": { "enum": ["claude", "omp", "any"], "description": "optional: preferred agent backend for this spec" },
+    "issue_url": { "type": "string" }
+  }
+}

@@ -1,0 +1,14 @@
+# Rust build artifacts
+/target
+**/target
+
+# meow generated shadow configs / caches (ADR-8: gitignored build artifacts)
+.meow/
+
+# transient sub-agent worktrees (GIT.md)
+.claude/worktrees/
+
+# node + os noise
+node_modules/
+.DS_Store
+*.log

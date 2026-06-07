@@ -1,0 +1,49 @@
+{
+  "version": 3,
+  "updated_at": "2026-06-07T09:10:00Z",
+  "mode": "incubating",
+  "phase": {
+    "id": "P0",
+    "name": "Foundations"
+  },
+  "active_task": null,
+  "in_flight_agents": [],
+  "subsystems": {
+    "GRAPH": { "status": "planned", "note": "Oxc CST/semantic/module/IR pipeline; incremental query system" },
+    "RT": { "status": "planned", "note": "V8 embedding, event loop, ops, Web globals, meow:* surface" },
+    "LOAD": { "status": "planned", "note": "ESM resolution, CJS->ESM wrap, the one shared resolver" },
+    "PKG": { "status": "planned", "note": "content-addressed cache, meow.lock.jsonl, install modes" },
+    "WS": { "status": "planned", "note": "monorepo graph discovery + linking" },
+    "TASK": { "status": "planned", "note": "typed meow.tasks.ts, in/out hashing, artifact->task" },
+    "TEST": { "status": "planned", "note": "isolate-per-file, deterministic clock + fake net" },
+    "TOOL": { "status": "planned", "note": "lint/format/bundle over the shared graph" },
+    "CHK": { "status": "planned", "note": "delegated tsc/tsgo daemon + fast-preview linter" },
+    "LSP": { "status": "planned", "note": "shared resolver, meow:* types, shadow symlink map" },
+    "SEC": { "status": "planned", "note": "capability tiers, provenance (Sigstore/OSV), anomaly detect" },
+    "OBS": { "status": "planned", "note": "why-slow/large/dep, trace, profile, doctor" },
+    "CFG": { "status": "planned", "note": "defineMeow + shadow config generation + sync" },
+    "DIST": { "status": "planned", "note": "static binary, upstream V8 pinning, SemVer" },
+    "H": { "status": "planned", "note": "harness chores: hooks, CI, docs" }
+  },
+  "waves": [],
+  "gates": {},
+  "drift_flags": [],
+  "decisions": {
+    "open": 0,
+    "max_severity": "none",
+    "needs_input": 0,
+    "ref": "decisions.json"
+  },
+  "resume_pointer": {
+    "read": [
+      "harness/state.json",
+      "harness/CHANGELOG.md",
+      "harness/decisions.json",
+      "harness/PLAN.md",
+      "harness/CONSTITUTION.md",
+      "harness/CANON.md"
+    ],
+    "active": "Autonomous execution — P0 Foundations. Planning complete; full foundation set + traceable.",
+    "next_pull_hint": "Draft specs from PLAN Initial backlog wave 1 (DIST-001, RT-001/002/003, GRAPH-001, LOAD-001, PKG-001, CFG-001), then dispatch wave 1."
+  }
+}

@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://0xos.dev/schemas/decisions.schema.json",
+  "title": "0xos decisions.json — the corrections feed",
+  "description": "Replaces the unread markdown decision queue. Mostly non-blocking 'assumption' records the agent shipped and you review-after; only 'bounded' and 'needs-input' records ever pause an agent. The Decision Inbox renders this. Resolving an item writes back here and the agent drafts a DR.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "updated_at", "open", "resolved"],
+  "properties": {
+    "version": { "const": 1 },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "open": { "type": "array", "items": { "$ref": "#/$defs/record" } },
+    "resolved": { "type": "array", "items": { "$ref": "#/$defs/record" } }
+  },
+  "$defs": {
+    "record": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "kind", "title", "opened_at", "status"],
+      "properties": {
+        "id": { "type": "string", "description": "e.g. A-204" },
+        "kind": {
+          "enum": ["assumption", "bounded", "needs-input"],
+          "description": "assumption = shipped on a default, review-after (non-blocking). bounded = hit a mechanical cap (pauses). needs-input = needs a fact only the human has (pauses)."
+        },
+        "title": { "type": "string" },
+        "opened_at": { "type": "string", "format": "date-time" },
+        "status": { "enum": ["open", "acked", "resolved"] },
+
+        "summary": { "type": "string", "description": "assumption: one line of what the agent did" },
+        "assumed": { "type": "string", "description": "assumption: the choice it made + why" },
+        "shipped": { "type": "string", "description": "assumption: spec id already built & merged" },
+        "reversible": { "type": "boolean" },
+        "confidence": { "enum": ["low", "medium", "high"], "description": "assumption: low surfaces louder" },
+
+        "bound": { "enum": ["spend_cap", "scope", "public_leak", "other"], "description": "bounded: which mechanical bound was hit" },
+        "needed": { "type": "string", "description": "bounded: what's being requested, e.g. $40/mo" },
+        "current_cap": { "type": "string", "description": "bounded: the current limit" },
+
+        "needs": { "type": "string", "description": "needs-input: the fact/credential required" },
+        "blocks": { "type": "array", "items": { "type": "string" }, "description": "spec ids paused by this; empty = nothing blocked" },
+
+        "body_ref": { "type": "string", "description": "path to the long context/runbook (behind a fold in the UI)" },
+
+        "resolution": { "type": "string", "description": "on resolve: what the human chose" },
+        "dr": { "type": "string", "description": "on resolve: the DR id the agent drafted" },
+        "resolved_at": { "type": "string", "format": "date-time" }
+      },
+      "allOf": [
+        { "if": { "properties": { "kind": { "const": "needs-input" } } }, "then": { "required": ["needs"] } },
+        { "if": { "properties": { "kind": { "const": "bounded" } } }, "then": { "required": ["bound"] } }
+      ]
+    }
+  }
+}
