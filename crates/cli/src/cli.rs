@@ -212,7 +212,24 @@ fn cmd_sync() -> ExitCode {
         eprintln!("meow sync: {err}");
         return ExitCode::FAILURE;
     }
-    println!("meow sync: regenerated .meow/tsconfig.json + tsconfig.json shim");
+    // === RT-004 ===
+    // Drop the curated strict-web ambient decl into `.meow/` so editors + `meow check`
+    // resolve the §8.1 globals (fetch/URL/crypto.subtle/…) with nothing installed. The
+    // runtime owns the content (I-9, curated-from-upstream); config owns the shadow dir.
+    if let Err(err) = meow_config::write_shadow_types(
+        &root,
+        &[(
+            meow_config::STRICT_WEB_DTS_FILE,
+            meow_runtime::web::STRICT_WEB_DTS,
+        )],
+    ) {
+        eprintln!("meow sync: {err}");
+        return ExitCode::FAILURE;
+    }
+    // === /RT-004 ===
+    println!(
+        "meow sync: regenerated .meow/tsconfig.json + .meow/strict-web.d.ts + tsconfig.json shim"
+    );
     ExitCode::SUCCESS
 }
 // === /CFG-001 ===
@@ -294,9 +311,22 @@ fn cmd_run(entry: &std::path::Path, argv: &[String]) -> ExitCode {
             ));
         // === /LOAD-001 ===
 
+        // === RT-004 ===
+        // Install the strict-web Stateless-Edge globals (CANON §8.1) on the
+        // default runtime so `meow run` sees fetch/URL/crypto.subtle/etc. The
+        // `fetch` network gate consults this capability seam; at P1 the default
+        // is `AllowAll` (seam, not enforcement — SEC-001/P6). The seam value is
+        // `Send + Sync` because deno_fetch resolves hosts on a spawned task.
+        let caps: meow_runtime::web::NetCaps = std::sync::Arc::new(meow_runtime::AllowAll);
+        let extensions = meow_runtime::web::extensions(meow_runtime::web::WebOptions {
+            caps,
+            user_agent: format!("meow/{}", env!("CARGO_PKG_VERSION")),
+        });
+        // === /RT-004 ===
+
         let mut runtime = match meow_runtime::Runtime::new(meow_runtime::RuntimeOptions {
             module_loader: loader,
-            extensions: vec![],
+            extensions,
         }) {
             Ok(runtime) => runtime,
             Err(err) => {

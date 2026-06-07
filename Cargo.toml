@@ -77,3 +77,23 @@ rustc-hash = "2"
 # crates/graph.
 oxc_ast_visit = "0.134"
 # === /RT-003 ===
+# === RT-004 ===
+# strict-web Stateless-Edge globals (CANON §8.1). Unmodified upstream Deno web
+# extension crates, co-versioned with the `deno_core 0.403` pin above (they release
+# in lockstep — these are the 0.403-matching set). Consumed ONLY by crates/runtime
+# (the sole V8 edge, I-10). deno_url + deno_console were merged into deno_web at
+# this generation, so URL/URLPattern/console live in deno_web. `deno_permissions`
+# supplies the concrete `PermissionsContainer` deno_fetch reads from `OpState`;
+# `hyper-util` supplies the `Name` type for the capability-gated DNS resolver
+# (crates/runtime/src/web/perms.rs). No version literal diverges from deno_core.
+deno_webidl = "0.250.0"
+deno_web = "0.281.0"
+deno_crypto = "0.264.0"
+deno_fetch = "0.274.0"
+# deno_fetch's client JS (`22_http_client.js`) lazy-loads deno_net's TLS polyfill,
+# so the embedder must also register deno_net (co-versioned). Net ops are unused
+# (fetch has its own hyper client); it is wired only so the JS graph resolves.
+deno_net = "0.242.0"
+deno_permissions = "0.109.0"
+hyper-util = { version = "0.1", features = ["client-legacy"] }
+# === /RT-004 ===

@@ -20,6 +20,21 @@ tokio = { workspace = true }
 # re-export it, so it is a direct dep pinned to the exact version deno_core uses.
 deno_error = { workspace = true }
 # === /RT-002 ===
+# === RT-004 ===
+# strict-web Stateless-Edge globals (CANON §8.1): unmodified upstream Deno web
+# extensions, co-versioned with deno_core 0.403 (pins owned by DIST-001). URL,
+# URLPattern and console live in deno_web at this generation (deno_url/deno_console
+# were merged upstream). The heavy `fetch` HTTP client (hyper/rustls + Request/
+# Response/Headers/FormData) is isolated behind the default-on `web-fetch` feature
+# so the footprint contingency (I-10) can drop it without losing the light globals.
+deno_webidl = { workspace = true }
+deno_web = { workspace = true }
+deno_crypto = { workspace = true }
+deno_fetch = { workspace = true, optional = true }
+deno_net = { workspace = true, optional = true }
+deno_permissions = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+# === /RT-004 ===
 
 [dev-dependencies]
 # Tests drive the async run path on a current-thread runtime (A5); deno_core also
@@ -30,3 +45,18 @@ tokio = { workspace = true }
 # crate in scope. The edge still originates ONLY from crates/runtime (the sole
 # embedding owner; I-10), never from another workspace crate.
 deno_core = { workspace = true }
+# === RT-004 ===
+# The `web_fetch_denied` test installs a Send+Sync recording capability check; a
+# lock without poisoning is the right tool (parking_lot, per the workspace rule).
+parking_lot = "0.12"
+# === /RT-004 ===
+
+# === RT-004 ===
+[features]
+default = ["web-fetch"]
+# `web-fetch` pulls deno_fetch (hyper/rustls/aws-lc) for the WHATWG `fetch`,
+# `Request`/`Response`/`Headers`/`FormData` globals and the capability-gated
+# network seam. Default-on; the footprint gate may turn it off (RT-004a) if the
+# HTTP client tree blows the I-10 budget, shipping the lighter globals alone.
+web-fetch = ["dep:deno_fetch", "dep:deno_net", "dep:deno_permissions", "dep:hyper-util"]
+# === /RT-004 ===

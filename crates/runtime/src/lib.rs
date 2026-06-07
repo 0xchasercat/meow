@@ -27,6 +27,13 @@ mod loader;
 pub mod io;
 // === RT-002 ===
 
+// === RT-004 ===
+/// strict-web Stateless-Edge globals (CANON §8.1): the WHATWG web extensions
+/// (fetch/URL/crypto.subtle/TextEncoder/…) wired onto the default runtime. See
+/// [`web::extensions`]. `console` is NOT installed here (RT-001 owns it).
+pub mod web;
+// === /RT-004 ===
+
 use deno_core::{JsRuntime, ModuleId, PollEventLoopOptions, RuntimeOptions as DenoRuntimeOptions};
 
 // Re-exports: callers depend on `meow_runtime`, not `deno_core`, directly.

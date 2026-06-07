@@ -6,8 +6,8 @@
 //! - I-11 (`honesty`): the TS-eval boundary is reported, never faked.
 
 use meow_config::{
-    generate_shadow_tsconfig, write_root_tsconfig_shim, ConfigError, MeowConfig, GENERATED_HEADER,
-    ROOT_TSCONFIG_SHIM,
+    generate_shadow_tsconfig, write_root_tsconfig_shim, write_shadow_types, ConfigError,
+    MeowConfig, GENERATED_HEADER, ROOT_TSCONFIG_SHIM,
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -77,9 +77,12 @@ fn root_shim_content_is_exact() {
 
     let bytes = std::fs::read(tmp.path().join("tsconfig.json")).expect("read shim");
     assert_eq!(bytes, ROOT_TSCONFIG_SHIM.as_bytes());
+    // The shim carries `include` (resolved relative to the project root) so tools that
+    // read the root tsconfig actually see project source; placing it in the shadow would
+    // resolve it to `.meow/` and find nothing (RT-004).
     assert_eq!(
         ROOT_TSCONFIG_SHIM,
-        "{ \"extends\": \"./.meow/tsconfig.json\" }\n"
+        "{ \"extends\": \"./.meow/tsconfig.json\", \"include\": [\".\"] }\n"
     );
 }
 
@@ -212,5 +215,48 @@ fn strict_false_propagates_and_erasable_flags_always_present() {
             "erasable-only flag {flag} must always be present and true (I-3)"
         );
     }
-    assert_eq!(json["include"], serde_json::json!(["."]));
+    // RT-004: `include` moved to the root shim (resolved relative to the project root);
+    // the shadow carries `lib: ["esnext"]` (no DOM) + a top-level `files` referencing the
+    // curated strict-web ambient decl loaded into every program.
+    assert!(
+        json.get("include").is_none(),
+        "shadow must NOT carry `include` (it would resolve to .meow/ — RT-004)"
+    );
+    assert_eq!(opts["lib"], serde_json::json!(["esnext"]));
+    assert_eq!(json["files"], serde_json::json!(["./strict-web.d.ts"]));
+    assert!(
+        opts.get("types").is_none(),
+        "ambient libs load via `files`, not `compilerOptions.types` (RT-004)"
+    );
+}
+
+// --- RT-004: shadow type files are written verbatim, nested paths create dirs -----
+
+#[test]
+fn write_shadow_types_writes_verbatim_and_nests() {
+    let tmp = TempDir::new();
+    write_shadow_types(
+        tmp.path(),
+        &[
+            ("strict-web.d.ts", "declare var x: number;\n"),
+            (
+                "types/meow/http.d.ts",
+                "export declare function serve(): void;\n",
+            ),
+        ],
+    )
+    .expect("write shadow types");
+
+    // Ambient lib lands next to where the shadow tsconfig's `files` references it.
+    let ambient =
+        std::fs::read_to_string(tmp.path().join(".meow/strict-web.d.ts")).expect("ambient");
+    assert_eq!(
+        ambient, "declare var x: number;\n",
+        "content is written verbatim (no injected header)"
+    );
+
+    // A nested module-type path (RT-005 `meow:*`) creates intermediate dirs.
+    let nested =
+        std::fs::read_to_string(tmp.path().join(".meow/types/meow/http.d.ts")).expect("nested");
+    assert_eq!(nested, "export declare function serve(): void;\n");
 }

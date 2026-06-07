@@ -23,5 +23,6 @@ pub use schema::{
     Runtime, Severity, TestConfig, TsHandling, Types, Workspace,
 };
 pub use shadow::{
-    generate_shadow_tsconfig, write_root_tsconfig_shim, GENERATED_HEADER, ROOT_TSCONFIG_SHIM,
+    generate_shadow_tsconfig, write_root_tsconfig_shim, write_shadow_types, GENERATED_HEADER,
+    ROOT_TSCONFIG_SHIM, STRICT_WEB_DTS_FILE,
 };

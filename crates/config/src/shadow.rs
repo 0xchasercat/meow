@@ -19,7 +19,18 @@ pub const GENERATED_HEADER: &str = "// GENERATED — do not edit (run: meow sync
 
 /// Exact, byte-stable content of the committed root `tsconfig.json` shim (ADR-8).
 /// Pure JSON (no header) so every legacy tool reads it; trailing newline included.
-pub const ROOT_TSCONFIG_SHIM: &str = "{ \"extends\": \"./.meow/tsconfig.json\" }\n";
+pub const ROOT_TSCONFIG_SHIM: &str =
+    "{ \"extends\": \"./.meow/tsconfig.json\", \"include\": [\".\"] }\n";
+
+// === RT-004 ===
+/// File name of the curated strict-web ambient decl inside `.meow/`, referenced
+/// from the shadow tsconfig's top-level `files` (relative to `.meow/`). The decl
+/// CONTENT lives with the runtime that implements those globals
+/// (`meow_runtime::web::STRICT_WEB_DTS`) and is threaded in by the CLI via
+/// [`write_shadow_types`], so this light config crate keeps NO `meow-runtime`
+/// dependency (no V8 here). Deterministic: same meow version ⇒ same path + bytes.
+pub const STRICT_WEB_DTS_FILE: &str = "strict-web.d.ts";
+// === /RT-004 ===
 
 /// Deterministically render the `.meow/tsconfig.json` body from `cfg`.
 ///
@@ -48,9 +59,23 @@ fn render_tsconfig(cfg: &MeowConfig) -> String {
             "moduleResolution": "bundler",
             "target": "esnext",
             "allowImportingTsExtensions": true,
-            "skipLibCheck": true
+            "skipLibCheck": true,
+            // === RT-004 ===
+            // strict-web ambient globals (CANON §8.1): drop the default DOM lib so
+            // the typed surface matches the runtime (meow is never a browser). The
+            // §8.1 globals come from the curated strict-web decl, loaded via the
+            // top-level `files` below — NOT `compilerOptions.types`, which takes
+            // @types package names, not a file path (I-1, I-9).
+            "lib": ["esnext"]
+            // === /RT-004 ===
         },
-        "include": ["."]
+        // === RT-004 ===
+        // Load the ambient strict-web decl into every program; `meow sync` writes it
+        // next to this file (write_shadow_types). `include` lives in the committed
+        // ROOT shim (resolved relative to the project root) — placed here in `.meow/`
+        // it would resolve to `.meow/` and find no project source.
+        "files": [format!("./{STRICT_WEB_DTS_FILE}")]
+        // === /RT-004 ===
     });
 
     // `to_string_pretty` cannot fail on this fully-owned, finite `Value`.
@@ -83,6 +108,35 @@ pub fn generate_shadow_tsconfig(cfg: &MeowConfig, root: &Path) -> Result<(), Con
         source,
     })
 }
+
+// === RT-004 ===
+/// Write each `(relative_path, content)` into `root/.meow/<relative_path>` verbatim,
+/// creating parent directories. The shadow tsconfig references these: the ambient
+/// strict-web decl via top-level `files` (RT-004), and `meow:*` module declarations
+/// via `compilerOptions.paths` (RT-005). The CONTENT is supplied by the caller (the
+/// CLI, which owns both `meow-config` and `meow-runtime`), keeping this crate light.
+/// `.meow/` is a gitignored, regenerable artifact (CANON §24.5); byte-stable for
+/// identical content (I-9).
+pub fn write_shadow_types(root: &Path, files: &[(&str, &str)]) -> Result<(), ConfigError> {
+    let dir = root.join(".meow");
+    for (rel, content) in files {
+        let path = dir.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| ConfigError::Io {
+                action: "create directory",
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        std::fs::write(&path, content).map_err(|source| ConfigError::Io {
+            action: "write",
+            path,
+            source,
+        })?;
+    }
+    Ok(())
+}
+// === /RT-004 ===
 
 /// Write the committed root `tsconfig.json` shim iff missing or non-identical.
 ///
