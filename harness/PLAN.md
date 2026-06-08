@@ -44,6 +44,8 @@
 ## Build sequence (phases)
 
 Ordered by dependency (CANON §21), not excitement; each phase is independently demonstrable and exits on a reality-checkable condition bound to an invariant gate.
+> ⚠ **Amendments 001/002 (CANON) re-order this.** Drop-in compatibility + Tier-1 UX now lead. A new **P2.5 · Drop-In Core** is inserted before P3 (it pulls the former Phase-5 node-compat + CJS work forward), and sequencing within every later phase follows the success tiers (Tier-1 `install`/`run`/`test`/`dev` first). The dependency order below is preserved for history; the amendment overrides *priority*, not the dependency facts.
+
 
 - **P0 · Foundations** — Rust CLI skeleton; embed V8 (`deno_core`) + event loop + op layer + async I/O (`tokio`; `io_uring` on Linux); stand up the Oxc pipeline as an incremental query system (stages 1/2/5); draft `meow.lock.jsonl` + cache layout; first shadow-config + `defineMeow` cut.
   - *Exit:* a trivial ESM file runs through V8; a trivial TS file strips-and-runs; one dependency resolves from the content-addressed cache; `principles-check` green. Gates: `strip-fidelity`, `graph-integrity`, `footprint` (initial).
@@ -51,6 +53,8 @@ Ordered by dependency (CANON §21), not excitement; each phase is independently 
   - *Exit:* a small TS web server runs with no emitted JS; behavior is identical across two machines on the same version+lockfile; first-party CJS is rejected. Gates: `determinism` (happy path), `compat` (CJS refusal), `strip-fidelity`, `types-fresh`.
 - **P2 · Packages & Resolution** — content-addressed cache; deterministic `meow.lock.jsonl`; PnP in-memory loader **and `--materialize` together** (ADR-4); npm registry resolution; integrity checks; `meow install`; `meow why-dep`.
   - *Exit:* a project installs and runs pure-ESM dependencies with no `node_modules`; the same lockfile reproduces the same graph; runtime and LSP resolve identically. Gates: `resolver-parity`, `lockfile-integrity`.
+- **P2.5 · Drop-In Core (Amendments 001/002 — the adoption spine, Tier-1)** — `package.json` becomes the dependency/scripts/workspaces authority (`meow` reads it; `meow add`/`remove` mutate it; the `meow.config.dependencies` field + config→package.json generation are retired); native Node built-ins (`fs`/`path`/`process`/`Buffer`/`node:*`), always-on; first-party CJS via `require`-interception + Oxc synchronous wrap; `meow run <script>` / `meow <script>` / `meow dev`. Default mode flips to drop-in; `strict-web` becomes opt-in.
+  - *Exit (the 5-minute test):* `cd existing-project && meow install && meow run dev` runs a stock npm/Bun app with **zero file edits**, and feels nicer than what it replaced. Gates: `drop-in` (real-project corpus installs + runs unmodified), `resolver-parity`, `determinism` (opt-in/frozen).
 - **P3 · Parse-Once Toolchain** — consolidate lint/format/check/bundle on the shared graph; `meow lint`/`fmt`/`bundle`; `meow check` via the delegated `tsc`/`tsgo` daemon + fast-preview linter; shared diagnostics model.
   - *Exit:* a file is parsed once and reused across multiple tool operations in one invocation; lint/format/check/bundle agree on resolution; `meow check` matches the reference compiler. Gates: `graph-integrity`, `check-parity`.
 - **P4 · Workspaces & Tasks** — workspace-graph discovery + internal linking; `meow.tasks.ts` with input/output hashing, caching, parallel execution; artifact→task wiring (importing a stale `./x.wasm` runs its producing task).
@@ -99,10 +103,10 @@ Concrete enough for the spec-drafter to start. Wave 1 = P0; Wave 2 = P1 (MVP); l
 - `LOAD-003` — Full Node resolution algorithm (conditions, `exports`/`imports`, self-references) shared by runtime + LSP (I-5).
 - `CFG-002` — Generated root `package.json` projection from `meow.config.ts` (I-9).
 
-**Later phases (sketch)**
-- P2: `PKG-002` install + integrity; `PKG-003` PnP in-memory loader; `PKG-004` `--materialize`/`--vendor`; `OBS-001` `why-dep`; `LSP-001` shared-resolver prototype + shadow symlink map.
-- P3: `TOOL-001` formatter; `TOOL-002` linter (incl. `no-first-party-cjs`, erasable-only rules); `TOOL-003` Rolldown bundler; `CHK-001` delegated daemon `meow check`; `CHK-002` fast-preview type-aware linter.
-- P4: `WS-001` workspace discovery/linking; `TASK-001` typed tasks + in/out hashing + caching; `TASK-002` artifact→task (Wasm) wiring.
-- P5: `LOAD-004` CJS→ESM wrapper (`cjs-module-lexer`); `RT-007` `node-compat` built-ins; `LOAD-005` `legacy` mode.
-- P6: `SEC-001` capability model + process-tier enforcement; `SEC-002` provenance (Sigstore/OSV) + anomaly detection; `TEST-001` isolate-per-file runner; `OBS-002` `why-slow` module-load timeline; `OBS-003` `trace`/`profile`/`doctor`.
+**Later phases (sketch — Amendment 001/002 priority order)**
+- **P2.5 · Drop-In Core (NOW — Tier 1, the adoption spine):** `CFG-003` **package.json = dependency authority** (read deps from `package.json`; `meow add`/`remove` mutate it; retire the `meow.config.dependencies` field + the `CFG-002` config→package.json *generation*); `RUN-001` `meow run <script>` / `meow <script>` / `meow dev` (package.json scripts runner); `RT-007` native Node built-ins (`fs`/`path`/`process`/`Buffer`/`node:*`), pulled forward from P5; `LOAD-004` first-party + dependency CJS interop (`require`-interception → Oxc wrap → execute; `cjs-module-lexer`), pulled forward from P5.
+- P3 (Parse-Once Toolchain — backlog drafted, reconcile vs. pivot): `TOOL-001` formatter; `TOOL-002` linter (**`no-first-party-cjs` flips error→advisory/off per Amendment 001**; erasable-only becomes opt-in); `TOOL-003` Rolldown bundler; `CHK-001` delegated `meow check`; `CHK-002` fast-preview linter.
+- P4: `WS-001` workspace discovery/linking (reads `package.json` `workspaces`); `TASK-001` typed tasks (OPTIONAL layer atop package.json scripts); `TASK-002` artifact→task (Wasm) wiring.
+- P5 (residual after pull-forward): `LOAD-005` `legacy` mode; hardened materialized install.
+- P6: `SEC-001` capability model + process-tier enforcement; `SEC-002` provenance (Sigstore/OSV) + anomaly detection; `TEST-001` isolate-per-file `meow test` (**Tier 1** — bring forward as deps allow; interim `meow test` = the package.json `test` script via RUN-001); `OBS-002` `why-slow` timeline (**Tier 2**); `OBS-003` `trace`/`profile`/`doctor` (**Tier 2**).
 - P7: `SEC-003` Trust Zones (load-time AST rewrite + interposition); `SEC-004` threat-model doc + tier-3 research flag.

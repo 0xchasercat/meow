@@ -4,12 +4,47 @@
 > One binary: runtime, package manager, workspace manager, task runner, test runner, bundler, linter, formatter, typechecker, security and observability toolchain.
 
 ---
+## Amendments (authoritative — supersede the body below)
+
+> Amendments are authoritative. Where the body of this document conflicts with an amendment, **the amendment wins**; the body is kept (not rewritten) so the reasoning history stays readable. Every agent/builder MUST read this section first.
+
+### Amendment 001 · The Drop-In Mandate (2026-06-08)
+
+**New prime directive: `meow` is a Node/Bun drop-in replacement, without exceptions.** An existing Node/Bun project must run under `meow` unchanged — `meow install` then `meow run` (or `meow <script>`) Just Works on a stock `package.json` project, no rewrite required. Frictionless adoption beats ecosystem purity; the standards-first defaults survive as an explicit *mode*, never a wall. (Rationale: Deno spent ~3 years bleeding users before conceding `package.json`/`node_modules`; we skip that phase. Bun won precisely on drop-in compatibility.)
+
+This amendment supersedes the following, in whole or part:
+
+1. **`package.json` is King — supersedes ADR-8 (package.json half), §18 / §18.1, §14, Invariant 13.** `package.json` is the AUTHORITY for dependencies (`dependencies`/`devDependencies`/`peerDependencies`), workspaces, scripts, and project metadata. `meow` **reads** it; it never owns, generates, or clobbers it. `meow add` / `meow remove` mutate `package.json` (then update `meow.lock.jsonl` + the content-addressed cache) exactly like `npm`/`bun`. `meow install` on a stock project reads `package.json` and builds the PnP cache. `meow.config.ts` is now STRICTLY meow runtime behavior — Trust-Zone permissions, execution mode, install mode, toolchain config (lint/format/test) — and carries **no dependencies**. (The `tsconfig.json` *shadow* generation in ADR-8 still stands; only the package.json-authority inversion changes.)
+2. **`package.json` scripts run natively — supersedes §14, §18.** `meow run <script>` executes a `package.json` `"scripts"` entry; `meow <script>` is shorthand; `meow run <file>` still runs a file (a name that is both a script and a file resolves to the script, npm-style). `meow.tasks.ts` becomes an OPTIONAL typed-task layer, not a replacement for `package.json` scripts.
+3. **Ambient Node APIs are native — supersedes Principle 2, the §11 modes table.** `import fs from "fs"`, `import path from "path"`, `process`, `Buffer`, `node:*` specifiers, etc. work out of the box — Node built-ins are a native, always-available surface, NOT gated behind a `node-compat` flag. `strict-web` becomes an explicit OPT-IN mode (edge / portable / security-sensitive projects) that *withdraws* the Node surface; it is no longer the default. The default is drop-in Node compatibility.
+4. **First-party CommonJS runs — supersedes ADR-3, Principle 3, Invariant 5, §11.1, the "CommonJS authoring environment" non-goal.** A first-party `require()` / `.cjs` / `module.exports` file is no longer refused. `meow` intercepts `require()`, runs the file through the owned Oxc pipeline, wraps it (synchronous CJS atop V8's async modules), and executes it; first-party CJS and ESM interoperate (`require` of an ESM dep and `import` of a CJS dep both work). The "ban new CJS to heal the ecosystem" goal is dropped for zero-friction adoption; an optional lint rule MAY still *nudge* toward ESM, but it is advisory, never a hard refusal.
+
+**Explicitly UNCHANGED by Amendment 001:** ADR-1 (V8 only), ADR-2 (build on Oxc/Rolldown), **ADR-4 (PnP / no `node_modules` by default** — `package.json` *declares*, the content-addressed cache *stores*; no `node_modules` is written unless `--materialize`), ADR-5 (delegated typecheck), the `meow.lock.jsonl` lockfile, determinism, the single shared graph (I-1), and resolver-parity (I-5). The mandate changes *defaults and authority*, not the *engine, cache, or one-graph architecture*.
+
+**Roadmap impact:** Phase-5 "Node Compatibility & Legacy" (native Node built-ins, CJS interop) is no longer deferred behind a strict-web core — it becomes foundational and moves earlier (see `PLAN.md` re-sequence). The drop-in path (`meow install` reads `package.json` → `meow run` a stock app) is now the headline acceptance criterion.
+
+### Amendment 002 · UX Is the Product (2026-06-08)
+
+**Corollary to 001, and now the project's North Star.** Almost every primitive `meow` synthesizes already exists (V8, Oxc, Rolldown, type-stripping, content-addressed caches, capability systems, query-based compilers). `meow`'s value is NOT a novel primitive — it is making them feel like **one coherent thing**, the way Cargo's value was `cargo build/test/run/publish` (not a new compiler) and Git's adoption was that it read existing trees (not the SHA-1 object store). **If the UX is not excellent, there is no product** — synthesis without coherence is just a pile of dependencies. After Amendment 001, UX *is* the differentiator; we compete on performance, security-when-asked, and tooling coherence, not on how much migration pain users will tolerate.
+
+- **Architecture may be opinionated; adoption paths may not.** Keep the opinionated internals invisible (shared graph, dependency sandboxing, content-addressed storage, observability); never let them become an adoption tax. The user keeps their `package.json`, their code, their `node_modules` mental model — the toolchain gets dramatically better underneath. Positioning: *"Your package.json stays. Your code stays. Your toolchain gets replaced."*
+
+- **The 5-minute test is the acceptance bar.** `cd existing-project && meow install && meow run dev` MUST Just Work with **zero file edits** and feel *nicer* than what it replaced. "Can `meow` save me time in the first 5 minutes?" gates every Tier-1 surface — now a first-class gate (`drop-in`: a corpus of real, stock npm/Bun projects that must install-and-run unmodified).
+
+- **Success tiers (the priority order for ALL sequencing):**
+  - **Tier 1 — must be magical:** `meow install`, `meow run`, `meow test`, `meow dev`. If these are not delightful on existing projects, nothing else matters. Build-order priority #1.
+  - **Tier 2 — the reason to switch:** `meow why-dep`, `meow why-slow`, `meow trace` — explainability Node/Bun can't match (anyone can *run* code; can they *explain* it?). The differentiation.
+  - **Tier 3 — invisible architecture:** shared graph, content-addressed storage, trust zones, incremental queries. Users should notice only the *symptoms* — fast, consistent, easy — never the machinery.
+
+- **Honest consequence (named, not hidden):** drop-in-by-default trades purity for adoption. The default mode is permissive (ambient Node, CJS, real env/fs), so determinism + capability + hermeticity become **progressive / opt-in** (`strict-web`, a `--frozen`-style flag, Trust Zones), not the out-of-box default. That is the deliberate trade.
+
+---
 
 ## 0. Status of this document
 
 - **Type:** Canonical planning document / product and architecture specification.
-- **State:** Pre-implementation baseline. No code exists yet; this defines what gets built, in what order, and what we will *not* claim.
-- **Last updated:** 2026-06-07.
+- **State:** Implementation underway (P0–P2 built). **Amendment 001 (The Drop-In Mandate, below) is IN EFFECT** and supersedes conflicting text in the body. The body is preserved (not retro-edited) so the evolution stays legible.
+- **Last updated:** 2026-06-08 (Amendment 001 — The Drop-In Mandate).
 - **Authority:** Single source of truth for scope and architecture. When this document and an implementation disagree, one of them is a bug — resolve it explicitly; do not fork the vision.
 - **How to read it:** §1–§4 are the *what* (summary, thesis, principles, non-goals). §5–§20 are the *how* (decisions and subsystems). §21–§23 are the *order of operations* (roadmap, MVP, first 90 days). §24–§25 are the *honest constraints* (risks, invariants) — **read §24 before quoting any performance or security claim externally.** §26 is *build, distribution & versioning*; §27 is the *resolved-decision ledger* (every `Q-ID` and how it was settled); §28–§30 are metrics, glossary, and the one-line pitch.
 
@@ -126,6 +161,8 @@ ADR-1 through ADR-4 are the founding choices. ADR-5 through ADR-9 forcibly resol
 
 ### ADR-3 · CJS/ESM boundary: **First-party code MUST be ESM; CJS is read-only for dependencies**
 
+> ⚠ **SUPERSEDED by Amendment 001 (The Drop-In Mandate).** First-party CJS now RUNS (require-interception + Oxc synchronous wrap + execute); it is no longer refused. Retained below for history.
+
 - **Choice:** `meow` refuses to execute a locally authored `.cjs` file or a first-party `require()`. Dependencies written in CJS are statically analyzed and wrapped in a synthetic ESM shell at the module loader.
 - **Why:** If new CJS can be authored, the ecosystem never heals and the exact ambiguity `meow` exists to remove is preserved. You may *import* legacy CJS seamlessly; you may not *write* it.
 - **Consequences:**
@@ -186,6 +223,8 @@ ADR-1 through ADR-4 are the founding choices. ADR-5 through ADR-9 forcibly resol
   - (−) Requires a concrete **artifact→task** mapping: task `outputs` register artifacts in the module graph, and importing such an artifact creates a dependency on its producing task.
 
 ### ADR-8 · Config: **single human-edited source + generated shadow configs**
+
+> ⚠ **PARTIALLY SUPERSEDED by Amendment 001.** `package.json` is now the AUTHORITY for dependencies/workspaces/scripts/metadata — `meow` reads it and never owns/generates/clobbers it. The `tsconfig.json` shadow-generation described below still stands; the `package.json`-as-derived-artifact half does not.
 
 - **Choice:** humans edit **only** `meow.config.ts`. `meow` derives and regenerates the legacy configs the ecosystem expects:
   - **`tsconfig.json`** — a committed one-line root shim `{ "extends": "./.meow/tsconfig.json" }`; the real content is regenerated into `.meow/`.
