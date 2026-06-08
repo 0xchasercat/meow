@@ -1,6 +1,6 @@
 {
   "version": 3,
-  "updated_at": "2026-06-08T04:00:00Z",
+  "updated_at": "2026-06-08T05:00:00Z",
   "mode": "incubating",
   "phase": {
     "id": "P1",
@@ -20,7 +20,7 @@
     "CHK": { "status": "planned", "note": "delegated tsc/tsgo daemon (P3)" },
     "LSP": { "status": "planned", "note": "shared resolver + shadow symlink map (P2); enables resolver-parity gate" },
     "SEC": { "status": "planned", "note": "capability tiers (RT-002/004/006 seams ready), provenance (P6/P7)" },
-    "OBS": { "status": "planned", "note": "why-slow/large/dep, trace, doctor (P6)" },
+    "OBS": { "status": "active", "note": "OBS-001 merged: meow why-dep (lockfile path-tracing, pure/deterministic); why-slow/large/trace/doctor later (P6)" },
     "CFG": { "status": "active", "note": "CFG-001 + CFG-002 merged: defineMeow + shadow tsconfig + meow sync + root package.json projection" },
     "DIST": { "status": "active", "note": "DIST-001 merged: Cargo workspace + meow CLI skeleton" },
     "H": { "status": "planned", "note": "harness chores: hooks, CI, docs" }
@@ -38,7 +38,8 @@
     { "id": 10, "specs": ["CFG-002"], "outcome": "merged" },
     { "id": 11, "specs": ["LOAD-003"], "outcome": "merged" },
     { "id": 12, "specs": ["RT-005"], "outcome": "merged" },
-    { "id": 13, "specs": ["PKG-002"], "outcome": "merged" }
+    { "id": 13, "specs": ["PKG-002"], "outcome": "merged" },
+    { "id": 14, "specs": ["OBS-001"], "outcome": "merged" }
   ],
   "gates": {
     "footprint": { "status": "green", "at": "2026-06-08T04:00:00Z", "evidence_ref": "scripts/footprint.sh gzip 27.5MB <= 60MB (PKG-002 ureq+rustls; TLS dedup with deno_fetch)" },
@@ -66,7 +67,7 @@
       "harness/PLAN.md",
       "harness/CANON.md"
     ],
-    "active": "P2 BUILDING - PKG-002 (meow install) merged + reality-checked: npm resolution + sha512-verify/sha256-cache integrity + deterministic meow.lock.jsonl; `meow install camelcase-keys@^10` then `meow run` executes the dep tree with NO node_modules, reinstall byte-identical (P2 core met via PKG-002 + LOAD-003). All 5 P2 specs drafted.",
-    "next_pull_hint": "Continue P2: OBS-001 why-dep (small/local) + PKG-003 ResolutionGraph (formalize shared PnP model for LSP resolver-parity), then PKG-004 materialize, LSP-001. Crypto-provider default installed for fetch (ureq+ring vs aws-lc-rs)."
+    "active": "P2 BUILDING - PKG-002 (meow install: npm resolution + integrity + deterministic lockfile, deps run with NO node_modules) + OBS-001 (meow why-dep: lockfile path-tracing) merged + gated. P2 core met (install+run+reproducible via PKG-002+LOAD-003). 2 of 5 P2 specs built; PKG-003/PKG-004/LSP-001 drafted + remaining.",
+    "next_pull_hint": "Continue P2: PKG-003 ResolutionGraph (formalize the shared PnP model + Resolver::from_resolution), then PKG-004 --materialize (ADR-4 pair) + LSP-001 (resolver-parity gate). Then P3 (toolchain). 16 decisions.json forks open."
   }
 }
