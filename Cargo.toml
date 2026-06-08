@@ -10,9 +10,8 @@ repository = "https://github.com/meow-rs/meow"
 version = "0.0.0"
 
 # Externals are DECLARED centrally so consuming crates inherit one pin each.
-# A pin here costs nothing until a crate lists it under its own [dependencies];
-# this skeleton consumes ONLY clap (+ dev assert_cmd/predicates), so cargo builds
-# nothing heavy. Each later spec that introduces an external appends its pin under
+# A pin here costs nothing until a crate lists it under its own [dependencies].
+# Each later spec that introduces an external appends its pin under
 # its own `# === <SPEC-ID> ===` marker (keeps fence-balance meaningful, makes the
 # footprint audit a single read).
 [workspace.dependencies]
@@ -21,8 +20,7 @@ version = "0.0.0"
 # Pin confirmed by RT-001's V8 build; consumed by RT-* (use `deno_core::v8`, no direct v8 dep).
 deno_core = "0.403"
 # Parse/semantic/transform — Oxc, pinned as sub-crates in the GRAPH-001 fence below (I-1).
-# Bundler — declared when TOOL-003 (P3) lands:
-# rolldown = "..."
+# Bundler — consumed by TOOL-003 below (skeleton only; no full bundle claim yet).
 # Async I/O — consumed by RT-002 (tokio; io_uring on Linux).
 tokio = { version = "1", features = ["rt-multi-thread", "fs", "io-util", "net", "macros", "sync", "time"] }
 # === RT-002 ===
@@ -53,15 +51,20 @@ sha2 = "0.10"
 base64 = "0.22"
 semver = "1"
 # === PKG-002 ===
-ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
-# rustls is already in the tree (deno_fetch's TLS). Declared so the runtime can
-# install the aws-lc-rs crypto-provider default before fetch's first TLS use —
-# ureq's `ring` provider above otherwise makes rustls' process default ambiguous.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "http2", "gzip", "brotli", "deflate"] }
+# PKG-002's `meow install` HTTPS client (`reqwest`) and runtime TLS both use
+# `rustls`; installing the aws-lc-rs default in runtime avoids provider ambiguity.
 rustls = "0.23"
 # === /PKG-002 ===
 # === /PKG-001 ===
+# === RT-007 ===
+# Node `crypto` compatibility: sync hash/HMAC algorithms commonly used by Node CLIs.
+sha1 = "0.10"
+hmac = "0.12"
+md5 = { package = "md-5", version = "0.10" }
+# === /RT-007 ===
 # === GRAPH-001 ===
-# The ONE parser (I-1, P15): Oxc sub-crates pinned together at one generation. The
+# The ONE parser (I-1, P15): Oxc, pinned together at one generation. The
 # umbrella `oxc` (DIST-001) is left declared-but-unused — sub-crates give per-feature
 # control and avoid a duplicate `oxc` key here. Consumed ONLY by crates/graph.
 oxc_allocator = "0.134"
@@ -70,22 +73,27 @@ oxc_parser = "0.134"
 oxc_semantic = "0.134"
 oxc_span = "0.134"
 oxc_diagnostics = "0.134"
-# Safe self-referential storage for the arena-owned AST/Semantic (no hand-written unsafe).
+# Safe self-referential storage for the FileId hot path.
 self_cell = "1"
 # Fast path interner map for the FileId hot path.
 rustc-hash = "2"
 # salsa intentionally NOT pinned: Oxc's arena artifacts are !Send/!Sync/!Update, so the
 # incremental layer is hand-built behind GraphDb (see crates/graph/src/db.rs). A swap to
-# salsa later is contained behind the facade. oxc_transformer/oxc_codegen are deferred to
-# RT-003 (no speculative deps before the real type-strip lands).
+# salsa later is contained behind the facade. oxc_transformer remains deferred; TOOL-001
+# pins oxc_codegen below for printing from this same AST generation.
 # === /GRAPH-001 ===
+# === TOOL-001 ===
+oxc_codegen = "0.134"
+# === /TOOL-001 ===
+# === TOOL-003 ===
+rolldown = "1.1.0"
+# === /TOOL-003 ===
 # === RT-003 ===
 # Position-preserving type-stripping (CANON §9, I-3) walks the stage-1 Oxc AST and
 # blanks type-only spans to whitespace over the source string. This needs the Oxc
-# AST visitor (traversal only); NO oxc_transformer / oxc_codegen — those transpile
-# and emit fresh text, which loses byte positions and forces a sourcemap (forbidden
-# by CANON §9). Span-blanking needs no codegen, so none are pinned. Consumed ONLY by
-# crates/graph.
+# AST visitor (traversal only). RT-003 does not consume oxc_transformer/oxc_codegen:
+# it blanks spans in-place to preserve byte positions and avoid sourcemaps. TOOL-001
+# owns the oxc_codegen printer pin above.
 oxc_ast_visit = "0.134"
 # === /RT-003 ===
 # === RT-004 ===

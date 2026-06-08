@@ -1,4 +1,4 @@
-//! The hermetic ops (RT-006 · A3): the four governed edges JS uses for time,
+//! The hermetic ops (RT-006 · A3): the governed edges JS uses for time,
 //! entropy, and env. Each borrows the shared [`HermeticState`] out of `OpState`.
 //!
 //! `OpState` holds `Rc<RefCell<HermeticState>>`, seeded by
@@ -53,10 +53,18 @@ pub fn op_hermetic_random_fill(
     hermetic_state(state).borrow_mut().fill_random(buf)
 }
 
-/// Read an env var through the policy. Deny → `null`; Allow → the real value iff
+/// Read an env var through the policy. Deny -> `null`; Allow -> the real value iff
 /// `name` is in the scoped allowlist.
 #[op2]
 #[string]
 pub fn op_hermetic_env_get(state: &mut OpState, #[string] name: &str) -> Option<String> {
     hermetic_state(state).borrow().env_get(name)
+}
+
+/// Snapshot the visible env through the policy. Deny -> empty list; Allow -> the
+/// scoped visible subset, key-sorted.
+#[op2]
+#[serde]
+pub fn op_hermetic_env_entries(state: &mut OpState) -> Vec<(String, String)> {
+    hermetic_state(state).borrow().env_entries()
 }

@@ -462,8 +462,8 @@ fn runtime_load_accepts_cjs_after_shared_resolution() {
 
     let loaded = load_result(&loader, &runtime_url).expect("runtime loads CJS");
     assert!(
-        loaded.contains("__meowExecute"),
-        "runtime now lowers CJS into a synthetic wrapper: {loaded}"
+        loaded.contains("__meowCjsExports"),
+        "cjs load delegates to the native CJS runtime shim: {loaded}"
     );
     assert!(!fixture.project.join("node_modules").exists());
 

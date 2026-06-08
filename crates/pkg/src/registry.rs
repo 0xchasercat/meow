@@ -5,6 +5,8 @@
 //! while the CLI edge injects the real HTTPS client.
 
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 
 use base64::Engine as _;
 use serde::Deserialize;
@@ -13,12 +15,18 @@ use sha2::{Digest, Sha512};
 use crate::{PackageName, Version, VersionReq};
 
 /// Where package metadata + tarball bytes come from.
-pub trait RegistrySource {
+pub trait RegistrySource: Send + Sync {
     /// Fetch the registry document for one package name.
-    fn fetch_metadata(&self, name: &PackageName) -> Result<PackageMetadata, RegistryError>;
+    fn fetch_metadata<'a>(
+        &'a self,
+        name: &'a PackageName,
+    ) -> Pin<Box<dyn Future<Output = Result<PackageMetadata, RegistryError>> + Send + 'a>>;
 
     /// Fetch the exact gzip-tar tarball bytes for one published version.
-    fn fetch_tarball(&self, url: &str) -> Result<Vec<u8>, RegistryError>;
+    fn fetch_tarball<'a>(
+        &'a self,
+        url: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, RegistryError>> + Send + 'a>>;
 }
 
 /// The subset of an npm package document the resolver consults.
@@ -55,20 +63,70 @@ pub struct DistInfo {
     pub shasum: Option<String>,
 }
 
-/// A dependency requirement: either a semver range or a registry dist-tag.
+/// A dependency requirement: either a semver range, registry dist-tag, or npm alias.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DepSpec {
     Range(VersionReq),
     Tag(String),
+    Alias {
+        package: PackageName,
+        spec: Box<DepSpec>,
+    },
 }
 
 impl DepSpec {
     /// Parse a direct or transitive dependency requirement.
     pub fn parse(value: &str) -> DepSpec {
+        if let Some(alias) = value.strip_prefix("npm:") {
+            if let Some((package, spec)) = split_npm_alias(alias) {
+                return DepSpec::Alias {
+                    package: PackageName::new(package),
+                    spec: Box::new(DepSpec::parse(spec.unwrap_or("latest"))),
+                };
+            }
+        }
+
         match VersionReq::parse(value) {
             Ok(req) => DepSpec::Range(req),
             Err(_) => DepSpec::Tag(value.to_owned()),
         }
+    }
+
+    pub fn registry_package<'a>(&'a self, fallback: &'a PackageName) -> &'a PackageName {
+        match self {
+            DepSpec::Alias { package, .. } => package,
+            DepSpec::Range(_) | DepSpec::Tag(_) => fallback,
+        }
+    }
+
+    pub fn selection_spec(&self) -> &DepSpec {
+        match self {
+            DepSpec::Alias { spec, .. } => spec,
+            DepSpec::Range(_) | DepSpec::Tag(_) => self,
+        }
+    }
+}
+
+fn split_npm_alias(value: &str) -> Option<(&str, Option<&str>)> {
+    if value.is_empty() {
+        return None;
+    }
+    if value.starts_with('@') {
+        let slash = value.find('/')?;
+        let rest = &value[slash + 1..];
+        let at = rest.find('@').map(|idx| slash + 1 + idx);
+        return match at {
+            Some(idx) => Some((&value[..idx], Some(&value[idx + 1..]))),
+            None => Some((value, None)),
+        };
+    }
+
+    match value
+        .rmatch_indices('@')
+        .find_map(|(idx, _)| (idx > 0).then_some(idx))
+    {
+        Some(idx) => Some((&value[..idx], Some(&value[idx + 1..]))),
+        None => Some((value, None)),
     }
 }
 
@@ -84,7 +142,7 @@ pub enum RegistryError {
 }
 
 /// In-memory registry fixture for deterministic tests.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct FixtureRegistry {
     metadata: BTreeMap<PackageName, PackageMetadata>,
     tarballs: BTreeMap<String, Vec<u8>>,
@@ -154,24 +212,34 @@ impl FixtureRegistry {
 }
 
 impl RegistrySource for FixtureRegistry {
-    fn fetch_metadata(&self, name: &PackageName) -> Result<PackageMetadata, RegistryError> {
-        self.metadata
-            .get(name)
-            .cloned()
-            .ok_or_else(|| RegistryError::Fetch {
-                target: name.to_string(),
-                reason: "package not found in fixture registry".to_owned(),
-            })
+    fn fetch_metadata<'a>(
+        &'a self,
+        name: &'a PackageName,
+    ) -> Pin<Box<dyn Future<Output = Result<PackageMetadata, RegistryError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.metadata
+                .get(name)
+                .cloned()
+                .ok_or_else(|| RegistryError::Fetch {
+                    target: name.to_string(),
+                    reason: "package not found in fixture registry".to_owned(),
+                })
+        })
     }
 
-    fn fetch_tarball(&self, url: &str) -> Result<Vec<u8>, RegistryError> {
-        self.tarballs
-            .get(url)
-            .cloned()
-            .ok_or_else(|| RegistryError::Fetch {
-                target: url.to_owned(),
-                reason: "tarball not found in fixture registry".to_owned(),
-            })
+    fn fetch_tarball<'a>(
+        &'a self,
+        url: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, RegistryError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.tarballs
+                .get(url)
+                .cloned()
+                .ok_or_else(|| RegistryError::Fetch {
+                    target: url.to_owned(),
+                    reason: "tarball not found in fixture registry".to_owned(),
+                })
+        })
     }
 }
 

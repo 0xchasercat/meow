@@ -3,10 +3,10 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use deno_core::url::Url;
 use deno_core::{
@@ -14,11 +14,13 @@ use deno_core::{
     RequestedModuleType,
 };
 use meow_graph::GraphDb;
-use meow_loader::{MeowModuleLoader, ModuleLocator, ResolveError, Resolver};
+use meow_loader::{
+    encode_cache_url, MeowModuleLoader, ModuleKind, ModuleLocator, ResolveError, Resolver,
+};
 use meow_pkg::{
     Cache, CacheError, LockEntry, Lockfile, PackageName, RegistryProvenance, Version, VersionReq,
 };
-use meow_runtime::{print_sink_extension, PrintSink, Runtime, RuntimeOptions};
+use meow_runtime::{hermetic, node, print_sink_extension, PrintSink, Runtime, RuntimeOptions};
 
 fn unique_dir(tag: &str) -> std::path::PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -117,6 +119,62 @@ fn capture() -> (Rc<RefCell<String>>, deno_core::Extension) {
     }));
     (out, print_sink_extension(sink))
 }
+struct TestCjsResolver(Mutex<Resolver>);
+
+impl node::CjsResolver for TestCjsResolver {
+    fn resolve_and_load_cjs(
+        &self,
+        specifier: &str,
+        referrer: &str,
+    ) -> Result<node::CjsLoadedModule, String> {
+        let referrer_url =
+            Url::parse(referrer).map_err(|_| format!("invalid CommonJS referrer {referrer}"))?;
+        let resolver = self
+            .0
+            .lock()
+            .map_err(|_| "CommonJS resolver lock poisoned".to_owned())?;
+        let resolved = resolver
+            .resolve_require(specifier, &referrer_url)
+            .map_err(|err| err.to_string())?;
+        if resolved.kind == meow_loader::ModuleKind::Esm {
+            return Err(format!("cannot require ES module {}", resolved.url));
+        }
+        let filename = resolver
+            .runtime_path_for(&resolved.locator)
+            .map_err(|err| err.to_string())?
+            .to_string_lossy()
+            .into_owned();
+        let dirname = PathBuf::from(&filename)
+            .parent()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let kind = match resolved.kind {
+            meow_loader::ModuleKind::Json => "json",
+            meow_loader::ModuleKind::Cjs => "cjs",
+            meow_loader::ModuleKind::Esm => unreachable!("ESM was rejected above"),
+        }
+        .to_owned();
+        Ok(node::CjsLoadedModule {
+            url: resolved.url.to_string(),
+            filename,
+            dirname,
+            source: resolved.source.as_ref().to_owned(),
+            kind,
+        })
+    }
+}
+
+// === RT-007 ===
+fn node_extensions(resolver: Option<Resolver>) -> Vec<deno_core::Extension> {
+    let mut opts = node::NodeOptions::enabled(Vec::new(), PathBuf::from("."));
+    opts.cjs_resolver = resolver.map(|resolver| {
+        Arc::new(TestCjsResolver(Mutex::new(resolver))) as Arc<dyn node::CjsResolver>
+    });
+    let mut exts = node::extensions(opts);
+    exts.extend(hermetic::extensions(hermetic::HermeticConfig::default()));
+    exts
+}
+// === /RT-007 ===
 
 fn sync_options() -> ModuleLoadOptions {
     ModuleLoadOptions {
@@ -139,9 +197,15 @@ fn load_code(loader: &MeowModuleLoader, spec: &ModuleSpecifier) -> Result<String
 
 async fn run_entry(
     loader: Rc<dyn ModuleLoader>,
+    resolver: Resolver,
     entry: &Path,
-    extensions: Vec<deno_core::Extension>,
+    mut extensions: Vec<deno_core::Extension>,
 ) -> Result<(), meow_runtime::RuntimeError> {
+    // === RT-007 ===
+    // Every CJS executor pre-injects the full `node:*` built-in set, so the
+    // `meow_node` ops must be registered before we evaluate the entry module.
+    extensions.extend(node_extensions(Some(resolver)));
+    // === /RT-007 ===
     let mut rt = Runtime::new(RuntimeOptions {
         module_loader: loader,
         extensions,
@@ -199,12 +263,19 @@ async fn cached_dep_runs_end_to_end_with_no_node_modules() {
 
     let resolver = resolver_with(&cache_root, lockfile, root_deps(&[("dep", "1.0.0")]), &proj);
     let graph = Rc::new(RefCell::new(GraphDb::new()));
-    let loader = Rc::new(MeowModuleLoader::new(resolver, graph));
+    let loader = Rc::new(MeowModuleLoader::new(resolver.clone(), graph));
 
     let (out, sink_ext) = capture();
     let mut rt = Runtime::new(RuntimeOptions {
         module_loader: loader,
-        extensions: vec![sink_ext],
+        // === RT-007 === CJS executors pre-import the `node:*` set, so the
+        // meow_node ops have to be live before the entry module evaluates.
+        extensions: {
+            let mut exts = node_extensions(Some(resolver.clone()));
+            exts.push(sink_ext);
+            exts
+        },
+        // === /RT-007 ===
     })
     .expect("runtime initializes");
 
@@ -322,6 +393,12 @@ fn node_builtin_resolves_from_node_and_bare_specifiers() {
         ModuleLocator::Native { name } => assert_eq!(name, "node:fs"),
         other => panic!("expected Native locator, got {other:?}"),
     }
+    let (dns_url, dns_locator) = resolver.locate("dns", &referrer).expect("dns resolves");
+    assert_eq!(dns_url.as_str(), "node:dns");
+    match dns_locator {
+        ModuleLocator::Native { name } => assert_eq!(name, "node:dns"),
+        other => panic!("expected Native locator, got {other:?}"),
+    }
 
     let resolved = resolver
         .resolve("fs/promises", &referrer)
@@ -336,7 +413,7 @@ fn node_builtin_resolves_from_node_and_bare_specifiers() {
 }
 
 #[test]
-fn lockfile_package_shadows_bare_node_builtin_name() {
+fn lockfile_package_does_not_shadow_builtin_name() {
     let proj = unique_dir("node-shadow");
     let cache_root = proj.join("cache");
     let cache = Cache::with_root(&cache_root);
@@ -362,19 +439,128 @@ fn lockfile_package_shadows_bare_node_builtin_name() {
 
     let (bare_url, bare_locator) = resolver
         .locate("path", &referrer)
-        .expect("shadowed path resolves");
-    assert_eq!(
-        bare_url,
-        meow_loader::encode_cache_url(&dep_hash, "index.js")
-    );
-    assert!(matches!(bare_locator, ModuleLocator::Cached { .. }));
+        .expect("builtin path resolves for bare specifier");
+    assert_eq!(bare_url.as_str(), "node:path");
+    assert!(matches!(bare_locator, ModuleLocator::Native { name } if name == "node:path"));
 
     let (node_url, node_locator) = resolver
         .locate("node:path", &referrer)
         .expect("explicit node:path still resolves");
     assert_eq!(node_url.as_str(), "node:path");
-    match node_locator {
-        ModuleLocator::Native { name } => assert_eq!(name, "node:path"),
+    assert!(matches!(node_locator, ModuleLocator::Native { name } if name == "node:path"));
+
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[test]
+fn missing_lockfile_entry_falls_back_to_node_builtin() {
+    let proj = unique_dir("node-builtin-missing-lock");
+    let cache_root = proj.join("cache");
+    let resolver = resolver_with(
+        &cache_root,
+        Lockfile::new(),
+        root_deps(&[("dns", "0.0.0")]),
+        &proj,
+    );
+    let referrer = Url::from_file_path(proj.join("main.ts")).expect("referrer URL");
+
+    let (url, locator) = resolver
+        .locate("dns", &referrer)
+        .expect("dns falls back to node builtin when the lock has no package entry");
+    assert_eq!(url.as_str(), "node:dns");
+    match locator {
+        ModuleLocator::Native { name } => assert_eq!(name, "node:dns"),
+        other => panic!("expected Native locator, got {other:?}"),
+    }
+
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[test]
+fn cached_package_dependency_dns_entry_prefers_builtin() {
+    let proj = unique_dir("node-builtin-locked-entry");
+    let cache_root = proj.join("cache");
+    let cache = Cache::with_root(&cache_root);
+    let next_hash = cache
+        .store(&archive(&[
+            (
+                "package.json",
+                br#"{"name":"next","version":"1.0.0","type":"module"}"#,
+            ),
+            ("dist/bin/next", b"import dns from 'dns';\n"),
+        ]))
+        .expect("store next-like dep blob");
+    let dns_hash = cache
+        .store(&archive(&[
+            (
+                "package.json",
+                br#"{"name":"dns","version":"1.0.0","type":"module","exports":"./index.js"}"#,
+            ),
+            ("index.js", b"export default 'shadowed package';\n"),
+        ]))
+        .expect("store dns-like dep blob");
+
+    let mut lockfile = Lockfile::new();
+    lockfile.upsert(lock_entry(
+        "next",
+        "1.0.0",
+        next_hash.clone(),
+        &[("dns", "1.0.0")],
+    ));
+    lockfile.upsert(lock_entry("dns", "1.0.0", dns_hash.clone(), &[]));
+    let resolver = resolver_with(
+        &cache_root,
+        lockfile,
+        root_deps(&[("next", "1.0.0")]),
+        &proj,
+    );
+    let referrer = encode_cache_url(&next_hash, "dist/bin/next");
+
+    let (url, locator) = resolver
+        .locate("dns", &referrer)
+        .expect("cached package dns import prefers node builtin");
+    assert_eq!(url.as_str(), "node:dns");
+    assert!(matches!(locator, ModuleLocator::Native { name } if name == "node:dns"));
+
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[test]
+fn cached_package_missing_lockfile_entry_falls_back_to_node_builtin() {
+    let proj = unique_dir("node-builtin-cached-missing-lock");
+    let cache_root = proj.join("cache");
+    let cache = Cache::with_root(&cache_root);
+    let next_hash = cache
+        .store(&archive(&[
+            (
+                "package.json",
+                br#"{"name":"next","version":"1.0.0","type":"module"}"#,
+            ),
+            ("dist/bin/next", b"import dns from 'dns';\n"),
+        ]))
+        .expect("store next-like dep blob");
+
+    let mut lockfile = Lockfile::new();
+    lockfile.upsert(lock_entry(
+        "next",
+        "1.0.0",
+        next_hash.clone(),
+        &[("dns", "0.0.0")],
+    ));
+    let resolver = resolver_with(
+        &cache_root,
+        lockfile,
+        root_deps(&[("next", "1.0.0")]),
+        &proj,
+    );
+    let referrer = encode_cache_url(&next_hash, "dist/bin/next");
+
+    let (url, locator) = resolver
+        .locate("dns", &referrer)
+        .expect("cached package dns import falls back to node builtin");
+    assert_eq!(url.as_str(), "node:dns");
+    match locator {
+        ModuleLocator::Native { name } => assert_eq!(name, "node:dns"),
         other => panic!("expected Native locator, got {other:?}"),
     }
 
@@ -388,7 +574,7 @@ fn ts_source_is_stripped_on_load() {
     std::fs::write(&entry, "export const n: number = 41 + 1;\n").expect("write");
 
     let resolver = resolver_with(&proj.join("cache"), Lockfile::new(), BTreeMap::new(), &proj);
-    let loader = MeowModuleLoader::new(resolver, Rc::new(RefCell::new(GraphDb::new())));
+    let loader = MeowModuleLoader::new(resolver.clone(), Rc::new(RefCell::new(GraphDb::new())));
 
     let spec = ModuleSpecifier::from_file_path(&entry).expect("file URL");
     let code = load_code(&loader, &spec).expect("typed module loads");
@@ -404,7 +590,7 @@ fn non_erasable_ts_enum_is_a_load_error() {
     std::fs::write(&entry, "enum E { A }\nexport const e = E.A;\n").expect("write");
 
     let resolver = resolver_with(&proj.join("cache"), Lockfile::new(), BTreeMap::new(), &proj);
-    let loader = MeowModuleLoader::new(resolver, Rc::new(RefCell::new(GraphDb::new())));
+    let loader = MeowModuleLoader::new(resolver.clone(), Rc::new(RefCell::new(GraphDb::new())));
 
     let spec = ModuleSpecifier::from_file_path(&entry).expect("file URL");
     let err = load_code(&loader, &spec).expect_err("enum module fails to load");
@@ -463,11 +649,11 @@ async fn first_party_js_commonjs_runs_end_to_end() {
 
     let resolver = resolver_with(&proj.join("cache"), Lockfile::new(), BTreeMap::new(), &proj);
     let loader: Rc<dyn ModuleLoader> = Rc::new(MeowModuleLoader::new(
-        resolver,
+        resolver.clone(),
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, &entry, vec![sink_ext])
+    run_entry(loader, resolver.clone(), &entry, vec![sink_ext])
         .await
         .expect("first-party CommonJS runs");
 
@@ -498,15 +684,76 @@ async fn esm_imports_cached_cjs_dependency() {
 
     let resolver = resolver_with(&cache_root, lockfile, root_deps(&[("dep", "1.0.0")]), &proj);
     let loader: Rc<dyn ModuleLoader> = Rc::new(MeowModuleLoader::new(
-        resolver,
+        resolver.clone(),
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, &entry, vec![sink_ext])
+    run_entry(loader, resolver.clone(), &entry, vec![sink_ext])
         .await
         .expect("cached CJS dependency imports");
 
     assert_eq!(*out.borrow(), "cache-cjs\n");
+    assert!(!proj.join("node_modules").exists());
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[tokio::test]
+async fn extensionless_cached_commonjs_bin_runs_via_native_cjs_runtime() {
+    let proj = unique_dir("extensionless-cjs-bin");
+    let cache_root = proj.join("cache");
+    let cache = Cache::with_root(&cache_root);
+    let dep_hash = cache
+        .store(&archive(&[
+            (
+                "package.json",
+                br#"{"name":"next","version":"1.0.0","type":"commonjs","bin":{"next":"dist/bin/next"}}"#,
+            ),
+            (
+                "dist/bin/next",
+                b"Object.defineProperty(exports, '__esModule', { value: true });\nexports.run = 'ok';\nconsole.log(exports.run);\n",
+            ),
+        ]))
+        .expect("store dep blob");
+
+    let mut lockfile = Lockfile::new();
+    lockfile.upsert(lock_entry("next", "1.0.0", dep_hash.clone(), &[]));
+    let resolver = resolver_with(
+        &cache_root,
+        lockfile,
+        root_deps(&[("next", "1.0.0")]),
+        &proj,
+    );
+    let loader: Rc<dyn ModuleLoader> = Rc::new(MeowModuleLoader::new(
+        resolver.clone(),
+        Rc::new(RefCell::new(GraphDb::new())),
+    ));
+    let (out, sink_ext) = capture();
+    let mut rt = Runtime::new(RuntimeOptions {
+        module_loader: loader,
+        // === RT-007 === see note on the entry above
+        extensions: {
+            let mut exts = node_extensions(Some(resolver.clone()));
+            exts.push(sink_ext);
+            exts
+        },
+        // === /RT-007 ===
+    })
+    .expect("runtime initializes");
+    let spec = encode_cache_url(&dep_hash, "dist/bin/next");
+    let ext_resolved = resolver
+        .resolve(spec.as_str(), &spec)
+        .expect("extensionless cache member resolves");
+    assert_eq!(
+        ext_resolved.kind,
+        ModuleKind::Cjs,
+        "extensionless cached member follows package type commonjs"
+    );
+
+    rt.run_main_module(&spec)
+        .await
+        .expect("extensionless CJS bin runs");
+
+    assert_eq!(*out.borrow(), "ok\n");
     assert!(!proj.join("node_modules").exists());
     std::fs::remove_dir_all(&proj).ok();
 }
@@ -539,11 +786,11 @@ async fn commonjs_require_uses_require_export_condition_for_cached_dep() {
 
     let resolver = resolver_with(&cache_root, lockfile, root_deps(&[("dep", "1.0.0")]), &proj);
     let loader: Rc<dyn ModuleLoader> = Rc::new(MeowModuleLoader::new(
-        resolver,
+        resolver.clone(),
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, &entry, vec![sink_ext])
+    run_entry(loader, resolver.clone(), &entry, vec![sink_ext])
         .await
         .expect("require branch runs");
 
@@ -562,17 +809,17 @@ async fn esm_imports_cjs_default_named_and_reassignment() {
     let entry = proj.join("main.mjs");
     std::fs::write(
         &entry,
-        "import legacy, { foo, bar } from './legacy.cjs';\nconsole.log(JSON.stringify({ answer: legacy.answer, foo, bar }));\n",
+        "import legacy from './legacy.cjs';\nconsole.log(JSON.stringify({ answer: legacy.answer, foo: legacy.foo, bar: legacy.bar }));\n",
     )
     .expect("write entry");
 
     let resolver = resolver_with(&proj.join("cache"), Lockfile::new(), BTreeMap::new(), &proj);
     let loader: Rc<dyn ModuleLoader> = Rc::new(MeowModuleLoader::new(
-        resolver,
+        resolver.clone(),
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, &entry, vec![sink_ext])
+    run_entry(loader, resolver.clone(), &entry, vec![sink_ext])
         .await
         .expect("ESM imports CJS");
 
@@ -602,11 +849,11 @@ async fn circular_commonjs_sees_partial_exports_object() {
 
     let resolver = resolver_with(&proj.join("cache"), Lockfile::new(), BTreeMap::new(), &proj);
     let loader: Rc<dyn ModuleLoader> = Rc::new(MeowModuleLoader::new(
-        resolver,
+        resolver.clone(),
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, &entry, vec![sink_ext])
+    run_entry(loader, resolver.clone(), &entry, vec![sink_ext])
         .await
         .expect("cycle runs");
 
@@ -634,11 +881,11 @@ async fn repeated_require_returns_the_same_object() {
 
     let resolver = resolver_with(&proj.join("cache"), Lockfile::new(), BTreeMap::new(), &proj);
     let loader: Rc<dyn ModuleLoader> = Rc::new(MeowModuleLoader::new(
-        resolver,
+        resolver.clone(),
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, &entry, vec![sink_ext])
+    run_entry(loader, resolver.clone(), &entry, vec![sink_ext])
         .await
         .expect("repeat require runs");
 
@@ -681,11 +928,11 @@ async fn dirname_and_filename_use_real_local_and_unpacked_cached_paths() {
 
     let resolver = resolver_with(&cache_root, lockfile, root_deps(&[("dep", "1.0.0")]), &proj);
     let loader: Rc<dyn ModuleLoader> = Rc::new(MeowModuleLoader::new(
-        resolver,
+        resolver.clone(),
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, &entry, vec![sink_ext])
+    run_entry(loader, resolver.clone(), &entry, vec![sink_ext])
         .await
         .expect("path metadata runs");
 
@@ -709,26 +956,58 @@ async fn dirname_and_filename_use_real_local_and_unpacked_cached_paths() {
 }
 
 #[tokio::test]
-async fn dynamic_require_without_prewalk_is_an_honest_error() {
+async fn dynamic_require_resolves_at_runtime() {
     let proj = unique_dir("dynamic-require");
     std::fs::write(proj.join("dep.cjs"), "module.exports = 42;\n").expect("write dep");
     let entry = proj.join("main.cjs");
-    std::fs::write(&entry, "const name = './dep.cjs';\nrequire(name);\n").expect("write entry");
+    std::fs::write(
+        &entry,
+        "const name = './dep.cjs';\nconsole.log(require(name));\n",
+    )
+    .expect("write entry");
 
     let resolver = resolver_with(&proj.join("cache"), Lockfile::new(), BTreeMap::new(), &proj);
     let loader: Rc<dyn ModuleLoader> = Rc::new(MeowModuleLoader::new(
-        resolver,
+        resolver.clone(),
         Rc::new(RefCell::new(GraphDb::new())),
     ));
-    let err = run_entry(loader, &entry, vec![])
+    let (out, sink_ext) = capture();
+    run_entry(loader, resolver.clone(), &entry, vec![sink_ext])
         .await
-        .expect_err("dynamic require must fail");
-    let detail = err.to_string();
-    assert!(detail.contains("./dep.cjs"), "specifier is named: {detail}");
-    assert!(detail.contains("LOAD-005"), "legacy pointer kept: {detail}");
-    assert!(
-        detail.contains(entry.to_string_lossy().as_ref()),
-        "referrer is named: {detail}"
+        .expect("dynamic require resolves through native CJS");
+    assert_eq!(*out.borrow(), "42\n");
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[tokio::test]
+async fn unresolvable_static_require_falls_through_to_catchable_runtime_error() {
+    // LOAD-003: CJS bundles (Next.js, Webpack) routinely wrap optional
+    // `require(...)` calls in `try { ... } catch {}` to feature-detect
+    // environments. Native CJS resolution keeps that error at the original
+    // JavaScript call site, so userland `try/catch` can still handle it.
+    let proj = unique_dir("optional-require");
+    let entry = proj.join("main.cjs");
+    std::fs::write(
+        &entry,
+        // `webpack` is never installed; the call is inside try/catch.
+        "let mod; try { mod = require('webpack'); } catch (e) { mod = null; }\nconsole.log(mod === null ? 'caught' : 'resolved');\n",
+    )
+    .expect("write entry");
+
+    let resolver = resolver_with(&proj.join("cache"), Lockfile::new(), BTreeMap::new(), &proj);
+    let loader: Rc<dyn ModuleLoader> = Rc::new(MeowModuleLoader::new(
+        resolver.clone(),
+        Rc::new(RefCell::new(GraphDb::new())),
+    ));
+    let (out, sink_ext) = capture();
+    run_entry(loader, resolver.clone(), &entry, vec![sink_ext])
+        .await
+        .expect("optional require wrapped in try/catch must not abort build");
+
+    assert_eq!(
+        *out.borrow(),
+        "caught\n",
+        "try/catch around an unresolvable require runs the catch branch"
     );
     std::fs::remove_dir_all(&proj).ok();
 }
@@ -746,11 +1025,11 @@ async fn erasable_typescript_commonjs_runs() {
 
     let resolver = resolver_with(&proj.join("cache"), Lockfile::new(), BTreeMap::new(), &proj);
     let loader: Rc<dyn ModuleLoader> = Rc::new(MeowModuleLoader::new(
-        resolver,
+        resolver.clone(),
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, &entry, vec![sink_ext])
+    run_entry(loader, resolver.clone(), &entry, vec![sink_ext])
         .await
         .expect("TS CommonJS runs");
 
@@ -765,7 +1044,7 @@ fn ts_export_equals_is_an_honest_commonjs_load_error() {
     std::fs::write(&entry, "const value = 1;\nexport = value;\n").expect("write entry");
 
     let resolver = resolver_with(&proj.join("cache"), Lockfile::new(), BTreeMap::new(), &proj);
-    let loader = MeowModuleLoader::new(resolver, Rc::new(RefCell::new(GraphDb::new())));
+    let loader = MeowModuleLoader::new(resolver.clone(), Rc::new(RefCell::new(GraphDb::new())));
     let spec = ModuleSpecifier::from_file_path(&entry).expect("file URL");
     let err = load_code(&loader, &spec).expect_err("export = must fail honestly");
     assert!(

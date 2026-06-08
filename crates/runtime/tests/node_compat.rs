@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use deno_core::url::Url;
 use meow_graph::GraphDb;
@@ -41,8 +41,52 @@ fn dir_url(path: &Path) -> Url {
 fn js_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\"))
 }
+struct TestCjsResolver(Mutex<Resolver>);
 
-fn loader_for(project_root: &Path) -> Rc<dyn deno_core::ModuleLoader> {
+impl node::CjsResolver for TestCjsResolver {
+    fn resolve_and_load_cjs(
+        &self,
+        specifier: &str,
+        referrer: &str,
+    ) -> Result<node::CjsLoadedModule, String> {
+        let referrer_url =
+            Url::parse(referrer).map_err(|_| format!("invalid CommonJS referrer {referrer}"))?;
+        let resolver = self
+            .0
+            .lock()
+            .map_err(|_| "CommonJS resolver lock poisoned".to_owned())?;
+        let resolved = resolver
+            .resolve_require(specifier, &referrer_url)
+            .map_err(|err| err.to_string())?;
+        if resolved.kind == meow_loader::ModuleKind::Esm {
+            return Err(format!("cannot require ES module {}", resolved.url));
+        }
+        let filename = resolver
+            .runtime_path_for(&resolved.locator)
+            .map_err(|err| err.to_string())?
+            .to_string_lossy()
+            .into_owned();
+        let dirname = std::path::PathBuf::from(&filename)
+            .parent()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let kind = match resolved.kind {
+            meow_loader::ModuleKind::Json => "json",
+            meow_loader::ModuleKind::Cjs => "cjs",
+            meow_loader::ModuleKind::Esm => unreachable!("ESM was rejected above"),
+        }
+        .to_owned();
+        Ok(node::CjsLoadedModule {
+            url: resolved.url.to_string(),
+            filename,
+            dirname,
+            source: resolved.source.as_ref().to_owned(),
+            kind,
+        })
+    }
+}
+
+fn runtime_parts_for(project_root: &Path) -> (Rc<dyn deno_core::ModuleLoader>, Resolver) {
     let resolver = Resolver::new(
         Arc::new(Cache::with_root(project_root.join("cache"))),
         Arc::new(Lockfile::new()),
@@ -50,10 +94,11 @@ fn loader_for(project_root: &Path) -> Rc<dyn deno_core::ModuleLoader> {
         dir_url(project_root),
         meow_runtime::native::native_module_registry(),
     );
-    Rc::new(MeowModuleLoader::new(
-        resolver,
+    let loader = Rc::new(MeowModuleLoader::new(
+        resolver.clone(),
         Rc::new(RefCell::new(GraphDb::new())),
-    ))
+    ));
+    (loader, resolver)
 }
 
 fn node_runtime(
@@ -61,6 +106,7 @@ fn node_runtime(
     cwd: &Path,
     argv: Vec<String>,
 ) -> (Rc<RefCell<String>>, Runtime) {
+    let (loader, resolver) = runtime_parts_for(cwd);
     let (out, sink) = capture();
     let caps: web::NetCaps = Arc::new(AllowAll);
     let mut extensions = web::extensions(web::WebOptions {
@@ -78,11 +124,12 @@ fn node_runtime(
         argv,
         cwd: cwd.to_path_buf(),
         env: BTreeMap::new(),
+        cjs_resolver: Some(Arc::new(TestCjsResolver(Mutex::new(resolver)))),
     }));
     extensions.push(sink);
 
     let runtime = Runtime::new(RuntimeOptions {
-        module_loader: loader_for(cwd),
+        module_loader: loader,
         extensions,
     })
     .expect("runtime initializes");
@@ -125,6 +172,41 @@ async fn node_path_bare_and_node_round_trip() {
     .await
     .expect("module runs");
     assert_eq!(*out.borrow(), "true:true\n");
+    std::fs::remove_dir_all(&proj).ok();
+}
+#[tokio::test]
+async fn node_dns_bare_and_node_import_round_trip() {
+    let proj = unique_dir("dns");
+    let (out, mut rt) = node_runtime(
+        node::NodeMode::Enabled,
+        &proj,
+        vec![
+            "meow".to_owned(),
+            proj.join("main.mjs").to_string_lossy().into_owned(),
+        ],
+    );
+    run_src(
+        &mut rt,
+        "file:///dns.mjs",
+        r#"
+        import dns from "dns";
+        import nodeDns from "node:dns";
+        dns.lookup("127.0.0.1", (error, address, family) => {
+          if (error) {
+            throw error;
+          }
+          nodeDns.lookup("127.0.0.1", { family: 4 }, (allError, secondAddress, secondFamily) => {
+            if (allError) {
+              throw allError;
+            }
+            console.log(`${dns === nodeDns}:${address}:${family}:${secondAddress}:${secondFamily}`);
+          });
+        });
+        "#,
+    )
+    .await
+    .expect("module runs");
+    assert_eq!(*out.borrow(), "true:127.0.0.1:4:127.0.0.1:4\n");
     std::fs::remove_dir_all(&proj).ok();
 }
 
@@ -395,5 +477,71 @@ async fn node_assert_module_works() {
     .await
     .expect("module runs");
     assert_eq!(*out.borrow(), "true\n");
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[tokio::test]
+async fn node_crypto_hash_hmac_random_and_bare_round_trip() {
+    let proj = unique_dir("crypto");
+    let (out, mut rt) = node_runtime(
+        node::NodeMode::Enabled,
+        &proj,
+        vec![
+            "meow".to_owned(),
+            proj.join("main.mjs").to_string_lossy().into_owned(),
+        ],
+    );
+    run_src(
+        &mut rt,
+        "file:///crypto.mjs",
+        r#"
+        import crypto from "crypto";
+        import nodeCrypto, { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+        const hash = createHash("sha256").update("abc").digest("hex");
+        const mac = createHmac("sha256", "key").update("data").digest("hex");
+        const bytes = randomBytes(8);
+        const equal = timingSafeEqual(Buffer.from("same"), Buffer.from("same"));
+        console.log(`${crypto === nodeCrypto}:${hash}:${mac}:${bytes.length}:${equal}`);
+        "#,
+    )
+    .await
+    .expect("module runs");
+    assert_eq!(
+        *out.borrow(),
+        "true:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad:5031fe3d989c6d1537a013fa6e739da23463fdaec3b70137d828e36ace221bd0:8:true\n"
+    );
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[tokio::test]
+async fn commonjs_require_dns_lookup_returns_node_shapes() {
+    let proj = unique_dir("cjs-dns");
+    let entry = proj.join("main.cjs");
+    std::fs::write(
+        &entry,
+        r#"const dns = require("dns");
+const nodeDns = require("node:dns");
+const nodeModule = require("module");
+dns.lookup("127.0.0.1", (error, address, family) => {
+  if (error) throw error;
+  nodeDns.lookup("127.0.0.1", { family: 4, all: true }, (allError, addresses) => {
+    if (allError) throw allError;
+    const first = addresses[0];
+    console.log(`${dns === nodeDns}:${nodeModule.isBuiltin("dns")}:${nodeModule.builtinModules.includes("dns")}:${address}:${family}:${Array.isArray(addresses)}:${first.address}:${first.family}`);
+  });
+});
+"#,
+    )
+    .expect("write entry");
+    let (out, mut rt) = node_runtime(
+        node::NodeMode::Enabled,
+        &proj,
+        vec!["meow".to_owned(), entry.to_string_lossy().into_owned()],
+    );
+    run_file(&mut rt, &entry).await.expect("CommonJS dns runs");
+    assert_eq!(
+        *out.borrow(),
+        "true:true:true:127.0.0.1:4:true:127.0.0.1:4\n"
+    );
     std::fs::remove_dir_all(&proj).ok();
 }

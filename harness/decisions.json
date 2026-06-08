@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-06-08T03:00:00Z",
+  "updated_at": "2026-06-08T12:15:00.000Z",
   "open": [
     {
       "id": "A-OBS1-PATHS",
@@ -17,11 +17,11 @@
     {
       "id": "A-OBS1-ROOTS",
       "kind": "assumption",
-      "title": "why-dep root-deps come from MeowConfig.dependencies, widening depends_on beyond [PKG-001]",
+      "title": "why-dep root-deps come from the shared declared-deps source, not graph in-degree",
       "opened_at": "2026-06-07T00:00:00Z",
       "status": "open",
       "summary": "Assignment said depends_on [PKG-001]; the full CLI honestly needs [PKG-001, PKG-002, CFG-001] because the lockfile cannot mark direct deps.",
-      "assumed": "Per PKG002 IRC, in-degree-zero is wrong (transitive-only pkgs can be in-degree-zero; direct deps can have in-edges). Correct root source = MeowConfig.dependencies pinned via Lockfile::resolve_roots (PKG-002) + MeowConfig::load (CFG-001). The pure path-finder library stays PKG-001-only.",
+      "assumed": "Per PKG002 IRC, in-degree-zero is wrong (transitive-only pkgs can be in-degree-zero; direct deps can have in-edges). Correct root source = the CFG-owned declared direct deps pinned via meow_pkg::resolve_roots (P2 used a config field; P2.5/CFG-003 moves that authority to package.json). The pure path-finder library stays PKG-001-only.",
       "shipped": "OBS-001",
       "reversible": true,
       "confidence": "high"
@@ -32,8 +32,8 @@
       "title": "Shadow .meow/deps map is flat-by-name; multi-version collisions pick one + record the rest",
       "opened_at": "2026-06-07T00:00:00Z",
       "status": "open",
-      "summary": "LSP-001's shadow node_modules symlink map exposes one version per package name (CANON \u00a720.1 flat-paths model); multi-version collisions are recorded, not nested.",
-      "assumed": "Flat .meow/deps/<name> over the root-reachable closure matches CANON \u00a720.1's flat tsconfig-paths model; on a multi-version name, link the root-reachable (else lowest) version and record the rest in ShadowDeps::collisions. A nested per-package multi-version tree is a full-LSP refinement; the runtime resolver stays multi-version-correct via the lockfile regardless.",
+      "summary": "LSP-001's shadow node_modules symlink map exposes one version per package name (CANON §20.1 flat-paths model); multi-version collisions are recorded, not nested.",
+      "assumed": "Flat .meow/deps/<name> over the root-reachable closure matches CANON §20.1's flat tsconfig-paths model; on a multi-version name, link the root-reachable (else lowest) version and record the rest in ShadowDeps::collisions. A nested per-package multi-version tree is a full-LSP refinement; the runtime resolver stays multi-version-correct via the lockfile regardless.",
       "shipped": "LSP-001",
       "reversible": true,
       "confidence": "medium"
@@ -80,30 +80,18 @@
       "title": "Root direct-dep pins are a pure function of (declared direct deps, lockfile) via resolve_roots; no separate persisted root index",
       "opened_at": "2026-06-07T00:00:00Z",
       "status": "open",
-      "summary": "ResolutionGraph root_deps come from the SHARED meow_pkg::resolve_roots(direct, lockfile) = max-satisfying locked version per declared direct dep (owned by PKG-002, called by install/runtime/LSP/PnP); no extra on-disk artifact beyond meow.lock.jsonl + MeowConfig.dependencies.",
-      "assumed": "The root has no LockEntry, so its exact direct-dep versions need a source. A pure function applied by every consumer cannot diverge (I-5/I-6 by construction). Honest caveat (I-11): max-satisfying lets a root dep silently float to a higher locked patch a transitive pulled in (deterministic, explainable via why-dep/OBS-001). Rejected heavier alternative: an install-written generated .meow/ PnP index (Yarn .pnp.cjs style). Shared root-derivation fn name reconciled to PKG-002's WRITTEN symbol meow_pkg::resolve_roots(direct: BTreeMap<PackageName,DepSpec>, lockfile) -> Result<_, RootResolveError> (supersedes the verbal pin_roots); OBS-001 already uses resolve_roots.",
+      "summary": "ResolutionGraph root_deps come from the SHARED meow_pkg::resolve_roots(direct, lockfile) = max-satisfying locked version per declared direct dep (owned by PKG-002, called by install/runtime/LSP/PnP); no extra on-disk graph artifact beyond package.json-declared roots + meow.lock.jsonl.",
+      "assumed": "The root has no LockEntry, so its exact direct-dep versions need a source. A pure function applied by every consumer cannot diverge (I-5/I-6 by construction). Honest caveat (I-11): max-satisfying lets a root dep silently float to a higher locked patch a transitive pulled in (deterministic, explainable via why-dep/OBS-001). Rejected heavier alternative: an install-written generated .meow/ PnP index (Yarn .pnp.cjs style). Shared root-derivation fn name reconciled to PKG-002's WRITTEN symbol meow_pkg::resolve_roots(direct: BTreeMap<PackageName,DepSpec>, lockfile) -> Result<_, RootResolveError>; P2.5 changes where direct comes from (package.json), not the ResolutionGraph seam.",
       "shipped": "PKG-003",
       "reversible": true,
       "confidence": "medium"
-    },
-    {
-      "id": "A-PKG002-1",
-      "kind": "assumption",
-      "title": "PKG-002 integrity: verify npm sha512 on download, content-address by meow sha256 (cache+lockfile key)",
-      "opened_at": "2026-06-08T03:00:00Z",
-      "status": "open",
-      "summary": "npm dist.integrity (sha512) is the supply-chain check at download; the meow sha256 is the cache key + LockEntry.integrity + I-7 anchor. sha512 verified-then-discarded at P2.",
-      "assumed": "PKG-001 cache is sha256; npm SRI is sha512. Verifying npm then content-addressing by sha256 reuses the existing cache without extending HashAlgo; provenance (persist sha512) deferred to SEC-002.",
-      "shipped": "PKG-002",
-      "reversible": true,
-      "confidence": "high"
     },
     {
       "id": "A-PKG002-2",
       "kind": "assumption",
       "title": "PKG-002/PKG-004 default install mode = PnP (ADR-4)",
       "opened_at": "2026-06-08T03:00:00Z",
-      "status": "open",
+      "status": "acked",
       "summary": "meow install defaults to PnP (in-memory, no node_modules); --materialize/--vendor are the escape hatch.",
       "assumed": "ADR-4 / CANON 24.4 ship PnP + materialize together with PnP as the norm.",
       "shipped": "PKG-002",
@@ -113,11 +101,11 @@
     {
       "id": "A-PKG002-3",
       "kind": "assumption",
-      "title": "PKG-002 declared deps live in meow.config.dependencies; add/remove write meow.config.json pre-RT-001",
+      "title": "PKG-002 declared deps were a P2 config stopgap; P2.5 moves authority to package.json",
       "opened_at": "2026-06-08T03:00:00Z",
       "status": "open",
-      "summary": "meow.config is the single source of declared deps (new MeowConfig.dependencies map); install add/remove edits it (JSON pre-defineMeow-execution).",
-      "assumed": "CFG is the single config authority; a TS-executed config is later, so JSON edits are the honest P1/P2 boundary.",
+      "summary": "PKG-002 shipped with declared deps in meow config; Amendment 001/CFG-003 retires that field and makes package.json the dependency authority.",
+      "assumed": "P2 needed a declared-deps source before package.json authority landed. The current architecture is package.json -> resolve_roots -> ResolutionGraph; meow.config remains runtime/tooling/policy only.",
       "shipped": "PKG-002",
       "reversible": true,
       "confidence": "medium"
@@ -130,18 +118,6 @@
       "status": "open",
       "summary": "The real NpmRegistry impl uses a small blocking HTTPS client (e.g. ureq) in the binary edge; meow-pkg stays network-free behind the RegistrySource trait.",
       "assumed": "Keeps meow-pkg footprint clean (I-10) + testable (FixtureRegistry); the client is swappable.",
-      "shipped": "PKG-002",
-      "reversible": true,
-      "confidence": "medium"
-    },
-    {
-      "id": "A-PKG002-5",
-      "kind": "assumption",
-      "title": "PKG-002 version resolution uses the pinned semver crate, not node-semver",
-      "opened_at": "2026-06-08T03:00:00Z",
-      "status": "open",
-      "summary": "Range resolution uses the workspace semver crate; node-semver-only forms error honestly (NoMatchingVersion/UnsupportedRange) rather than mis-resolve.",
-      "assumed": "Avoids a node-semver reimplementation now; the honesty gate (I-11) covers the gap; a faithful engine is a later option.",
       "shipped": "PKG-002",
       "reversible": true,
       "confidence": "medium"
@@ -193,7 +169,64 @@
       "shipped": "PKG-004",
       "reversible": true,
       "confidence": "medium"
+    },
+    {
+      "id": "A-P3-START",
+      "kind": "assumption",
+      "title": "Transition to P3 parses once, with DR-003 compatibility contract held fixed",
+      "opened_at": "2026-06-08T12:15:00Z",
+      "status": "open",
+      "summary": "Move from P2.5 drop-in Node harvest to P3 parse-once tooling: TOOL-001/002/003 and CHK-001/002 may start, but P2.5 semantics and .meow/deps/editor projection rules remain unchanged.",
+      "assumed": "Runtime truth is still ResolutionGraph + UnpackedStore paths; meow tooling must never bypass that for module identity or compatibility behavior.",
+      "reversible": true,
+      "confidence": "high"
     }
   ],
-  "resolved": []
+  "resolved": [
+    {
+      "id": "A-NODE-HARVEST",
+      "kind": "assumption",
+      "title": "Deno owns Node semantics; meow owns the PnP bridge",
+      "opened_at": "2026-06-08T12:00:00Z",
+      "status": "resolved",
+      "summary": "Node built-ins, CommonJS semantics, and N-API support move to upstream Deno crates; meow bridges its PnP graph/cache to Deno via real UnpackedStore package paths.",
+      "assumed": "Compatibility and UX beat a meow-owned Node reimplementation. Runtime truth is ResolutionGraph; UnpackedStore provides the real filesystem paths Deno's resolver/N-API need; .meow/deps is only the editor/TS/LSP shadow; --materialize is the explicit node_modules escape hatch.",
+      "shipped": "planning",
+      "reversible": true,
+      "confidence": "high",
+      "resolution": "Accepted by operator: staged cutover to Deno Node/N-API, with meow as PnP glue and UX/tooling layer; no manual Node polyfills and no synthetic CJS wrappers as target architecture.",
+      "dr": "DR-003",
+      "resolved_at": "2026-06-08T12:00:00Z"
+    },
+    {
+      "id": "A-PKG002-5",
+      "kind": "assumption",
+      "title": "PKG-002 version resolution uses the pinned semver crate, not node-semver",
+      "opened_at": "2026-06-08T03:00:00Z",
+      "status": "resolved",
+      "summary": "Range resolution uses the workspace semver crate; node-semver-only forms error honestly (NoMatchingVersion/UnsupportedRange) rather than mis-resolve.",
+      "assumed": "Avoids a node-semver reimplementation now; the honesty gate (I-11) covers the gap; a faithful engine is a later option.",
+      "shipped": "PKG-002",
+      "reversible": true,
+      "confidence": "medium",
+      "resolution": "Almost every project is unusable with meow, we actually need to support it fully, and this is adding on to my previous correction of drop-in compat for package.json",
+      "dr": "DR-002",
+      "resolved_at": "2026-06-08T01:39:24.768Z"
+    },
+    {
+      "id": "A-PKG002-1",
+      "kind": "assumption",
+      "title": "PKG-002 integrity: verify npm sha512 on download, content-address by meow sha256 (cache+lockfile key)",
+      "opened_at": "2026-06-08T03:00:00Z",
+      "status": "resolved",
+      "summary": "npm dist.integrity (sha512) is the supply-chain check at download; the meow sha256 is the cache key + LockEntry.integrity + I-7 anchor. sha512 verified-then-discarded at P2.",
+      "assumed": "PKG-001 cache is sha256; npm SRI is sha512. Verifying npm then content-addressing by sha256 reuses the existing cache without extending HashAlgo; provenance (persist sha512) deferred to SEC-002.",
+      "shipped": "PKG-002",
+      "reversible": true,
+      "confidence": "high",
+      "resolution": "You cannot fight package.json. It isn't just a config file; it is the database of the entire JavaScript ecosystem.\nIf we strictly enforce ADR-8 (where meow actively overwrites package.json and forces everyone to use meow.config.json), the friction to adopt meow in an existing Next.js, SvelteKit, or Express project is too high. Developers want to clone their existing repo, type meow install, and have it just work.\nWhat \"Drop-In Compat\" Means for meow\nTo make meow a true drop-in replacement, we need to adjust the architecture so that it treats package.json as a first-class citizen, not a generated shadow.\nHere is what we need the Orchestrator to wire up:\nBidirectional meow install: If a user types meow install svelte in a directory with a package.json, meow reads the existing package.json, resolves the dependency, and writes \"svelte\": \"^5.56.3\" directly into package.json (just like npm/bun/pnpm).\nFirst-Class Scripts: meow run dev or meow task build must natively parse the \"scripts\" block inside package.json. We can keep meow.tasks.ts for advanced, typed task graphs, but standard npm run dev workflows must work out of the box.\nTransparent Resolution: The LOAD-003 resolver we just built needs to treat package.json's dependencies and devDependencies as the root of the module graph if meow.config.json doesn't explicitly override it.",
+      "dr": "DR-001",
+      "resolved_at": "2026-06-08T01:37:27.333Z"
+    }
+  ]
 }

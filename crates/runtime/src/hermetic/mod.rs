@@ -44,6 +44,7 @@ deno_core::extension!(
         ops::op_hermetic_mono_ms,
         ops::op_hermetic_random_fill,
         ops::op_hermetic_env_get,
+        ops::op_hermetic_env_entries,
     ],
     esm_entry_point = "ext:meow_hermetic/hermetic.js",
     esm = [dir "src/hermetic/js", "hermetic.js"],

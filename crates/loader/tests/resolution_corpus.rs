@@ -445,8 +445,8 @@ fn legacy_main_extensionless_json_and_cjs_boundary_work_end_to_end() {
 
     let cjs_code = load_result(&loader, &cjs_spec).expect("cjs load succeeds");
     assert!(
-        cjs_code.contains("__meowExecute"),
-        "cjs load now returns a synthetic wrapper: {cjs_code}"
+        cjs_code.contains("__meowCjsExports"),
+        "cjs load delegates to the native CJS runtime shim: {cjs_code}"
     );
 
     assert!(

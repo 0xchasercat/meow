@@ -1,6 +1,6 @@
-//! `meow-pkg` — the lockfile schema and content-addressed cache (PKG-001).
+//! `meow-pkg` — lockfile, cache, install resolution, and graph projections.
 //!
-//! Two P0 foundations the dependency subsystem builds on:
+//! The dependency subsystem has one runtime truth:
 //!
 //! - [`Lockfile`] / [`LockEntry`] — the `meow.lock.jsonl` format: strictly-sorted
 //!   JSON-lines, one dependency per line, byte-stable across runs so git merges
@@ -8,13 +8,17 @@
 //! - [`Cache`] — the global content-addressed store
 //!   `~/.meow/cache/<algo>/<hash>`, which RECOMPUTES a blob's hash before any
 //!   read and refuses to serve mismatched bytes (I-7, CANON §12.1).
+//! - [`Installer`] / [`RegistrySource`] — package.json-declared dependencies are
+//!   resolved against registry metadata, publisher sha512 integrity is verified,
+//!   and verified tarballs are stored by content hash.
+//! - [`ResolutionGraph`] — the validated resolved tree consumed by runtime,
+//!   materialization, and editor tooling. [`UnpackedStore`] supplies stable real
+//!   paths for path-oriented consumers; project `node_modules` is written only by
+//!   the explicit materialize projection.
 //!
 //! All hashes/specifiers are newtypes ([`ContentHash`], [`PackageName`],
 //! [`Version`], [`VersionReq`]) and every reachable failure is a typed
 //! [`thiserror`] enum — no path here panics on malformed input (CRAFT Part B).
-//!
-//! Out of scope at P0 (Non-goals): install/registry fetch, the PnP loader, the
-//! real capability model, provenance verification, and async I/O.
 
 mod cache;
 mod error;
@@ -37,7 +41,7 @@ use std::path::{Path, PathBuf};
 pub use cache::Cache;
 pub use error::{CacheError, LockError, ParseHashError, ParseVersionError};
 pub use hash::{ContentHash, HashAlgo, PackageName, Version, VersionReq};
-pub use install::{resolve_roots, InstallError, Installer, PkgInstallError, RootResolveError};
+pub use install::{resolve_roots, InstallError, InstallProgress, Installer, RootResolveError};
 // === PKG-003 ===
 pub use pnp::{PnpError, ResolutionGraph, ResolvedPackage};
 // === /PKG-003 ===

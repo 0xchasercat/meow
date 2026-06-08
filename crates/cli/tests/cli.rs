@@ -54,9 +54,6 @@ const CASES: &[(&[&str], &str, &str)] = &[
     (&["task", "t"], "task", "P4"),
     (&["test"], "test", "P6"),
     (&["check"], "check", "P3"),
-    (&["lint"], "lint", "P3"),
-    (&["fmt"], "fmt", "P3"),
-    (&["bundle", "x.ts"], "bundle", "P3"),
     (&["why-slow"], "why-slow", "P6"),
     (&["why-large"], "why-large", "P6"),
     (&["trace", "x.ts"], "trace", "P6"),
@@ -68,8 +65,8 @@ const CASES: &[(&[&str], &str, &str)] = &[
 fn every_subcommand_stub_is_honest() {
     assert_eq!(
         CASES.len(),
-        13,
-        "13 stub subcommands (sync/run/dev/install/types/why-dep are real; doctor reverts to the P6 stub after CFG-003 retires package.json ownership)"
+        10,
+        "10 stub subcommands (add/remove/task/test/check/why-slow/why-large/trace/profile/doctor); lint/fmt/bundle are real commands"
     );
     for (argv, verb, phase) in CASES {
         let expected = format!("meow: not yet implemented — `{verb}` lands in PLAN {phase}");
@@ -80,6 +77,130 @@ fn every_subcommand_stub_is_honest() {
             .stdout(predicate::str::is_empty())
             .stderr(predicate::str::contains(expected));
     }
+}
+
+#[test]
+fn lint_reports_debugger_diagnostics() {
+    let tmp = load_tmp("lint-debugger");
+    let entry = tmp.join("entry.ts");
+    std::fs::write(&entry, "debugger;\n").expect("write linter fixture");
+    let out = meow().arg("lint").arg(&entry).output().expect("run lint");
+    assert!(
+        !out.status.success(),
+        "lint should fail on debugger statement: {out:?}"
+    );
+    let stderr = String::from_utf8(out.stderr).expect("stderr utf8");
+    let file_name = entry.file_name().expect("entry file name");
+    assert!(
+        stderr.contains("🙀 [Bad Kitty!]"),
+        "lint should use hiss envelope: {stderr:?}"
+    );
+    assert!(
+        stderr.contains(entry.to_string_lossy().as_ref())
+            || stderr.contains(file_name.to_string_lossy().as_ref()),
+        "lint diagnostic should include the file path: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("debugger"),
+        "lint diagnostic should include the offending token: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("1:") || stderr.contains("line 1"),
+        "lint diagnostic should include a line snippet: {stderr:?}"
+    );
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[test]
+fn fmt_check_fails_without_reformatting() {
+    let tmp = load_tmp("fmt-check");
+    let entry = tmp.join("entry.ts");
+    let source = "function  foo ( ) { return  1+2 }\n";
+    std::fs::write(&entry, source).expect("write formatter fixture");
+    let before = std::fs::read_to_string(&entry).expect("read before formatting");
+
+    let out = meow()
+        .arg("fmt")
+        .arg("--check")
+        .arg(&entry)
+        .output()
+        .expect("run fmt --check");
+    assert!(
+        !out.status.success(),
+        "fmt --check should fail on unformatted input: {out:?}"
+    );
+    let after = std::fs::read_to_string(&entry).expect("read after check");
+    assert_eq!(
+        before, after,
+        "fmt --check should be read-only and must not rewrite {entry:?}"
+    );
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[test]
+fn fmt_rewrites_and_then_check_succeeds() {
+    let tmp = load_tmp("fmt-rewrite");
+    let entry = tmp.join("entry.ts");
+    let source = "function  foo ( ) { return  1+2 }\n";
+    std::fs::write(&entry, source).expect("write formatter fixture");
+
+    let out = meow().arg("fmt").arg(&entry).output().expect("run fmt");
+    assert!(
+        out.status.success(),
+        "fmt should succeed and rewrite file: {out:?}"
+    );
+    let formatted = std::fs::read_to_string(&entry).expect("read formatted output");
+    assert_ne!(
+        formatted, source,
+        "fmt should rewrite source from unformatted to canonical form"
+    );
+
+    let check = meow()
+        .arg("fmt")
+        .arg("--check")
+        .arg(&entry)
+        .output()
+        .expect("run fmt --check");
+    assert!(
+        check.status.success(),
+        "fmt --check should succeed after format: {check:?}"
+    );
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[test]
+fn bundle_entry_is_skeleton_with_pending_wiring_message() {
+    let tmp = load_tmp("bundle-skeleton");
+    let entry = tmp.join("entry.ts");
+    let dist = tmp.join("dist");
+    std::fs::write(&entry, "export const value = 1;\n").expect("write bundle entry");
+    let out = meow()
+        .current_dir(&tmp)
+        .arg("bundle")
+        .arg(&entry)
+        .arg("--out")
+        .arg(&dist)
+        .output()
+        .expect("run bundle");
+    assert!(
+        out.status.success(),
+        "bundle should succeed as skeleton: {out:?}"
+    );
+    let stdout = String::from_utf8(out.stdout).expect("stdout utf8");
+    let stdout_lc = stdout.to_lowercase();
+    assert!(
+        stdout.contains("😸 [Purrfect!]") || stdout.contains("😸 [purrfect!]"),
+        "bundle success should use a purr envelope: {stdout:?}"
+    );
+    assert!(
+        stdout_lc.contains("resolver wiring") && stdout_lc.contains("pending"),
+        "bundle should mention pending resolver wiring: {stdout:?}"
+    );
+    assert!(
+        stdout_lc.contains("purrfect!") && stdout_lc.contains("bundle"),
+        "bundle skeleton success should be identifiable: {stdout:?}"
+    );
+    std::fs::remove_dir_all(&tmp).ok();
 }
 
 #[test]
@@ -599,13 +720,14 @@ fn run_executes_a_cached_commonjs_package_bin_without_node_modules() {
         .store(&npm_tarball(&[
             (
                 "package.json",
-                "{\"name\":\"toolkit\",\"version\":\"1.0.0\",\"type\":\"commonjs\",\"bin\":{\"tool\":\"bin/tool.cjs\"}}",
+                "{\"name\":\"toolkit\",\"version\":\"1.0.0\",\"type\":\"commonjs\",\"exports\":{\".\":\"./index.js\"},\"bin\":{\"tool\":\"bin/tool\"}}",
             ),
+            ("index.js", "module.exports = {};\n"),
             (
-                "bin/tool.cjs",
-                "const msg = require(\"../lib.cjs\");\nconsole.log(`BIN=${msg}`);\nconsole.log(`ARGV=${JSON.stringify(process.argv.slice(2))}`);\nconsole.log(`FILE=${__filename}`);\n",
+                "bin/tool",
+                "const Module = require(\"module\");\nconst childProcess = require(\"child_process\");\nconst crypto = require(\"crypto\");\nconst http = require(\"http\");\nconst https = require(\"https\");\nconst msg = require(\"toolkit/dist/compiled/helper\");\nconst child = process.platform === \"win32\" ? childProcess.execFileSync(\"cmd.exe\", [\"/D\", \"/S\", \"/C\", \"echo child-ok\"], { encoding: \"utf8\" }).trim() : childProcess.execFileSync(\"/bin/sh\", [\"-c\", \"printf child-ok\"], { encoding: \"utf8\" });\nconst hash = crypto.createHash(\"sha256\").update(\"abc\").digest(\"hex\");\nObject.defineProperty(exports, \"__esModule\", { value: true });\nconsole.log(`MODULE=${Module.isBuiltin(\"module\")}`);\nconsole.log(`CHILD=${child}`);\nconsole.log(`CRYPTO=${hash}`);\nconsole.log(`HTTP=${typeof http.createServer}:${typeof https.get}`);\nconsole.log(`BIN=${msg}`);\nconsole.log(`ARGV=${JSON.stringify(process.argv.slice(2))}`);\nconsole.log(`FILE=${__filename}`);\n",
             ),
-            ("lib.cjs", "module.exports = \"from-bin\";\n"),
+            ("dist/compiled/helper.js", "module.exports = \"from-bin\";\n"),
         ]))
         .expect("store toolkit blob");
 
@@ -638,6 +760,12 @@ fn run_executes_a_cached_commonjs_package_bin_without_node_modules() {
         .arg("from-cli")
         .assert()
         .success()
+        .stdout(predicate::str::contains("MODULE=true"))
+        .stdout(predicate::str::contains("CHILD=child-ok"))
+        .stdout(predicate::str::contains(
+            "CRYPTO=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        ))
+        .stdout(predicate::str::contains("HTTP=function:function"))
         .stdout(predicate::str::contains("BIN=from-bin"))
         .stdout(predicate::str::contains(
             r#"ARGV=["--from-script","from-cli"]"#,

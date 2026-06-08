@@ -138,6 +138,7 @@ pub enum ResolveError {
     Cache(#[from] CacheError),
 }
 
+#[derive(Clone)]
 pub struct Resolver {
     cache: Arc<Cache>,
     lockfile: Arc<Lockfile>,
@@ -207,10 +208,7 @@ impl Resolver {
             .unwrap_or_else(|| hash.to_sri())
     }
     // === LOAD-004 ===
-    pub(crate) fn runtime_path_for(
-        &self,
-        locator: &ModuleLocator,
-    ) -> Result<PathBuf, ResolveError> {
+    pub fn runtime_path_for(&self, locator: &ModuleLocator) -> Result<PathBuf, ResolveError> {
         match locator {
             ModuleLocator::LocalFile(path) => Ok(path.clone()),
             ModuleLocator::Cached { package, member } => {
@@ -227,11 +225,29 @@ impl Resolver {
                 })?;
                 Ok(root.join(member))
             }
-            ModuleLocator::Native { name } => Ok(PathBuf::from("meow-native").join(name)),
+            ModuleLocator::Native { name } => {
+                let (base, member) = if let Some(member) = name.strip_prefix("node:") {
+                    ("node-native", member)
+                } else {
+                    ("meow-native", name.as_str())
+                };
+                let member = member.trim_start_matches('/');
+                let member = if member.is_empty() { "index" } else { member };
+                Ok(PathBuf::from(base).join(format!("{member}.ts")))
+            }
         }
     }
     // === /LOAD-004 ===
     // === RT-005 ===
+    // === RT-007 ===
+    /// Expose the runtime's canonical `node:*` built-in name set to the rest of
+    /// the loader (ops registration, etc.). Keeping this on `Resolver` avoids having
+    /// the runtime bridge reach into the `NativeModuleSource` trait directly.
+    pub fn node_builtins(&self) -> &'static [&'static str] {
+        self.native.node_builtins()
+    }
+    // === /RT-007 ===
+
     fn native_available_list(&self, node_builtin: bool) -> String {
         if node_builtin {
             return self
@@ -548,49 +564,75 @@ impl Resolver {
         referrer: &Url,
         context: ResolveContext,
     ) -> Result<(Url, ModuleLocator), ResolveError> {
-        let owner = self.owner_for_referrer(referrer)?;
         let (package_name_text, subpath) = parse_package_specifier(specifier);
+
+        let canonical_node_builtin = if self.native.node_builtins().contains(&specifier) {
+            Some(specifier)
+        } else if subpath.is_none() && self.native.node_builtins().contains(&package_name_text) {
+            Some(package_name_text)
+        } else {
+            None
+        };
+        if let Some(name) = canonical_node_builtin {
+            return self.locate_node_builtin(name);
+        }
+
+        let owner = self.owner_for_referrer(referrer)?;
 
         if owner.package_name() == Some(package_name_text) {
             let Some(manifest) = owner.manifest() else {
+                if context == ResolveContext::Require {
+                    if let Ok(resolution) = self.legacy_package_resolve(&owner, subpath) {
+                        return self.target_resolution_to_locator(resolution);
+                    }
+                }
                 return Err(ResolveError::SubpathNotExported {
                     package: package_name_text.to_owned(),
                     subpath: subpath_for_exports(subpath),
                 });
             };
             let Some(exports) = manifest.exports.as_ref() else {
+                if context == ResolveContext::Require {
+                    if let Ok(resolution) = self.legacy_package_resolve(&owner, subpath) {
+                        return self.target_resolution_to_locator(resolution);
+                    }
+                }
                 return Err(ResolveError::SubpathNotExported {
                     package: package_name_text.to_owned(),
                     subpath: subpath_for_exports(subpath),
                 });
             };
-            return self.target_resolution_to_locator(self.package_exports_resolve(
+            match self.package_exports_resolve(
                 &owner,
                 exports,
                 &subpath_for_exports(subpath),
                 context,
-            )?);
+            ) {
+                Ok(resolution) => return self.target_resolution_to_locator(resolution),
+                Err(err) if context == ResolveContext::Require && is_export_boundary_miss(&err) => {
+                    if let Ok(resolution) = self.legacy_package_resolve(&owner, subpath) {
+                        return self.target_resolution_to_locator(resolution);
+                    }
+                    return Err(err);
+                }
+                Err(err) => return Err(err),
+            }
         }
 
         let dep_name = PackageName::new(package_name_text.to_owned());
         let version = match self.dependency_version(&owner, &dep_name) {
             Some(version) => version,
             None => {
-                // === RT-007 ===
-                if self.native.node_builtins().contains(&specifier) {
-                    return self.locate_node_builtin(specifier);
-                }
-                // === /RT-007 ===
                 return Err(ResolveError::BareSpecifierNotInLockfile {
                     name: package_name_text.to_owned(),
                 });
             }
         };
-        let entry = self.lockfile.get(&dep_name, &version).ok_or_else(|| {
-            ResolveError::BareSpecifierNotInLockfile {
+        let Some(entry) = self.lockfile.get(&dep_name, &version) else {
+            return Err(ResolveError::BareSpecifierNotInLockfile {
                 name: package_name_text.to_owned(),
-            }
-        })?;
+            });
+        };
         let package = entry.integrity.clone();
         let fs = self.package_fs(&package)?;
         let dep_owner = OwnerPackage::Cached {
@@ -987,6 +1029,15 @@ impl OwnerPackage {
     }
 }
 
+fn is_export_boundary_miss(err: &ResolveError) -> bool {
+    matches!(
+        err,
+        ResolveError::SubpathNotExported { .. }
+            | ResolveError::SubpathBlocked { .. }
+            | ResolveError::NoMatchingCondition { .. }
+    )
+}
+
 enum TargetResolution {
     LocalFile(PathBuf),
     Cached {
@@ -1192,7 +1243,13 @@ fn cached_file_kind(member: &str, fs: &PackageFs) -> ModuleKind {
                 ModuleKind::Cjs
             }
         }
-        _ => ModuleKind::Esm,
+        _ => {
+            if fs.nearest_manifest(member).package_type.as_deref() == Some("module") {
+                ModuleKind::Esm
+            } else {
+                ModuleKind::Cjs
+            }
+        }
     }
 }
 

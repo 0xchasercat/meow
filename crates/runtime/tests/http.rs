@@ -136,9 +136,11 @@ fn spawn_runtime(source: &str, policy: Policy) -> RuntimeThread {
                 ModuleSpecifier::from_directory_path(&join_root).expect("project root URL"),
                 meow_runtime::native::native_module_registry(),
             );
-            let loader: Rc<dyn meow_runtime::deno_core::ModuleLoader> = Rc::new(
-                MeowModuleLoader::new(resolver, Rc::new(std::cell::RefCell::new(GraphDb::new()))),
-            );
+            let loader: Rc<dyn meow_runtime::deno_core::ModuleLoader> =
+                Rc::new(MeowModuleLoader::new(
+                    resolver.clone(),
+                    Rc::new(std::cell::RefCell::new(GraphDb::new())),
+                ));
 
             let mut extensions = vec![sink];
             extensions.extend(meow_runtime::web::extensions(
@@ -147,7 +149,22 @@ fn spawn_runtime(source: &str, policy: Policy) -> RuntimeThread {
                     user_agent: "meow-test/rt005".to_owned(),
                 },
             ));
+            extensions.extend(meow_runtime::hermetic::extensions(
+                meow_runtime::hermetic::HermeticConfig::default(),
+            ));
             extensions.push(meow_runtime::http_extension());
+            extensions.extend(meow_runtime::node::extensions(
+                meow_runtime::node::NodeOptions {
+                    mode: meow_runtime::node::NodeMode::Enabled,
+                    argv: vec![
+                        "meow".to_owned(),
+                        join_root.join("main.ts").to_string_lossy().into_owned(),
+                    ],
+                    cwd: join_root.clone(),
+                    env: BTreeMap::new(),
+                    cjs_resolver: None,
+                },
+            ));
             if let Policy::DenyNetListen(shared) = policy {
                 extensions.push(io_capability_extension(Rc::new(NetListenDeny { shared })));
             }
@@ -248,6 +265,65 @@ async fn serve_handles_request() {
         logs.iter()
             .any(|(is_err, line)| !*is_err && line.trim() == "FINISHED"),
         "shutdown drains and resolves finished: {logs:?}"
+    );
+}
+
+#[tokio::test]
+async fn node_http_create_server_handles_basic_get() {
+    let mut server = spawn_runtime(
+        r#"
+        import http from "http";
+
+        let server;
+        server = http.createServer((req, res) => {
+          req.on("end", () => {
+            if (req.url === "/__shutdown") {
+              res.writeHead(200, { "x-shutdown": "yes" });
+              res.end("bye", () => server.close());
+              return;
+            }
+            res.setHeader("x-method", req.method);
+            res.write("hi ");
+            res.end(req.url);
+          });
+        });
+
+        server.listen(0, "127.0.0.1", () => {
+          const addr = server.address();
+          console.log(`LISTEN ${addr.address}:${addr.port}`);
+        });
+
+        await new Promise((resolve) => server.on("close", resolve));
+        console.log("FINISHED");
+        "#,
+        Policy::Allow,
+    );
+
+    let (hostname, port) = server.wait_for_listen().await;
+    let (status, headers, body) = http_get(&hostname, port, "/world").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "hi /world");
+    assert_eq!(
+        headers.get("x-method").and_then(|v| v.to_str().ok()),
+        Some("GET")
+    );
+
+    let (shutdown_status, shutdown_headers, shutdown_body) =
+        http_get(&hostname, port, "/__shutdown").await;
+    assert_eq!(shutdown_status, StatusCode::OK);
+    assert_eq!(shutdown_body, "bye");
+    assert_eq!(
+        shutdown_headers
+            .get("x-shutdown")
+            .and_then(|v| v.to_str().ok()),
+        Some("yes")
+    );
+
+    let logs = server.finish();
+    assert!(
+        logs.iter()
+            .any(|(is_err, line)| !*is_err && line.trim() == "FINISHED"),
+        "node:http close emits close: {logs:?}"
     );
 }
 

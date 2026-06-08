@@ -1,10 +1,12 @@
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use meow_pkg::{
-    resolve_roots, Cache, ContentHash, DepSpec, FixtureRegistry, InstallError, Installer,
-    LockEntry, Lockfile, PackageName, RegistryError, RegistryProvenance, RegistrySource,
+    resolve_roots, Cache, CacheError, ContentHash, DepSpec, FixtureRegistry, InstallError,
+    Installer, LockEntry, Lockfile, PackageName, RegistryError, RegistryProvenance, RegistrySource,
     RootResolveError, Version, VersionReq,
 };
 
@@ -33,8 +35,16 @@ fn declared(name: &str, spec: &str) -> BTreeMap<PackageName, VersionReq> {
     BTreeMap::from([(PackageName::new(name), req(spec))])
 }
 
-fn installer<'a>(registry: &'a dyn RegistrySource, cache: &'a Cache) -> Installer<'a> {
-    Installer::new(registry, cache, "https://registry.npmjs.org", req("^0.0.0"))
+fn installer<'a, R>(registry: &R, cache: &'a Cache) -> Installer<'a>
+where
+    R: RegistrySource + Clone + 'static,
+{
+    Installer::new(
+        registry.clone(),
+        cache,
+        "https://registry.npmjs.org",
+        req("^0.0.0"),
+    )
 }
 
 fn entry(name: &str, version: &str) -> LockEntry {
@@ -105,6 +115,44 @@ fn transitive_resolution_records_exact_versions() {
 }
 
 #[test]
+fn npm_alias_fetches_target_metadata_but_pins_alias_name() {
+    let root = tmp_dir("alias");
+    let cache = Cache::with_root(root.join("cache"));
+    let mut registry = FixtureRegistry::new();
+    registry.publish(
+        "@swc/helpers",
+        "0.4.14",
+        &[("tslib", "^2.4.0")],
+        b"helpers".to_vec(),
+    );
+    registry.publish("tslib", "2.4.1", &[], b"tslib".to_vec());
+    let direct = BTreeMap::from([(
+        PackageName::new("@swc/legacy-helpers"),
+        DepSpec::parse("npm:@swc/helpers@=0.4.14"),
+    )]);
+
+    let lockfile = installer(&registry, &cache)
+        .resolve(&direct)
+        .expect("install succeeds");
+
+    let alias = lockfile
+        .get(&PackageName::new("@swc/legacy-helpers"), &ver("0.4.14"))
+        .expect("alias entry is present");
+    assert!(
+        lockfile
+            .get(&PackageName::new("@swc/helpers"), &ver("0.4.14"))
+            .is_none(),
+        "alias does not require a second target-named lock entry"
+    );
+    assert_eq!(
+        alias.dependencies.get(&PackageName::new("tslib")),
+        Some(&ver("2.4.1"))
+    );
+    assert!(cache.contains(&alias.integrity));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn multi_version_graph_keeps_both_pins() {
     let root = tmp_dir("multiver");
     let cache = Cache::with_root(root.join("cache"));
@@ -157,6 +205,13 @@ fn semver_max_satisfying_and_dist_tags_are_honored() {
         .expect("tilde range resolves");
     assert!(tilde.get(&PackageName::new("pkg"), &ver("1.1.0")).is_some());
 
+    let disjunction = installer(&registry, &cache)
+        .resolve(&dep("pkg", DepSpec::Range(req("^0.9 || ^1.1.0"))))
+        .expect("disjunction range resolves");
+    assert!(disjunction
+        .get(&PackageName::new("pkg"), &ver("1.2.0"))
+        .is_some());
+
     let tagged = installer(&registry, &cache)
         .resolve(&dep("pkg", DepSpec::Tag("latest".to_owned())))
         .expect("dist tag resolves");
@@ -207,6 +262,40 @@ fn lockfile_bytes_are_deterministic_and_sorted() {
 }
 
 #[test]
+fn reused_lockfile_rechecks_cache_integrity_before_claiming_hit() {
+    let root = tmp_dir("reuse-corrupt");
+    let cache = Cache::with_root(root.join("cache"));
+    let mut registry = FixtureRegistry::new();
+    let bytes = b"a-1.0.0".to_vec();
+    registry.publish("a", "1.0.0", &[], bytes.clone());
+    let direct = dep("a", DepSpec::Range(req("^1.0.0")));
+
+    let lockfile = installer(&registry, &cache)
+        .resolve(&direct)
+        .expect("initial install succeeds");
+    let entry = lockfile
+        .get(&PackageName::new("a"), &ver("1.0.0"))
+        .expect("entry present")
+        .clone();
+    std::fs::write(cache.path_for(&entry.integrity), b"corrupt").expect("corrupt cache");
+    assert!(matches!(
+        cache.read(&entry.integrity),
+        Err(CacheError::IntegrityMismatch { .. })
+    ));
+
+    let repaired = installer(&registry, &cache)
+        .with_reuse_lockfile(lockfile.clone())
+        .resolve(&direct)
+        .expect("corrupt cache hit is repaired by redownload");
+    assert_eq!(
+        repaired.to_canonical_string(),
+        lockfile.to_canonical_string()
+    );
+    assert_eq!(cache.read(&entry.integrity).expect("cache repaired"), bytes);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn integrity_mismatch_returns_typed_error_and_stores_nothing() {
     let root = tmp_dir("integrity-mismatch");
     let cache = Cache::with_root(root.join("cache"));
@@ -229,7 +318,7 @@ fn integrity_mismatch_returns_typed_error_and_stores_nothing() {
 }
 
 #[test]
-fn unsupported_integrity_no_match_and_unsupported_range_are_honest_errors() {
+fn unsupported_integrity_no_match_and_unsupported_spec_are_honest_errors() {
     let root = tmp_dir("honesty");
     let cache = Cache::with_root(root.join("cache"));
     let mut registry = FixtureRegistry::new();
@@ -250,31 +339,41 @@ fn unsupported_integrity_no_match_and_unsupported_range_are_honest_errors() {
     assert!(matches!(no_match, InstallError::NoMatchingVersion { .. }));
 
     let unsupported = installer(&registry, &cache)
-        .resolve(&dep("b", DepSpec::Tag("1 || 2".to_owned())))
-        .expect_err("node-semver union is unsupported");
+        .resolve(&dep("b", DepSpec::parse("file:../local")))
+        .expect_err("unsupported non-registry specifier must fail");
     assert!(matches!(unsupported, InstallError::UnsupportedRange { .. }));
     std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn malformed_registry_metadata_surfaces_typed_error() {
+    #[derive(Clone)]
     struct BrokenRegistry;
 
     impl RegistrySource for BrokenRegistry {
-        fn fetch_metadata(
-            &self,
-            name: &PackageName,
-        ) -> Result<meow_pkg::PackageMetadata, RegistryError> {
-            Err(RegistryError::Metadata {
-                name: name.to_string(),
-                reason: "bad version key".to_owned(),
+        fn fetch_metadata<'a>(
+            &'a self,
+            name: &'a PackageName,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<meow_pkg::PackageMetadata, RegistryError>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                Err(RegistryError::Metadata {
+                    name: name.to_string(),
+                    reason: "bad version key".to_owned(),
+                })
             })
         }
 
-        fn fetch_tarball(&self, url: &str) -> Result<Vec<u8>, RegistryError> {
-            Err(RegistryError::Fetch {
-                target: url.to_owned(),
-                reason: "unreachable".to_owned(),
+        fn fetch_tarball<'a>(
+            &'a self,
+            url: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, RegistryError>> + Send + 'a>> {
+            Box::pin(async move {
+                Err(RegistryError::Fetch {
+                    target: url.to_owned(),
+                    reason: "unreachable".to_owned(),
+                })
             })
         }
     }

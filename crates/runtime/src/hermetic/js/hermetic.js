@@ -27,12 +27,15 @@ const {
 const OriginalDate = globalThis.Date;
 function Date(...args) {
   if (!new.target) {
-    // `Date()` called as a function -> the current-time string.
+    // `Date()` as a function -> a deterministic current-time string. This keeps
+    // `Date()` semantics while preserving the deterministic virtual-clock value
+    // under the pinning path (`pin_deterministic_intl`).
     return new OriginalDate(op_hermetic_now_ms()).toString();
   }
-  return args.length === 0
-    ? new OriginalDate(op_hermetic_now_ms())
-    : new OriginalDate(...args);
+  // Preserve `new.target` so `class D extends Date {}` keeps its own prototype
+  // (`super()` must yield a `D`, not a plain `Date`). Zero-arg reads the clock.
+  const construct_args = args.length === 0 ? [op_hermetic_now_ms()] : args;
+  return Reflect.construct(OriginalDate, construct_args, new.target);
 }
 Date.now = () => op_hermetic_now_ms();
 Date.parse = OriginalDate.parse;

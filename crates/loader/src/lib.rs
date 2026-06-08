@@ -6,14 +6,10 @@
 //! [`Resolver::resolve`] with the already-absolute URL to read the source.
 
 pub mod package;
-// === LOAD-004 ===
-mod cjs;
-// === /LOAD-004 ===
 mod resolver;
 mod url;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -33,20 +29,11 @@ pub use crate::url::{
 pub struct MeowModuleLoader {
     resolver: Resolver,
     graph: Rc<RefCell<GraphDb>>,
-    // === LOAD-004 ===
-    cjs_plans: RefCell<HashMap<String, cjs::CjsPlan>>,
-    // === /LOAD-004 ===
 }
 
 impl MeowModuleLoader {
     pub fn new(resolver: Resolver, graph: Rc<RefCell<GraphDb>>) -> MeowModuleLoader {
-        MeowModuleLoader {
-            resolver,
-            graph,
-            // === LOAD-004 ===
-            cjs_plans: RefCell::new(HashMap::new()),
-            // === /LOAD-004 ===
-        }
+        MeowModuleLoader { resolver, graph }
     }
 }
 
@@ -57,11 +44,6 @@ impl ModuleLoader for MeowModuleLoader {
         referrer: &str,
         _kind: ResolutionKind,
     ) -> Result<ModuleSpecifier, ModuleLoaderError> {
-        if let Ok(url) = Url::parse(specifier) {
-            if cjs::parse_companion_url(&url).is_some() {
-                return Ok(url);
-            }
-        }
         let referrer = parse_referrer(referrer, self.resolver.project_root());
         let (url, _locator) = self
             .resolver
@@ -86,20 +68,6 @@ impl MeowModuleLoader {
         module_specifier: &ModuleSpecifier,
         maybe_referrer: Option<&ModuleLoadReferrer>,
     ) -> Result<ModuleSource, ModuleLoaderError> {
-        // === LOAD-004 ===
-        if let Some((original_url, kind)) = cjs::parse_companion_url(module_specifier) {
-            self.ensure_cjs_plan(&original_url)?;
-            let plans = self.cjs_plans.borrow();
-            let key = original_url.as_str().to_owned();
-            let plan = plans.get(&key).ok_or_else(|| {
-                internal_loader_error(format!(
-                    "missing CommonJS plan for companion {module_specifier}"
-                ))
-            })?;
-            return Ok(cjs::companion_module_source(module_specifier, kind, plan));
-        }
-        // === /LOAD-004 ===
-
         let referrer = maybe_referrer
             .map(|r| r.specifier.clone())
             .unwrap_or_else(|| self.resolver.project_root().clone());
@@ -117,9 +85,14 @@ impl MeowModuleLoader {
             ));
         }
 
+        if resolved.kind == ModuleKind::Cjs {
+            return Ok(cjs_module_source(module_specifier));
+        }
+
         let graph_path = graph_path_for(&resolved.url, module_specifier);
         let mut db = self.graph.borrow_mut();
-        let fid = db.set_file(graph_path.clone(), resolved.source.clone());
+        let fid = db.set_file(graph_path, resolved.source.clone());
+        let code = runtime_ir_code(&db, fid, module_specifier)?;
         let analysis = {
             let cst = db.cst(fid).ok_or_else(|| {
                 internal_loader_error(format!(
@@ -128,21 +101,25 @@ impl MeowModuleLoader {
             })?;
             meow_graph::analyze_cjs(cst)
         };
-
-        // === LOAD-004 ===
-        if cjs::should_wrap_cjs(&resolved, &graph_path, &analysis) {
-            let lowered = runtime_ir_code(&db, fid, module_specifier)?;
-            drop(db);
-            let plan = cjs::build_plan(&self.resolver, &resolved, &analysis, lowered)?;
-            let source = cjs::wrapper_module_source(module_specifier, &plan);
-            self.cjs_plans
-                .borrow_mut()
-                .insert(plan.original_url.as_str().to_owned(), plan);
-            return Ok(source);
+        if analysis.has_commonjs_syntax && !analysis.has_esm_syntax {
+            let filename = resolved
+                .url
+                .to_file_path()
+                .unwrap_or_else(|_| graph_path_for(&resolved.url, module_specifier))
+                .to_string_lossy()
+                .into_owned();
+            let dirname = PathBuf::from(&filename)
+                .parent()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            return Ok(cjs_inline_module_source(
+                module_specifier,
+                resolved.url.as_str(),
+                &filename,
+                &dirname,
+                &code,
+            ));
         }
-        // === /LOAD-004 ===
-
-        let code = runtime_ir_code(&db, fid, module_specifier)?;
         Ok(ModuleSource::new(
             ModuleType::JavaScript,
             ModuleSourceCode::String(code.into()),
@@ -150,47 +127,45 @@ impl MeowModuleLoader {
             None,
         ))
     }
+}
 
-    // === LOAD-004 ===
-    fn ensure_cjs_plan(&self, module_specifier: &ModuleSpecifier) -> Result<(), ModuleLoaderError> {
-        if self
-            .cjs_plans
-            .borrow()
-            .contains_key(module_specifier.as_str())
-        {
-            return Ok(());
-        }
+fn cjs_module_source(module_specifier: &ModuleSpecifier) -> ModuleSource {
+    let specifier = serde_json::to_string(module_specifier.as_str())
+        .expect("serializing module specifier as JS string");
+    javascript_module(
+        module_specifier,
+        format!(
+            "import {{ runCjsModule }} from \"meow:internal/cjs\";\nconst __meowCjsExports = runCjsModule({specifier});\nexport default __meowCjsExports;\nexport {{ __meowCjsExports as __meow_cjs_exports__ }};\n",
+        ),
+    )
+}
 
-        let referrer = self.resolver.project_root().clone();
-        let resolved = self
-            .resolver
-            .resolve(module_specifier.as_str(), &referrer)
-            .map_err(resolve_error)?;
-        let graph_path = graph_path_for(&resolved.url, module_specifier);
-        let mut db = self.graph.borrow_mut();
-        let fid = db.set_file(graph_path.clone(), resolved.source.clone());
-        let analysis = {
-            let cst = db.cst(fid).ok_or_else(|| {
-                internal_loader_error(format!(
-                    "module {module_specifier} was not interned in the graph"
-                ))
-            })?;
-            meow_graph::analyze_cjs(cst)
-        };
-        if !cjs::should_wrap_cjs(&resolved, &graph_path, &analysis) {
-            return Err(internal_loader_error(format!(
-                "module {module_specifier} is not CommonJS"
-            )));
-        }
-        let lowered = runtime_ir_code(&db, fid, module_specifier)?;
-        drop(db);
-        let plan = cjs::build_plan(&self.resolver, &resolved, &analysis, lowered)?;
-        self.cjs_plans
-            .borrow_mut()
-            .insert(plan.original_url.as_str().to_owned(), plan);
-        Ok(())
-    }
-    // === /LOAD-004 ===
+fn cjs_inline_module_source(
+    module_specifier: &ModuleSpecifier,
+    url: &str,
+    filename: &str,
+    dirname: &str,
+    source: &str,
+) -> ModuleSource {
+    let url = serde_json::to_string(url).expect("serializing module URL as JS string");
+    let filename = serde_json::to_string(filename).expect("serializing filename as JS string");
+    let dirname = serde_json::to_string(dirname).expect("serializing dirname as JS string");
+    let source = serde_json::to_string(source).expect("serializing source as JS string");
+    javascript_module(
+        module_specifier,
+        format!(
+            "import {{ runCjsModuleText }} from \"meow:internal/cjs\";\nconst __meowCjsExports = runCjsModuleText({url}, {filename}, {dirname}, {source});\nexport default __meowCjsExports;\nexport {{ __meowCjsExports as __meow_cjs_exports__ }};\n",
+        ),
+    )
+}
+
+fn javascript_module(module_specifier: &ModuleSpecifier, code: String) -> ModuleSource {
+    ModuleSource::new(
+        ModuleType::JavaScript,
+        ModuleSourceCode::String(code.into()),
+        module_specifier,
+        None,
+    )
 }
 
 fn parse_referrer(referrer: &str, project_root: &Url) -> Url {
@@ -230,11 +205,23 @@ fn graph_path_for(url: &Url, module_specifier: &ModuleSpecifier) -> PathBuf {
     }
     // === RT-005 ===
     if url.scheme() == "meow" {
-        return PathBuf::from("meow-native").join(format!("{}.ts", url.path()));
+        let native_member = url.path().trim_start_matches('/');
+        let native_member = if native_member.is_empty() {
+            "index"
+        } else {
+            native_member
+        };
+        return PathBuf::from("meow-native").join(format!("{}.ts", native_member));
     }
     // === RT-007 ===
     if url.scheme() == "node" {
-        return PathBuf::from("node-native").join(format!("{}.ts", url.path()));
+        let native_member = url.path().trim_start_matches('/');
+        let native_member = if native_member.is_empty() {
+            "index"
+        } else {
+            native_member
+        };
+        return PathBuf::from("node-native").join(format!("{}.ts", native_member));
     }
     // === /RT-007 ===
     // === /RT-005 ===

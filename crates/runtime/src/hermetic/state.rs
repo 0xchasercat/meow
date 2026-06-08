@@ -44,9 +44,9 @@ enum RngState {
     Os,
 }
 
-/// Built once from [`HermeticConfig`], stored in `OpState`. The four accessors
-/// below are the only ways JS obtains time / entropy / env — the I-6 single
-/// governed entry.
+/// Built once from [`HermeticConfig`], stored in `OpState`. The accessors below
+/// are the only ways JS obtains time / entropy / env — the I-6 single governed
+/// entry.
 pub struct HermeticState {
     clock: ClockState,
     rng: RngState,
@@ -136,6 +136,18 @@ impl HermeticState {
                     None
                 }
             }
+        }
+    }
+
+    /// Snapshot the visible env, key-sorted. Deny -> empty; Allow(set) -> the
+    /// visible real subset. This stays in the one sanctioned env-read file.
+    pub fn env_entries(&self) -> Vec<(String, String)> {
+        match &self.env {
+            EnvPolicy::Deny => Vec::new(),
+            EnvPolicy::Allow(set) => set
+                .iter()
+                .filter_map(|name| std::env::var(name).ok().map(|value| (name.clone(), value)))
+                .collect(),
         }
     }
 }

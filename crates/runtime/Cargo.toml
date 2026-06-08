@@ -36,14 +36,15 @@ deno_crypto = { workspace = true }
 deno_fetch = { workspace = true, optional = true }
 deno_net = { workspace = true, optional = true }
 deno_permissions = { workspace = true, optional = true }
-# === PKG-002 ===
-# PKG-002's `meow install` HTTPS client (ureq) pulls rustls' `ring` provider, so
-# rustls now sees TWO crypto providers (ring + deno_fetch's aws-lc-rs) via feature
-# unification and has no auto-default. We install the aws-lc-rs default once in the
-# fetch wiring (web/mod.rs) before any TLS use, or deno_fetch's get_default()
-# panics. Optional + web-fetch-gated (no fetch ⇒ no TLS ⇒ no provider needed).
+# PKG-002's `meow install` HTTPS client (`reqwest`) and runtime TLS both use
+# `rustls`; installing the aws-lc-rs default in runtime avoids provider ambiguity.
 rustls = { workspace = true, optional = true }
-# === /PKG-002 ===
+# Node `crypto` compatibility: hashes/HMACs are sync Node APIs, so the native
+# module routes those through small Rust ops instead of async WebCrypto.
+sha2 = { workspace = true }
+sha1 = { workspace = true }
+hmac = { workspace = true }
+md5 = { workspace = true }
 # === RT-005 ===
 # `meow:http` reuses the same Hyper generation already in the tree: hyper itself,
 # the body adapters, and the existing hyper-util pin extended with server/tokio
