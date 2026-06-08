@@ -353,6 +353,27 @@ async fn commonjs_require_fs_and_node_fs_round_trip() {
     assert_eq!(*out.borrow(), "true:function\n");
     std::fs::remove_dir_all(&proj).ok();
 }
+#[tokio::test]
+async fn commonjs_with_shebang_runs() {
+    let proj = unique_dir("cjs-shebang");
+    let entry = proj.join("entry.cjs");
+    std::fs::write(
+        &entry,
+        "#!/usr/bin/env node\nconsole.log(\"shebang execution\");\n",
+    )
+    .expect("write shebang entry");
+    let (out, mut rt) = node_runtime(
+        node::NodeMode::Enabled,
+        &proj,
+        vec!["meow".to_owned(), entry.to_string_lossy().into_owned()],
+    );
+    let spec = ModuleSpecifier::from_file_path(&entry).expect("entry spec");
+    rt.run_main_module(&spec)
+        .await
+        .expect("shebang CommonJS runs");
+    assert_eq!(*out.borrow(), "shebang execution\n");
+    std::fs::remove_dir_all(&proj).ok();
+}
 
 #[tokio::test]
 async fn strict_web_commonjs_still_parses_but_fs_is_withdrawn_at_use_time() {

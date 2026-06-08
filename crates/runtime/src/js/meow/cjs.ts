@@ -125,12 +125,29 @@ function toRequireSpecifier(specifier: unknown): string {
   return specifier;
 }
 
+function stripLeadingHashbang(source: string): string {
+  if (!source.startsWith("#!")) {
+    return source;
+  }
+
+  const lineBreakIndex = source.search(/[\r\n]/);
+  if (lineBreakIndex === -1) {
+    return "\n";
+  }
+
+  const lineBreakLength =
+    source[lineBreakIndex] === "\r" && source[lineBreakIndex + 1] === "\n" ? 2 : 1;
+  const lineBreak = source.slice(lineBreakIndex, lineBreakIndex + lineBreakLength);
+
+  return `${lineBreak}${source.slice(lineBreakIndex + lineBreakLength)}`;
+}
 
 function instantiate(moduleValue: CjsModuleRecord, loaded: LoadedModule): void {
   const previousRequire = (globalThis as { __meowCurrentRequire?: unknown }).__meowCurrentRequire;
   (globalThis as { __meowCurrentRequire?: unknown }).__meowCurrentRequire = moduleValue.require;
   try {
-    const closure = `(function(exports, require, module, __filename, __dirname) {\n${loaded.source}\n})\n//# sourceURL=${loaded.url.replace(/[\r\n]/g, "")}`;
+    const source = stripLeadingHashbang(loaded.source);
+    const closure = `(function(exports, require, module, __filename, __dirname) {\n${source}\n})\n//# sourceURL=${loaded.url.replace(/[\r\n]/g, "")}`;
     const compiled = (0, eval)(closure) as (
       exports: unknown,
       require: (specifier: unknown) => unknown,
@@ -144,6 +161,7 @@ function instantiate(moduleValue: CjsModuleRecord, loaded: LoadedModule): void {
     (globalThis as { __meowCurrentRequire?: unknown }).__meowCurrentRequire = previousRequire;
   }
 }
+
 
 function executeLoadedModule(loaded: LoadedModule, parent?: CjsModuleRecord): unknown {
   const cached = moduleCache.get(loaded.url);

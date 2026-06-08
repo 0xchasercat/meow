@@ -38,12 +38,11 @@ pub use crate::ids::FileId;
 pub use crate::ir::RuntimeIr;
 pub use crate::semantic::SemanticGraph;
 pub use crate::strip::{ErasablePolicy, PermissivePolicy, StripPolicy};
+pub use oxc_span::SourceType;
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-
-use oxc_span::SourceType;
 
 use crate::db::{FileSlot, FileStore, RecomputeCounters};
 use crate::ids::PathInterner;
@@ -97,6 +96,19 @@ impl GraphDb {
         let path = path.into();
         // Never panics on a bad/unknown extension — fall back to the default type.
         let source_type = SourceType::from_path(&path).unwrap_or_default();
+        self.set_file_with_source_type(path, text, source_type)
+    }
+
+    /// Insert or update a file's text with an explicit source type. Invalidates ONLY
+    /// this file's stage queries (its slot, and thus its memos) is replaced); every
+    /// other file is untouched. Returns the file's stable id.
+    pub fn set_file_with_source_type(
+        &mut self,
+        path: impl Into<PathBuf>,
+        text: Arc<str>,
+        source_type: SourceType,
+    ) -> FileId {
+        let path = path.into();
         let id = self.interner.intern(&path);
         self.store
             .slots

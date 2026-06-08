@@ -5,10 +5,11 @@ use std::{
     sync::Arc,
 };
 
-use meow_graph::GraphDb;
+use meow_graph::{GraphDb, SourceType};
 use oxc_codegen::Codegen;
 use oxc_diagnostics::OxcDiagnostic;
 
+#[derive(Debug)]
 pub struct ToolDiagnostic {
     pub path: PathBuf,
     pub source: Arc<str>,
@@ -32,8 +33,8 @@ pub fn lint_paths(root: &Path, paths: &[PathBuf]) -> Result<LintReport, ToolErro
 
     for path in files {
         let source = read_source(&path)?;
-        let id = db.set_file(&path, Arc::clone(&source));
-
+        let source_type = permissive_source_type(&path);
+        let id = db.set_file_with_source_type(&path, Arc::clone(&source), source_type);
         let cst = db.cst(id).ok_or_else(|| ToolError::InconsistentGraph {
             path: path.clone(),
             reason: "missing CST after insertion",
@@ -89,8 +90,8 @@ pub fn format_paths(
 
     for path in files {
         let source = read_source(&path)?;
-        let id = db.set_file(&path, Arc::clone(&source));
-
+        let source_type = permissive_source_type(&path);
+        let id = db.set_file_with_source_type(&path, Arc::clone(&source), source_type);
         let cst = db.cst(id).ok_or_else(|| ToolError::InconsistentGraph {
             path: path.clone(),
             reason: "missing CST after insertion",
@@ -112,7 +113,23 @@ pub fn format_paths(
             continue;
         }
 
-        let formatted = Codegen::new().build(cst.program()).code;
+        let formatted = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Codegen::new().build(cst.program()).code
+        })) {
+            Ok(formatted) => formatted,
+            Err(err) => {
+                let message = formatter_panic_message(err);
+                report.diagnostics.push(ToolDiagnostic {
+                    path: path.clone(),
+                    source: Arc::clone(&source),
+                    span: (0, 0),
+                    message: format!("formatter panicked while formatting file: {message}"),
+                    label: None,
+                });
+                continue;
+            }
+        };
+
         if formatted != source.as_ref() {
             report.changed.push(path.clone());
             if !options.check {
@@ -214,6 +231,24 @@ fn write_source(path: &Path, source: &str) -> Result<(), ToolError> {
         path: path.to_path_buf(),
         source,
     })
+}
+fn permissive_source_type(path: &Path) -> SourceType {
+    SourceType::from_path(path)
+        .unwrap_or_default()
+        .with_typescript(true)
+        .with_jsx(true)
+}
+
+fn formatter_panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast::<String>()
+        .map(|message| *message)
+        .or_else(|payload| {
+            payload
+                .downcast::<&str>()
+                .map(|message| (*message).to_string())
+        })
+        .unwrap_or_else(|_| "unknown panic".to_string())
 }
 
 fn append_diagnostics(
@@ -505,5 +540,85 @@ fn normalize_path(path: &Path) -> PathBuf {
         PathBuf::from(".")
     } else {
         normalized
+    }
+}
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::process;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    static TOOL_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    const JSX_JS_SOURCE: &str = r#"'use client';
+
+function Widget() {
+  return <Provider />;
+}
+
+Widget();
+"#;
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let id = TOOL_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("meow-tool-{tag}-{id}-{}", process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    fn jsx_js_file(tmp: &PathBuf) -> PathBuf {
+        let file = tmp.join("entry.js");
+        std::fs::write(&file, JSX_JS_SOURCE).expect("write js fixture");
+        file
+    }
+
+    #[test]
+    fn formatter_panic_message_handles_non_string_payload() {
+        assert_eq!(
+            formatter_panic_message(Box::new("boom")),
+            "boom".to_string()
+        );
+        assert_eq!(
+            formatter_panic_message(Box::new(String::from("kapow"))),
+            "kapow".to_string()
+        );
+        assert_eq!(
+            formatter_panic_message(Box::new(std::fmt::Error)),
+            "unknown panic".to_string()
+        );
+    }
+    fn assert_no_parser_blocking_diagnostics(diagnostics: &[ToolDiagnostic]) {
+        assert!(
+            diagnostics.iter().all(|diag| {
+                !diag.message.contains("parser panicked while parsing file")
+                    && !diag.message.contains("parser panic while parsing file")
+                    && !diag.message.contains("Unexpected JSX expression")
+            }),
+            "unexpected parser diagnostics from js with JSX: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn format_paths_supports_js_with_directive_and_jsx() {
+        let tmp = tmp_dir("fmt-jsx");
+        let file = jsx_js_file(&tmp);
+        let report = format_paths(&tmp, &vec![file.clone()], FormatOptions { check: true })
+            .expect("format_paths should parse jsx js fixture");
+
+        assert_no_parser_blocking_diagnostics(&report.diagnostics);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn lint_paths_supports_js_with_directive_and_jsx() {
+        let tmp = tmp_dir("lint-jsx");
+        let file = jsx_js_file(&tmp);
+        let report =
+            lint_paths(&tmp, &vec![file.clone()]).expect("lint_paths should parse jsx js fixture");
+
+        assert_no_parser_blocking_diagnostics(&report.diagnostics);
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }
