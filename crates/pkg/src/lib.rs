@@ -27,6 +27,9 @@ mod pnp;
 // === PKG-004 ===
 mod archive;
 mod materialize;
+// === LSP-001 ===
+mod unpacked;
+// === /LSP-001 ===
 // === /PKG-004 ===
 mod registry;
 use std::path::{Path, PathBuf};
@@ -44,6 +47,9 @@ pub use materialize::{
     LinkStrategy, MaterializeError, MaterializeOptions, MaterializePlan, MaterializeReport,
     Materializer, Projection,
 };
+// === LSP-001 ===
+pub use unpacked::UnpackedStore;
+// === /LSP-001 ===
 // === /PKG-004 ===
 pub use lockfile::{CapabilityGrant, LockEntry, Lockfile, RegistryProvenance};
 pub use registry::{

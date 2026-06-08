@@ -115,6 +115,12 @@ pub enum MaterializeError {
         #[source]
         source: crate::CacheError,
     },
+    #[error("reading cached blob {hash} for the unpacked store")]
+    CacheBlob {
+        hash: String,
+        #[source]
+        source: crate::CacheError,
+    },
     #[error("malformed package archive for {name}@{version}: {reason}")]
     InvalidArchive {
         name: String,

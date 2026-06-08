@@ -2798,6 +2798,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "meow-lsp"
+version = "0.0.0"
+dependencies = [
+ "deno_core",
+ "flate2",
+ "meow-graph",
+ "meow-loader",
+ "meow-pkg",
+ "meow-runtime",
+ "tar",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "meow-obs"
 version = "0.0.0"
 dependencies = [
