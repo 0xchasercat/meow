@@ -167,20 +167,23 @@ fn run_refuses_first_party_cjs() {
 }
 
 #[test]
-fn run_rejects_unwired_argv_instead_of_dropping_it() {
-    // Forwarding program args (after `--`) is not wired yet — reject, never silently drop.
+fn run_forwards_argv_after_double_dash_to_process_argv() {
     let tmp = std::env::temp_dir().join(format!("meow-run-argv-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).expect("temp dir");
-    let entry = tmp.join("noop.mjs");
-    std::fs::write(&entry, "").expect("write entry");
+    let entry = tmp.join("argv.mjs");
+    std::fs::write(
+        &entry,
+        r#"console.log(JSON.stringify(process.argv.slice(-1)))"#,
+    )
+    .expect("write entry");
     meow()
         .arg("run")
         .arg(&entry)
         .arg("--")
         .arg("foo")
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("not yet supported"));
+        .success()
+        .stdout(predicate::str::contains("[\"foo\"]"));
     std::fs::remove_dir_all(&tmp).ok();
 }
 

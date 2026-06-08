@@ -49,6 +49,12 @@ pub mod web;
 /// reads (`principles-check.sh` P16 allowlists `src/hermetic/`).
 pub mod hermetic;
 // === /RT-006 ===
+// === RT-007 ===
+/// Native Node built-in bootstrap (`process` / `Buffer`) + the default
+/// node-compat op wiring (`fs`, `cwd`, strict-web withdrawal policy). See
+/// [`node::extensions`].
+pub mod node;
+// === /RT-007 ===
 
 use deno_core::{JsRuntime, ModuleId, PollEventLoopOptions, RuntimeOptions as DenoRuntimeOptions};
 
@@ -172,6 +178,12 @@ impl Runtime {
             .run_event_loop(PollEventLoopOptions::default())
             .await
             .map_err(|err| RuntimeError::EventLoop(Box::new(err)))
+    }
+
+    /// Take and clear a `process.exit(code)` request recorded by RT-007's node
+    /// bootstrap, if the run triggered one.
+    pub fn take_process_exit_code(&mut self) -> Option<i32> {
+        crate::node::take_process_exit_code(&self.js_runtime)
     }
 
     /// The canonical deno_core dance: kick off evaluation, drive the loop, then

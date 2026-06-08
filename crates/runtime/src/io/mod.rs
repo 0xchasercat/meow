@@ -20,16 +20,31 @@ pub use ops::{op_read_file, op_tcp_connect, RuntimeIoError, TcpStreamResource};
 // Raw host-I/O ops. **Unmediated internal plumbing — NOT a user-visible API.**
 //
 // This extension is deliberately *not* installed by `Runtime::new`'s default
-// set: a default runtime (what `meow run` uses) must not expose `op_read_file`
-// / `op_tcp_connect` to user JS, or any executed module would hold ambient host
-// FS/network authority (I-6, I-8). It is opt-in — internal consumers install it
-// via `RuntimeOptions.extensions` alongside `io_capability_extension` for a
-// non-`AllowAll` policy. The ops only go live behind a mediated,
-// capability-enforced surface in a later spec (meow:fs + SEC/P6); until then
-// they are plumbing for tests + future internal callers.
+// set: a bare runtime stays host-pure until a caller opts into these ops via
+// `RuntimeOptions.extensions`. RT-007's Node built-ins are that first mediated
+// user-facing surface: they call these ops from committed shims and route every
+// host touch through the same capability seam.
 deno_core::extension!(
     meow_io,
-    ops = [crate::io::ops::op_read_file, crate::io::ops::op_tcp_connect],
+    ops = [
+        crate::io::ops::op_read_file,
+        crate::io::ops::op_node_read_file_sync,
+        crate::io::ops::op_node_write_file,
+        crate::io::ops::op_node_write_file_sync,
+        crate::io::ops::op_node_readdir,
+        crate::io::ops::op_node_readdir_sync,
+        crate::io::ops::op_node_stat,
+        crate::io::ops::op_node_stat_sync,
+        crate::io::ops::op_node_mkdir,
+        crate::io::ops::op_node_mkdir_sync,
+        crate::io::ops::op_node_access,
+        crate::io::ops::op_node_access_sync,
+        crate::io::ops::op_node_rm,
+        crate::io::ops::op_node_rm_sync,
+        crate::io::ops::op_node_exists_sync,
+        crate::io::ops::op_node_cwd,
+        crate::io::ops::op_tcp_connect,
+    ],
     // Seed the capability seam so every op finds a checker in OpState. Default
     // is ALLOW (P0 runnable); a later extension may overwrite it. NOT a security
     // boundary — see capability.rs TODO(SEC-001, P6).

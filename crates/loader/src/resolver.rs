@@ -188,18 +188,29 @@ impl Resolver {
             .unwrap_or_else(|| hash.to_sri())
     }
     // === RT-005 ===
-    fn locate_native(&self, name: &str) -> Result<(Url, ModuleLocator), ResolveError> {
-        if self.native.source(name).is_none() {
-            let available = self
+    fn native_available_list(&self, node_builtin: bool) -> String {
+        if node_builtin {
+            return self
                 .native
-                .modules()
+                .node_builtins()
                 .iter()
-                .map(|module| format!("meow:{module}"))
+                .map(|module| format!("node:{module}"))
                 .collect::<Vec<_>>()
                 .join(", ");
+        }
+        self.native
+            .modules()
+            .iter()
+            .map(|module| format!("meow:{module}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn locate_native(&self, name: &str) -> Result<(Url, ModuleLocator), ResolveError> {
+        if self.native.source(name).is_none() {
             return Err(ResolveError::UnknownNativeModule {
                 name: name.to_owned(),
-                available,
+                available: self.native_available_list(false),
             });
         }
         let url =
@@ -215,6 +226,28 @@ impl Resolver {
         ))
     }
     // === /RT-005 ===
+    // === RT-007 ===
+    fn locate_node_builtin(&self, name: &str) -> Result<(Url, ModuleLocator), ResolveError> {
+        let canonical = format!("node:{name}");
+        if self.native.source(&canonical).is_none() {
+            return Err(ResolveError::UnknownNativeModule {
+                name: canonical,
+                available: self.native_available_list(true),
+            });
+        }
+        let url =
+            Url::parse(&format!("node:{name}")).map_err(|_| ResolveError::SpecifierNotFound {
+                specifier: format!("node:{name}"),
+                referrer: self.project_root.clone(),
+            })?;
+        Ok((
+            url,
+            ModuleLocator::Native {
+                name: format!("node:{name}"),
+            },
+        ))
+    }
+    // === /RT-007 ===
 
     pub fn locate(
         &self,
@@ -227,6 +260,11 @@ impl Resolver {
                 return self.locate_native(url.path());
             }
             // === /RT-005 ===
+            // === RT-007 ===
+            if url.scheme() == "node" {
+                return self.locate_node_builtin(url.path());
+            }
+            // === /RT-007 ===
             return self.locate_url(url);
         }
         if specifier.starts_with("./") || specifier.starts_with("../") || specifier.starts_with('/')
@@ -275,18 +313,9 @@ impl Resolver {
                 let bytes = self
                     .native
                     .source(name)
-                    .ok_or_else(|| {
-                        let available = self
-                            .native
-                            .modules()
-                            .iter()
-                            .map(|module| format!("meow:{module}"))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        ResolveError::UnknownNativeModule {
-                            name: name.clone(),
-                            available,
-                        }
+                    .ok_or_else(|| ResolveError::UnknownNativeModule {
+                        name: name.clone(),
+                        available: self.native_available_list(name.starts_with("node:")),
                     })?
                     .as_bytes()
                     .to_vec();
@@ -452,11 +481,19 @@ impl Resolver {
         }
 
         let dep_name = PackageName::new(package_name_text.to_owned());
-        let version = self.dependency_version(&owner, &dep_name).ok_or_else(|| {
-            ResolveError::BareSpecifierNotInLockfile {
-                name: package_name_text.to_owned(),
+        let version = match self.dependency_version(&owner, &dep_name) {
+            Some(version) => version,
+            None => {
+                // === RT-007 ===
+                if self.native.node_builtins().contains(&specifier) {
+                    return self.locate_node_builtin(specifier);
+                }
+                // === /RT-007 ===
+                return Err(ResolveError::BareSpecifierNotInLockfile {
+                    name: package_name_text.to_owned(),
+                });
             }
-        })?;
+        };
         let entry = self.lockfile.get(&dep_name, &version).ok_or_else(|| {
             ResolveError::BareSpecifierNotInLockfile {
                 name: package_name_text.to_owned(),

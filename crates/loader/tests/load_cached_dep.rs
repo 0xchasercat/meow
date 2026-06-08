@@ -288,6 +288,86 @@ fn meow_import_resolves() {
 }
 
 #[test]
+fn node_builtin_resolves_from_node_and_bare_specifiers() {
+    let proj = unique_dir("node-native");
+    let resolver = resolver_with(&proj.join("cache"), Lockfile::new(), BTreeMap::new(), &proj);
+    let referrer = Url::from_file_path(proj.join("main.ts")).expect("referrer URL");
+
+    let (node_url, node_locator) = resolver
+        .locate("node:fs", &referrer)
+        .expect("node:fs resolves");
+    assert_eq!(node_url.as_str(), "node:fs");
+    match node_locator {
+        ModuleLocator::Native { name } => assert_eq!(name, "node:fs"),
+        other => panic!("expected Native locator, got {other:?}"),
+    }
+
+    let (bare_url, bare_locator) = resolver.locate("fs", &referrer).expect("fs resolves");
+    assert_eq!(bare_url, node_url, "bare builtin canonicalizes to node:");
+    match bare_locator {
+        ModuleLocator::Native { name } => assert_eq!(name, "node:fs"),
+        other => panic!("expected Native locator, got {other:?}"),
+    }
+
+    let resolved = resolver
+        .resolve("fs/promises", &referrer)
+        .expect("fs/promises resolves");
+    assert_eq!(resolved.url.as_str(), "node:fs/promises");
+    assert!(
+        resolved.source.contains("writeFile"),
+        "node builtin source served from the runtime registry"
+    );
+
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[test]
+fn lockfile_package_shadows_bare_node_builtin_name() {
+    let proj = unique_dir("node-shadow");
+    let cache_root = proj.join("cache");
+    let cache = Cache::with_root(&cache_root);
+    let dep_hash = cache
+        .store(&archive(&[
+            (
+                "package.json",
+                br#"{"name":"path","version":"1.0.0","exports":"./index.js","type":"module"}"#,
+            ),
+            ("index.js", b"export default 'shadow-package';\n"),
+        ]))
+        .expect("store dep blob");
+
+    let mut lockfile = Lockfile::new();
+    lockfile.upsert(lock_entry("path", "1.0.0", dep_hash.clone(), &[]));
+    let resolver = resolver_with(
+        &cache_root,
+        lockfile,
+        root_deps(&[("path", "1.0.0")]),
+        &proj,
+    );
+    let referrer = Url::from_file_path(proj.join("main.ts")).expect("referrer URL");
+
+    let (bare_url, bare_locator) = resolver
+        .locate("path", &referrer)
+        .expect("shadowed path resolves");
+    assert_eq!(
+        bare_url,
+        meow_loader::encode_cache_url(&dep_hash, "index.js")
+    );
+    assert!(matches!(bare_locator, ModuleLocator::Cached { .. }));
+
+    let (node_url, node_locator) = resolver
+        .locate("node:path", &referrer)
+        .expect("explicit node:path still resolves");
+    assert_eq!(node_url.as_str(), "node:path");
+    match node_locator {
+        ModuleLocator::Native { name } => assert_eq!(name, "node:path"),
+        other => panic!("expected Native locator, got {other:?}"),
+    }
+
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[test]
 fn ts_source_is_stripped_on_load() {
     let proj = unique_dir("strip");
     let entry = proj.join("typed.ts");

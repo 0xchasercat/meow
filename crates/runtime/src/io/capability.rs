@@ -9,9 +9,9 @@
 //! default [`AllowAll`] permits everything so P0 is runnable. Real tiered
 //! enforcement (I-8, gate `capability`) lands at P6.
 //
-// TODO(SEC-001, P6): replace `AllowAll` with real per-capability grant
-// enforcement. RT-002 only stands up the seam + proves every op routes through
-// it; it makes no security claim.
+//! TODO(SEC-001, P6): replace `AllowAll` with real per-capability grant
+//! enforcement. RT-002 only stands up the seam + proves every op routes through
+//! it; it makes no security claim.
 
 use std::path::Path;
 
@@ -20,6 +20,22 @@ use std::path::Path;
 pub enum CapRequest<'a> {
     /// Read the file at this path.
     ReadFile(&'a Path),
+    // === RT-007 ===
+    /// Write the file at this path.
+    WriteFile(&'a Path),
+    /// Enumerate directory entries at this path.
+    ReadDir(&'a Path),
+    /// Stat this path.
+    Stat(&'a Path),
+    /// Create this directory.
+    Mkdir(&'a Path),
+    /// Check access to this path.
+    Access(&'a Path),
+    /// Remove this path.
+    Remove(&'a Path),
+    /// Read the current working directory.
+    CurrentDir,
+    // === /RT-007 ===
     /// Open a TCP connection to this address string (as supplied by JS).
     NetConnect(&'a str),
     // === RT-005 ===

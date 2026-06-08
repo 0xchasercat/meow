@@ -25,6 +25,36 @@ pub async fn read_file(path: &Path) -> std::io::Result<Vec<u8>> {
     tokio::fs::read(path).await
 }
 
+/// Write an entire file off the V8 thread.
+pub async fn write_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    tokio::fs::write(path, bytes).await
+}
+
+/// Read directory entry names. Sorted for deterministic tests.
+pub async fn read_dir(path: &Path) -> std::io::Result<Vec<String>> {
+    let mut dir = tokio::fs::read_dir(path).await?;
+    let mut entries = Vec::new();
+    while let Some(entry) = dir.next_entry().await? {
+        entries.push(entry.file_name().to_string_lossy().into_owned());
+    }
+    entries.sort();
+    Ok(entries)
+}
+
+/// Metadata for a path.
+pub async fn stat(path: &Path) -> std::io::Result<std::fs::Metadata> {
+    tokio::fs::metadata(path).await
+}
+
+/// Create a directory (or directory tree when `recursive`).
+pub async fn mkdir(path: &Path, recursive: bool) -> std::io::Result<()> {
+    if recursive {
+        tokio::fs::create_dir_all(path).await
+    } else {
+        tokio::fs::create_dir(path).await
+    }
+}
+
 /// Open a TCP connection. Returns the connected stream; the caller stores it as
 /// a resource and maps the `io::Error` to a typed op error.
 pub async fn tcp_connect(addr: SocketAddr) -> std::io::Result<tokio::net::TcpStream> {

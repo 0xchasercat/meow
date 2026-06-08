@@ -28,7 +28,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Execute a program (default mode = strict-web).
+    /// Execute a program (default mode = node-compat; `strict-web` is opt-in).
     Run(RunArgs),
     /// Watch-mode run.
     Dev(RunArgs),
@@ -237,12 +237,7 @@ impl Cli {
             Command::Types(args) => cmd_types(&args),
             // === /RT-005 ===
             // === RT-001 ===
-            Command::Run(args) => {
-                // === RT-006 ===
-                let hermetic = hermetic_config(&args);
-                // === /RT-006 ===
-                cmd_run(&args.entry, &args.argv, hermetic)
-            }
+            Command::Run(args) => cmd_run(&args),
             // === /RT-001 ===
             // HONEST stub (CRAFT — "the action must DO the work"): no fake success path.
             // Structured, single-line, machine-greppable; stderr only; non-zero exit.
@@ -921,21 +916,51 @@ fn hermetic_config(args: &RunArgs) -> meow_runtime::hermetic::HermeticConfig {
 }
 // === /RT-006 ===
 
+// === RT-007 ===
+fn runtime_mode(project_dir: &Path) -> Result<meow_runtime::node::NodeMode, String> {
+    match meow_config::MeowConfig::load(project_dir) {
+        Ok(cfg) => Ok(match cfg.mode {
+            meow_config::Mode::StrictWeb => meow_runtime::node::NodeMode::StrictWeb,
+            meow_config::Mode::NodeCompat | meow_config::Mode::Legacy => {
+                meow_runtime::node::NodeMode::Enabled
+            }
+        }),
+        Err(meow_config::ConfigError::NotFound(_)) => Ok(meow_runtime::node::NodeMode::Enabled),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn run_hermetic_config(
+    args: &RunArgs,
+    mode: meow_runtime::node::NodeMode,
+) -> meow_runtime::hermetic::HermeticConfig {
+    let mut cfg = hermetic_config(args);
+    if matches!(mode, meow_runtime::node::NodeMode::Enabled) && args.allow_env.is_none() {
+        cfg = cfg.with_env_all();
+    }
+    if matches!(mode, meow_runtime::node::NodeMode::StrictWeb) {
+        cfg.env = meow_runtime::hermetic::EnvPolicy::Deny;
+    }
+    cfg
+}
+// === /RT-007 ===
+
 // === RT-001 ===
 /// `meow run <file>`: canonicalize the named entry -> `file:` URL -> drive one
 /// ESM module to completion through V8. The binary edge owns host access (cwd via
 /// canonicalize) and error rendering; `meow-runtime` stays free of ambient reads
 /// (I-6). Plain JS/ESM (`.js`/`.mjs`) executes; a `.ts` entry fails honestly
 /// (TypeScript needs the type-strip, RT-003) via a `RuntimeError::Module`.
-fn cmd_run(
-    entry: &std::path::Path,
-    argv: &[String],
-    hermetic: meow_runtime::hermetic::HermeticConfig,
-) -> ExitCode {
-    if !argv.is_empty() {
-        eprintln!("meow run: forwarding program arguments (after `--`) is not yet supported");
-        return ExitCode::FAILURE;
-    }
+fn cmd_run(args: &RunArgs) -> ExitCode {
+    let entry = &args.entry;
+    let argv = &args.argv;
+    let cwd = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            eprintln!("meow run: cannot resolve the current directory: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
     let async_rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -981,6 +1006,14 @@ fn cmd_run(
                 return ExitCode::FAILURE;
             }
         };
+        let node_mode = match runtime_mode(&project_dir) {
+            Ok(mode) => mode,
+            Err(err) => {
+                eprintln!("meow run: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let hermetic = run_hermetic_config(args, node_mode);
         let lockfile = match load_lockfile(&project_dir) {
             Ok(lockfile) => lockfile,
             Err(err) => {
@@ -1053,6 +1086,19 @@ fn cmd_run(
         // timezones + locales (craft-7 M3).
         meow_runtime::hermetic::pin_deterministic_intl(&hermetic);
         extensions.extend(meow_runtime::hermetic::extensions(hermetic));
+        // === RT-007 ===
+        let mut node_argv = Vec::with_capacity(argv.len() + 2);
+        node_argv.push("meow".to_owned());
+        node_argv.push(abs.to_string_lossy().into_owned());
+        node_argv.extend(argv.iter().cloned());
+        extensions.extend(meow_runtime::node::extensions(
+            meow_runtime::node::NodeOptions {
+                mode: node_mode,
+                argv: node_argv,
+                cwd: cwd.clone(),
+            },
+        ));
+        // === /RT-007 ===
         // === /RT-006 ===
 
         let mut runtime = match meow_runtime::Runtime::new(meow_runtime::RuntimeOptions {
@@ -1068,11 +1114,17 @@ fn cmd_run(
 
         // A typed error renders as a diagnostic; never a panic / backtrace.
         match runtime.run_main_module(&spec).await {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(err) => {
-                eprintln!("meow run: {err}");
-                ExitCode::FAILURE
-            }
+            Ok(()) => match runtime.take_process_exit_code() {
+                Some(code) => ExitCode::from(code.rem_euclid(256) as u8),
+                None => ExitCode::SUCCESS,
+            },
+            Err(err) => match runtime.take_process_exit_code() {
+                Some(code) => ExitCode::from(code.rem_euclid(256) as u8),
+                None => {
+                    eprintln!("meow run: {err}");
+                    ExitCode::FAILURE
+                }
+            },
         }
     })
 }
