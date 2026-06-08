@@ -83,9 +83,9 @@ fn every_subcommand_stub_is_honest() {
 }
 
 #[test]
-fn install_non_pnp_modes_remain_honest_stubs() {
+fn install_vfs_mode_remains_an_honest_stub() {
     meow()
-        .args(["install", "--mode", "materialize"])
+        .args(["install", "--mode", "vfs"])
         .assert()
         .code(3)
         .stdout(predicate::str::is_empty())

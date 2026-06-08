@@ -2811,10 +2811,12 @@ name = "meow-pkg"
 version = "0.0.0"
 dependencies = [
  "base64",
+ "flate2",
  "semver",
  "serde",
  "serde_json",
  "sha2",
+ "tar",
  "thiserror 2.0.18",
 ]
 

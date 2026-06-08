@@ -24,8 +24,11 @@ mod lockfile;
 // === PKG-003 ===
 mod pnp;
 // === /PKG-003 ===
+// === PKG-004 ===
+mod archive;
+mod materialize;
+// === /PKG-004 ===
 mod registry;
-
 use std::path::{Path, PathBuf};
 
 pub use cache::Cache;
@@ -35,6 +38,13 @@ pub use install::{resolve_roots, InstallError, Installer, PkgInstallError, RootR
 // === PKG-003 ===
 pub use pnp::{PnpError, ResolutionGraph, ResolvedPackage};
 // === /PKG-003 ===
+// === PKG-004 ===
+pub use archive::{unpack_to, UnpackStats};
+pub use materialize::{
+    LinkStrategy, MaterializeError, MaterializeOptions, MaterializePlan, MaterializeReport,
+    Materializer, Projection,
+};
+// === /PKG-004 ===
 pub use lockfile::{CapabilityGrant, LockEntry, Lockfile, RegistryProvenance};
 pub use registry::{
     DepSpec, DistInfo, FixtureRegistry, PackageMetadata, RegistryError, RegistrySource,

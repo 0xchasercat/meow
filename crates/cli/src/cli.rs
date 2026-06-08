@@ -97,6 +97,23 @@ pub struct InstallArgs {
     /// Virtual-store install mode (CANON §18; PKG owns the final flag surface).
     #[arg(long, value_enum, default_value_t = InstallMode::Pnp)]
     pub mode: InstallMode,
+    // === PKG-004 ===
+    /// Write a real node_modules/ tree (escape hatch for tools that stat() packages). §24.4.
+    #[arg(long, conflicts_with_all = ["mode", "vendor"])]
+    pub materialize: bool,
+    /// Write a self-contained vendor/ copy (air-gapped deploys). §12.2.
+    #[arg(long, conflicts_with_all = ["mode", "materialize"])]
+    pub vendor: bool,
+    /// Vendor directory (default "vendor"); meaningful only for vendor projection.
+    #[arg(long, default_value = "vendor")]
+    pub vendor_dir: PathBuf,
+    /// Force full copies instead of symlinks.
+    #[arg(long)]
+    pub copy: bool,
+    /// Remove any existing projection tree before writing.
+    #[arg(long)]
+    pub clean: bool,
+    // === /PKG-004 ===
     // === PKG-002 ===
     /// Optional package specifier(s) to add before installing, e.g. `lodash` or `p-limit@^5`.
     #[arg(value_name = "PKG")]
@@ -622,16 +639,21 @@ impl meow_pkg::RegistrySource for NpmRegistry {
 
 /// `meow install`: resolve declared deps, populate the cache, and write the lockfile.
 fn cmd_install(args: &InstallArgs) -> ExitCode {
-    match args.mode {
-        InstallMode::Pnp => {}
-        InstallMode::Vfs | InstallMode::Materialize | InstallMode::Vendor => {
-            eprintln!(
-                "meow install: `--mode {}` lands in PKG-004 (P2)",
-                install_mode_name(&args.mode)
-            );
-            return ExitCode::from(EXIT_UNIMPLEMENTED);
-        }
+    if matches!(args.mode, InstallMode::Vfs) {
+        eprintln!(
+            "meow install: `--mode {}` lands in PKG-004 (P2)",
+            install_mode_name(&args.mode)
+        );
+        return ExitCode::from(EXIT_UNIMPLEMENTED);
     }
+
+    let projection = match install_projection(args) {
+        Ok(projection) => projection,
+        Err(err) => {
+            eprintln!("meow install: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let root = match std::env::current_dir() {
         Ok(dir) => dir,
@@ -691,6 +713,7 @@ fn cmd_install(args: &InstallArgs) -> ExitCode {
         }
     };
 
+    let installed = lockfile.len();
     let lock_path = root.join("meow.lock.jsonl");
     if let Err(err) = lockfile.write_canonical(&lock_path) {
         eprintln!("meow install: {err}");
@@ -701,9 +724,53 @@ fn cmd_install(args: &InstallArgs) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // === PKG-004 ===
+    if let Some(opts) = projection {
+        let roots = match meow_pkg::resolve_roots(&cfg.dependencies, &lockfile) {
+            Ok(roots) => roots,
+            Err(err) => {
+                eprintln!("meow install: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let graph = match meow_pkg::ResolutionGraph::assemble(std::sync::Arc::new(lockfile), roots)
+        {
+            Ok(graph) => graph,
+            Err(err) => {
+                eprintln!("meow install: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let report = match meow_pkg::Materializer::new(&cache, &graph, &root).materialize(&opts) {
+            Ok(report) => report,
+            Err(err) => {
+                eprintln!("meow install: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        println!(
+            "installed {} packages → {}",
+            installed,
+            lock_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("meow.lock.jsonl")
+        );
+        println!(
+            "materialized {} packages / {} edges / {} bytes → {}{}",
+            report.packages,
+            report.edges,
+            report.bytes_written,
+            report.root.display(),
+            if report.skipped { " (skipped)" } else { "" }
+        );
+        return ExitCode::SUCCESS;
+    }
+    // === /PKG-004 ===
+
     println!(
         "installed {} packages → {} (no node_modules)",
-        lockfile.len(),
+        installed,
         lock_path
             .file_name()
             .and_then(|name| name.to_str())
@@ -797,6 +864,65 @@ fn runtime_meow_requirement() -> Result<meow_pkg::VersionReq, String> {
 fn encode_package_name(name: &meow_pkg::PackageName) -> String {
     name.as_str().replace('/', "%2f")
 }
+
+// === PKG-004 ===
+fn install_projection(args: &InstallArgs) -> Result<Option<meow_pkg::MaterializeOptions>, String> {
+    let selection = if args.materialize {
+        Some(InstallMode::Materialize)
+    } else if args.vendor {
+        Some(InstallMode::Vendor)
+    } else {
+        match args.mode {
+            InstallMode::Pnp => None,
+            InstallMode::Vfs => None,
+            InstallMode::Materialize => Some(InstallMode::Materialize),
+            InstallMode::Vendor => Some(InstallMode::Vendor),
+        }
+    };
+
+    if selection.is_none() {
+        if args.copy {
+            return Err(
+                "`--copy` requires `--materialize`, `--vendor`, or `--mode materialize|vendor`"
+                    .to_owned(),
+            );
+        }
+        if args.clean {
+            return Err(
+                "`--clean` requires `--materialize`, `--vendor`, or `--mode materialize|vendor`"
+                    .to_owned(),
+            );
+        }
+        if args.vendor_dir != Path::new("vendor") {
+            return Err("`--vendor-dir` requires `--vendor` or `--mode vendor`".to_owned());
+        }
+        return Ok(None);
+    }
+
+    if matches!(selection, Some(InstallMode::Materialize)) && args.vendor_dir != Path::new("vendor")
+    {
+        return Err("`--vendor-dir` requires `--vendor` or `--mode vendor`".to_owned());
+    }
+
+    match selection {
+        Some(InstallMode::Materialize) => {
+            let mut opts = meow_pkg::MaterializeOptions::node_modules();
+            if args.copy {
+                opts.link = meow_pkg::LinkStrategy::Copy;
+            }
+            opts.clean = args.clean;
+            Ok(Some(opts))
+        }
+        Some(InstallMode::Vendor) => {
+            let mut opts = meow_pkg::MaterializeOptions::vendor();
+            opts.clean = args.clean;
+            opts.vendor_dir = args.vendor_dir.clone();
+            Ok(Some(opts))
+        }
+        _ => Ok(None),
+    }
+}
+// === /PKG-004 ===
 
 fn install_mode_name(mode: &InstallMode) -> &'static str {
     match mode {
@@ -1093,6 +1219,17 @@ mod tests {
             std::fs::canonicalize(&root).expect("canon root"),
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn install_materialize_flag_parses_with_default_mode() {
+        let cli = Cli::try_parse_from(["meow", "install", "--materialize"]).expect("parse cli");
+        let Command::Install(args) = cli.command else {
+            panic!("expected install command");
+        };
+        assert!(args.materialize);
+        assert!(matches!(args.mode, InstallMode::Pnp));
+        assert!(!args.vendor);
     }
 
     #[test]
