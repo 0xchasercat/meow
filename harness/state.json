@@ -1,10 +1,10 @@
 {
   "version": 3,
-  "updated_at": "2026-06-08T07:00:00Z",
+  "updated_at": "2026-06-08T08:00:00Z",
   "mode": "incubating",
   "phase": {
-    "id": "P1",
-    "name": "Minimal Runtime (MVP)"
+    "id": "P3",
+    "name": "Parse-Once Toolchain"
   },
   "active_task": null,
   "in_flight_agents": [],
@@ -18,7 +18,7 @@
     "TEST": { "status": "planned", "note": "isolate-per-file, deterministic clock (P6); RT-006 substrate ready" },
     "TOOL": { "status": "planned", "note": "lint/format/bundle over shared graph (P3)" },
     "CHK": { "status": "planned", "note": "delegated tsc/tsgo daemon (P3)" },
-    "LSP": { "status": "planned", "note": "shared resolver + shadow symlink map (P2); the resolver-parity seam (Resolver::from_resolution + ResolutionGraph::packages) landed with PKG-003 — LSP-001 just constructs through it" },
+    "LSP": { "status": "active", "note": "LSP-001 merged: meow-lsp (EditorResolver delegates to THE Resolver via from_resolution; ShadowDeps .meow/deps symlink map into the global UnpackedStore). resolver-parity proven (runtime == editor over the corpus). Full LSP (diagnostics/hover/JSON-RPC) later" },
     "SEC": { "status": "planned", "note": "capability tiers (RT-002/004/006 seams ready), provenance (P6/P7)" },
     "OBS": { "status": "active", "note": "OBS-001 merged: meow why-dep (lockfile path-tracing, pure/deterministic); why-slow/large/trace/doctor later (P6)" },
     "CFG": { "status": "active", "note": "CFG-001 + CFG-002 merged: defineMeow + shadow tsconfig + meow sync + root package.json projection" },
@@ -41,14 +41,15 @@
     { "id": 13, "specs": ["PKG-002"], "outcome": "merged" },
     { "id": 14, "specs": ["OBS-001"], "outcome": "merged" },
     { "id": 15, "specs": ["PKG-003"], "outcome": "merged" },
-    { "id": 16, "specs": ["PKG-004"], "outcome": "merged" }
+    { "id": 16, "specs": ["PKG-004"], "outcome": "merged" },
+    { "id": 17, "specs": ["LSP-001"], "outcome": "merged" }
   ],
   "gates": {
     "footprint": { "status": "green", "at": "2026-06-08T07:00:00Z", "evidence_ref": "scripts/footprint.sh gzip 27.5MB <= 60MB (PKG-004 flate2+tar already linked via LOAD-003, no new cost)" },
     "craft": { "status": "green", "at": "2026-06-08T01:15:00Z", "evidence_ref": "harness/reality-checks/craft-7.md" },
     "strip-fidelity": { "status": "green", "at": "2026-06-07T17:30:00Z", "evidence_ref": "harness/reality-checks/strip-fidelity-1.md" },
     "types-fresh": { "status": "green", "at": "2026-06-08T01:45:00Z", "evidence_ref": "RT-005 meow types --check fresh; committed crates/runtime/types/meow" },
-    "resolver-parity": { "status": "green", "at": "2026-06-08T06:00:00Z", "evidence_ref": "LOAD-003 resolution_corpus + PKG-003 pnp_parity (one Arc<ResolutionGraph> -> identical (url,locator) for runtime+LSP via from_resolution); no node_modules" },
+    "resolver-parity": { "status": "green", "at": "2026-06-08T08:00:00Z", "evidence_ref": "LOAD-003 resolution_corpus + PKG-003 pnp_parity + LSP-001 resolver_parity (runtime MeowModuleLoader == EditorResolver over the corpus from one Arc<ResolutionGraph>; identical typed errors; no node_modules) -- the I-5 keystone proven" },
     "determinism": { "status": "green", "at": "2026-06-08T02:30:00Z", "evidence_ref": "RT-006 hermetic; meow run byte-identical incl. Date/Intl (TZ+locale pinned UTC/en-US, M3 closed b04cc91)" }
   },
   "drift_flags": [
@@ -69,7 +70,7 @@
       "harness/PLAN.md",
       "harness/CANON.md"
     ],
-    "active": "P2 BUILDING - PKG-002 (install) + OBS-001 (why-dep) + PKG-003 (ResolutionGraph) + PKG-004 (--materialize/--vendor: isolated no-hoist disk projection of the same graph, atomic + integrity-verified + deterministic) merged + gated. 4 of 5 P2 specs built; only LSP-001 (editor wiring over the shared seam) remains.",
-    "next_pull_hint": "Finish P2: LSP-001 (constructs via Resolver::from_resolution + enumerates ResolutionGraph::packages() for the .meow/deps shadow symlink map). NOTE LSP-001.md cites for_project (shipped: from_project) + expects meow_pkg::UnpackedStore (NOT defined by PKG-004; add it over archive::unpack_to). Then P3 (toolchain). 16 decisions.json forks open."
+    "active": "P2 (Packages & Resolution) COMPLETE - all 5 specs merged + gated (PKG-002 install, OBS-001 why-dep, PKG-003 ResolutionGraph, PKG-004 --materialize/--vendor, LSP-001 shared-resolver + shadow map). P2 exit criteria MET: a project installs + runs pure-ESM deps with NO node_modules, same lockfile -> same graph, runtime and LSP resolve identically (resolver-parity + lockfile-integrity green).",
+    "next_pull_hint": "Start P3 (Parse-Once Toolchain) - NOT yet started; draft its backlog first (TOOL-001 formatter, TOOL-002 linter incl. no-first-party-cjs + erasable-only, TOOL-003 Rolldown bundler, CHK-001 delegated tsc/tsgo daemon `meow check`, CHK-002 fast-preview type-aware linter). Exit: parse once + reuse across tools, lint/fmt/check/bundle agree on resolution, `meow check` == reference compiler. Gates: graph-integrity, check-parity. 16 decisions.json forks open for operator review."
   }
 }
