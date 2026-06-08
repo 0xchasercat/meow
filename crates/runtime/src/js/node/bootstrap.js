@@ -151,9 +151,10 @@ function makeBufferClass() {
   return Buffer;
 }
 
-function envProxy() {
+function envProxy(overrides) {
   const store = Object.create(null);
   for (const [name, value] of ops.op_hermetic_env_entries()) store[name] = value;
+  for (const [name, value] of overrides) store[name] = value;
   return new Proxy(store, {
     deleteProperty(target, key) {
       delete target[key];
@@ -200,7 +201,7 @@ function stream(isErr) {
 function makeProcess() {
   return {
     argv: [...processInfo.argv],
-    env: envProxy(),
+    env: envProxy(processInfo.env),
     cwd() {
       return processInfo.cwd;
     },

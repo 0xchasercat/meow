@@ -77,6 +77,7 @@ fn node_runtime(
         mode,
         argv,
         cwd: cwd.to_path_buf(),
+        env: BTreeMap::new(),
     }));
     extensions.push(sink);
 

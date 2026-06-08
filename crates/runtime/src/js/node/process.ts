@@ -14,6 +14,9 @@ interface ProcessInfo {
   readonly enabled: boolean;
   readonly argv: readonly string[];
   readonly cwd: string;
+  // === RUN-001 ===
+  readonly env: ReadonlyArray<readonly [string, string]>;
+  // === /RUN-001 ===
   readonly platform: string;
   readonly arch: string;
   readonly version: string;
@@ -62,7 +65,10 @@ function toOutputString(chunk: string | Uint8Array): string {
   return typeof chunk === "string" ? chunk : decodeUtf8(chunk);
 }
 
-function envProxy(enabled: boolean): Record<string, string> {
+function envProxy(
+  enabled: boolean,
+  overrides: ReadonlyArray<readonly [string, string]>,
+): Record<string, string> {
   if (!enabled) {
     return new Proxy(Object.create(null) as Record<string, string>, {
       deleteProperty() {
@@ -88,6 +94,9 @@ function envProxy(enabled: boolean): Record<string, string> {
 
   const store = Object.create(null) as Record<string, string>;
   for (const [name, value] of ops.op_hermetic_env_entries()) {
+    store[name] = value;
+  }
+  for (const [name, value] of overrides) {
     store[name] = value;
   }
   return new Proxy(store, {
@@ -132,7 +141,7 @@ function makeStream(isErr: boolean): NodeWriteStream {
 function createProcess(info: ProcessInfo): Process {
   const value: Process = {
     argv: [...info.argv],
-    env: envProxy(info.enabled),
+    env: envProxy(info.enabled, info.env),
     platform: info.platform,
     arch: info.arch,
     version: info.version,

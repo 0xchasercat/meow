@@ -9,6 +9,7 @@
 //! The actual module sources (`node:fs`, `node:path`, ...) live in `native.rs`
 //! and resolve through the shared loader. This file only wires the op/state seam.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -36,6 +37,9 @@ pub struct NodeOptions {
     pub mode: NodeMode,
     pub argv: Vec<String>,
     pub cwd: PathBuf,
+    // === RUN-001 ===
+    pub env: BTreeMap<String, String>,
+    // === /RUN-001 ===
 }
 
 impl NodeOptions {
@@ -44,6 +48,9 @@ impl NodeOptions {
             mode: NodeMode::Enabled,
             argv,
             cwd,
+            // === RUN-001 ===
+            env: BTreeMap::new(),
+            // === /RUN-001 ===
         }
     }
 
@@ -52,6 +59,9 @@ impl NodeOptions {
             mode: NodeMode::StrictWeb,
             argv,
             cwd,
+            // === RUN-001 ===
+            env: BTreeMap::new(),
+            // === /RUN-001 ===
         }
     }
 }
@@ -61,6 +71,9 @@ struct NodeRuntimeState {
     mode: NodeMode,
     argv: Vec<String>,
     cwd: String,
+    // === RUN-001 ===
+    env: Vec<(String, String)>,
+    // === /RUN-001 ===
 }
 
 impl NodeRuntimeState {
@@ -69,6 +82,9 @@ impl NodeRuntimeState {
             mode: opts.mode,
             argv: opts.argv,
             cwd: opts.cwd.to_string_lossy().into_owned(),
+            // === RUN-001 ===
+            env: opts.env.into_iter().collect(),
+            // === /RUN-001 ===
         }
     }
 
@@ -77,6 +93,9 @@ impl NodeRuntimeState {
             mode: NodeMode::StrictWeb,
             argv: Vec::new(),
             cwd: ".".to_owned(),
+            // === RUN-001 ===
+            env: Vec::new(),
+            // === /RUN-001 ===
         }
     }
 }
@@ -93,6 +112,9 @@ struct NodeProcessInfo {
     enabled: bool,
     argv: Vec<String>,
     cwd: String,
+    // === RUN-001 ===
+    env: Vec<(String, String)>,
+    // === /RUN-001 ===
     platform: String,
     arch: String,
     version: String,
@@ -165,6 +187,9 @@ fn process_info(state: &OpState) -> NodeProcessInfo {
         enabled: st.mode.globals_enabled(),
         argv: st.argv,
         cwd: st.cwd,
+        // === RUN-001 ===
+        env: st.env,
+        // === /RUN-001 ===
         platform: node_platform().to_owned(),
         arch: node_arch().to_owned(),
         version: format!("v{}", NODE_COMPAT_VERSION),

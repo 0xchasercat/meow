@@ -28,10 +28,10 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Execute a program (default mode = node-compat; `strict-web` is opt-in).
+    /// Execute a file or a package.json script (default mode = node-compat; `strict-web` is opt-in).
     Run(RunArgs),
-    /// Watch-mode run.
-    Dev(RunArgs),
+    /// Shorthand for `meow run dev`.
+    Dev(RunScriptArgs),
     /// Install dependencies into the virtual store.
     Install(InstallArgs),
     /// Add a dependency + update the lockfile.
@@ -73,9 +73,9 @@ pub enum Command {
 
 #[derive(Debug, Args)]
 pub struct RunArgs {
-    /// Entry module to execute.
-    pub entry: PathBuf,
-    /// Arguments after `--`, to forward to the program (forwarding is not yet wired).
+    /// Script name or entry module to execute.
+    pub target: String,
+    /// Arguments after `--`, to forward to the program.
     #[arg(last = true)]
     pub argv: Vec<String>,
     // === RT-006 ===
@@ -91,6 +91,23 @@ pub struct RunArgs {
     pub allow_env: Option<String>,
     // === /RT-006 ===
 }
+
+// === RUN-001 ===
+#[derive(Debug, Args)]
+pub struct RunScriptArgs {
+    /// Arguments after `--`, to forward to the script.
+    #[arg(last = true)]
+    pub argv: Vec<String>,
+    // === RT-006 ===
+    #[arg(long)]
+    pub allow_clock: bool,
+    #[arg(long)]
+    pub allow_random: bool,
+    #[arg(long, value_name = "NAMES", num_args = 0..=1, require_equals = true, default_missing_value = "")]
+    pub allow_env: Option<String>,
+    // === /RT-006 ===
+}
+// === /RUN-001 ===
 
 #[derive(Debug, Args)]
 pub struct InstallArgs {
@@ -236,6 +253,9 @@ impl Cli {
             // === RT-005 ===
             Command::Types(args) => cmd_types(&args),
             // === /RT-005 ===
+            // === RUN-001 ===
+            Command::Dev(args) => cmd_dev(&args),
+            // === /RUN-001 ===
             // === RT-001 ===
             Command::Run(args) => cmd_run(&args),
             // === /RT-001 ===
@@ -889,9 +909,37 @@ fn install_mode_name(mode: &InstallMode) -> &'static str {
 // === /PKG-002 ===
 
 // === RT-006 ===
+#[derive(Debug, Clone, Copy)]
+struct RunFlagView<'a> {
+    argv: &'a [String],
+    allow_clock: bool,
+    allow_random: bool,
+    allow_env: &'a Option<String>,
+}
+
+fn run_flags(args: &RunArgs) -> RunFlagView<'_> {
+    RunFlagView {
+        argv: &args.argv,
+        allow_clock: args.allow_clock,
+        allow_random: args.allow_random,
+        allow_env: &args.allow_env,
+    }
+}
+
+// === RUN-001 ===
+fn run_script_flags(args: &RunScriptArgs) -> RunFlagView<'_> {
+    RunFlagView {
+        argv: &args.argv,
+        allow_clock: args.allow_clock,
+        allow_random: args.allow_random,
+        allow_env: &args.allow_env,
+    }
+}
+// === /RUN-001 ===
+
 /// Build the hermetic (clock/rng/env) config from the `meow run` grant flags. No
 /// flags = fully deterministic (I-6); each `--allow-*` flips one source (A6).
-fn hermetic_config(args: &RunArgs) -> meow_runtime::hermetic::HermeticConfig {
+fn hermetic_config(args: &RunFlagView<'_>) -> meow_runtime::hermetic::HermeticConfig {
     let mut cfg = meow_runtime::hermetic::HermeticConfig::default();
     if args.allow_clock {
         cfg = cfg.with_real_clock();
@@ -899,7 +947,7 @@ fn hermetic_config(args: &RunArgs) -> meow_runtime::hermetic::HermeticConfig {
     if args.allow_random {
         cfg = cfg.with_os_rng();
     }
-    if let Some(names) = &args.allow_env {
+    if let Some(names) = args.allow_env {
         cfg = if names.is_empty() {
             cfg.with_env_all()
         } else {
@@ -931,7 +979,7 @@ fn runtime_mode(project_dir: &Path) -> Result<meow_runtime::node::NodeMode, Stri
 }
 
 fn run_hermetic_config(
-    args: &RunArgs,
+    args: &RunFlagView<'_>,
     mode: meow_runtime::node::NodeMode,
 ) -> meow_runtime::hermetic::HermeticConfig {
     let mut cfg = hermetic_config(args);
@@ -945,201 +993,701 @@ fn run_hermetic_config(
 }
 // === /RT-007 ===
 
+// === RUN-001 ===
+#[derive(Debug, thiserror::Error)]
+enum RunCommandError {
+    #[error("cannot resolve the current directory: {0}")]
+    CurrentDir(#[source] std::io::Error),
+    #[error("cannot start the async runtime: {0}")]
+    AsyncRuntime(#[source] std::io::Error),
+    #[error("cannot find {target}: {source}")]
+    MissingEntry {
+        target: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("entry is not a file: {0}")]
+    EntryNotFile(String),
+    #[error("invalid entry path {0}")]
+    InvalidEntryPath(String),
+    #[error("invalid project directory {0}")]
+    InvalidProjectDirectory(String),
+    #[error(transparent)]
+    PackageJson(#[from] meow_config::ConfigError),
+    #[error(transparent)]
+    Lockfile(#[from] meow_pkg::LockError),
+    #[error("cannot read cached manifest {path}: {source}")]
+    CachedManifestRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("cached manifest {path} is invalid: {source}")]
+    CachedManifestParse {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("package `{package}` declares an invalid bin target `{target}`")]
+    InvalidBinTarget { package: String, target: String },
+    #[error("package `{package}` bin `{command}` points at missing file `{target}`")]
+    MissingBinFile {
+        package: String,
+        command: String,
+        target: String,
+    },
+    #[error("bin `{command}` is ambiguous across direct dependencies: {packages}")]
+    AmbiguousBin { command: String, packages: String },
+    #[error("cannot unpack cached package `{package}`: {reason}")]
+    UnpackBin { package: String, reason: String },
+    #[error("cannot spawn {shell}: {source}")]
+    ShellSpawn {
+        shell: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("the shell terminated without an exit code")]
+    ShellTerminated,
+    #[error("{0}")]
+    Message(String),
+}
+
+impl From<String> for RunCommandError {
+    fn from(value: String) -> Self {
+        Self::Message(value)
+    }
+}
+
+#[derive(Clone)]
+struct RuntimeContext {
+    project_dir: PathBuf,
+    project_root: meow_runtime::ModuleSpecifier,
+    node_mode: meow_runtime::node::NodeMode,
+    graph: std::sync::Arc<meow_pkg::ResolutionGraph>,
+    cache: std::sync::Arc<meow_pkg::Cache>,
+}
+
+#[derive(Debug, Clone)]
+struct NativeRunRequest {
+    project_dir: PathBuf,
+    process_cwd: PathBuf,
+    spec: meow_runtime::ModuleSpecifier,
+    argv1: String,
+    argv: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+enum PlannedScript {
+    Native(NativeRunRequest),
+    Shell { script: String, argv: Vec<String> },
+}
+// === /RUN-001 ===
+
 // === RT-001 ===
-/// `meow run <file>`: canonicalize the named entry -> `file:` URL -> drive one
-/// ESM module to completion through V8. The binary edge owns host access (cwd via
-/// canonicalize) and error rendering; `meow-runtime` stays free of ambient reads
-/// (I-6). Plain JS/ESM (`.js`/`.mjs`) executes; a `.ts` entry fails honestly
-/// (TypeScript needs the type-strip, RT-003) via a `RuntimeError::Module`.
+/// `meow run <name-or-file>`: prefer a package.json script when present; otherwise
+/// canonicalize the named entry -> `file:` URL -> drive one module to completion
+/// through V8. The binary edge owns host access (cwd/package root lookup) and error
+/// rendering; `meow-runtime` stays free of ambient reads (I-6).
 fn cmd_run(args: &RunArgs) -> ExitCode {
-    let entry = &args.entry;
-    let argv = &args.argv;
-    let cwd = match std::env::current_dir() {
-        Ok(dir) => dir,
+    cmd_run_inner("run", &args.target, run_flags(args))
+}
+
+// === RUN-001 ===
+fn cmd_dev(args: &RunScriptArgs) -> ExitCode {
+    cmd_run_inner("dev", "dev", run_script_flags(args))
+}
+
+fn cmd_run_inner(verb: &'static str, target: &str, flags: RunFlagView<'_>) -> ExitCode {
+    match cmd_run_result(target, flags) {
+        Ok(code) => code,
         Err(err) => {
-            eprintln!("meow run: cannot resolve the current directory: {err}");
-            return ExitCode::FAILURE;
+            eprintln!("meow {verb}: {err}");
+            ExitCode::FAILURE
         }
-    };
-    let async_rt = match tokio::runtime::Builder::new_current_thread()
+    }
+}
+
+fn cmd_run_result(target: &str, flags: RunFlagView<'_>) -> Result<ExitCode, RunCommandError> {
+    let cwd = std::env::current_dir().map_err(RunCommandError::CurrentDir)?;
+    let async_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-    {
-        Ok(rt) => rt,
-        Err(err) => {
-            eprintln!("meow run: cannot start the async runtime: {err}");
-            return ExitCode::FAILURE;
+        .map_err(RunCommandError::AsyncRuntime)?;
+    async_rt.block_on(async move {
+        if let Some(project_dir) = find_package_root(&cwd) {
+            let package_json = meow_config::PackageJson::read(&project_dir)?;
+            if package_json.scripts.contains_key(target) {
+                return execute_package_script(&package_json, &project_dir, &cwd, target, flags)
+                    .await;
+            }
         }
-    };
 
-    async_rt.block_on(async {
-        // Explicit: the program the user named (canonicalize against the real cwd).
-        let abs = match std::fs::canonicalize(entry) {
-            Ok(path) => path,
-            Err(err) => {
-                eprintln!("meow run: cannot find {}: {err}", entry.display());
-                return ExitCode::FAILURE;
-            }
-        };
-        let spec = match meow_runtime::ModuleSpecifier::from_file_path(&abs) {
-            Ok(spec) => spec,
-            Err(()) => {
-                eprintln!("meow run: invalid entry path {}", abs.display());
-                return ExitCode::FAILURE;
-            }
-        };
-
-        // === LOAD-001 ===
-        // Build THE resolver + content-addressed cache loader. The binary edge owns
-        // ambient reads (I-6): it resolves the project root + host home and reads
-        // meow.lock.jsonl, then derives the root-dependency map from package.json
-        // when present (with a lockfile-only fallback for local-only runs).
-        let entry_dir = abs.parent().unwrap_or(&abs);
-        let project_dir = find_project_root(entry_dir);
-        let project_root = match meow_runtime::ModuleSpecifier::from_directory_path(&project_dir) {
-            Ok(url) => url,
-            Err(()) => {
-                eprintln!(
-                    "meow run: invalid project directory {}",
-                    project_dir.display()
-                );
-                return ExitCode::FAILURE;
-            }
-        };
-        let node_mode = match runtime_mode(&project_dir) {
-            Ok(mode) => mode,
-            Err(err) => {
-                eprintln!("meow run: {err}");
-                return ExitCode::FAILURE;
-            }
-        };
-        let hermetic = run_hermetic_config(args, node_mode);
-        let lockfile = match load_lockfile(&project_dir) {
-            Ok(lockfile) => lockfile,
-            Err(err) => {
-                eprintln!("meow run: {err}");
-                return ExitCode::FAILURE;
-            }
-        };
-        // === CFG-003 ===
-        let root_deps = match load_declared_root_deps(&project_dir, &lockfile) {
-            Ok(deps) => deps,
-            Err(err) => {
-                eprintln!("meow run: {err}");
-                return ExitCode::FAILURE;
-            }
-        };
-        // === /CFG-003 ===
-        // === PKG-003 ===
-        let cache = std::sync::Arc::new(meow_pkg::Cache::in_home(crate::host::host_home()));
-        let graph =
-            match meow_pkg::ResolutionGraph::assemble(std::sync::Arc::new(lockfile), root_deps) {
-                Ok(graph) => std::sync::Arc::new(graph),
-                Err(err) => {
-                    eprintln!("meow run: {err}");
-                    return ExitCode::FAILURE;
-                }
-            };
-        if let Err(err) = graph.verify_cached(&cache) {
-            eprintln!("meow run: {err}");
-            return ExitCode::FAILURE;
-        }
-        let loader: std::rc::Rc<dyn meow_runtime::deno_core::ModuleLoader> =
-            std::rc::Rc::new(meow_loader::MeowModuleLoader::new(
-                meow_loader::Resolver::from_resolution(
-                    &graph,
-                    cache,
-                    project_root,
-                    // === RT-005 ===
-                    meow_runtime::native::native_module_registry(),
-                    // === /RT-005 ===
-                ),
-                std::rc::Rc::new(std::cell::RefCell::new(meow_graph::GraphDb::new())),
-            ));
-        // === /PKG-003 ===
-        // === /LOAD-001 ===
-
-        // === RT-004 ===
-        // Install the strict-web Stateless-Edge globals (CANON §8.1) on the
-        // default runtime so `meow run` sees fetch/URL/crypto.subtle/etc. The
-        // `fetch` network gate consults this capability seam; at P1 the default
-        // is `AllowAll` (seam, not enforcement — SEC-001/P6). The seam value is
-        // `Send + Sync` because deno_fetch resolves hosts on a spawned task.
-        let caps: meow_runtime::web::NetCaps = std::sync::Arc::new(meow_runtime::AllowAll);
-        let mut extensions = meow_runtime::web::extensions(meow_runtime::web::WebOptions {
-            caps,
-            user_agent: format!("meow/{}", env!("CARGO_PKG_VERSION")),
-        });
-        // === RT-005 ===
-        // The `meow:http` native module resolves through the shared loader; append
-        // its op layer here so `serve()` can bind, accept, respond, and shut down.
-        extensions.push(meow_runtime::http_extension());
-        // === /RT-005 ===
-        // === /RT-004 ===
-
-        // === RT-006 ===
-        // Determinism shadows AFTER the Web globals so they rebind the real
-        // Date/crypto/performance. Deterministic by default; the --allow-* flags
-        // built `hermetic` (A6). Append, never replace.
-        // Pin TZ=UTC + a fixed default locale under the virtual clock BEFORE the
-        // isolate is created, so V8 renders Date/Intl deterministically across host
-        // timezones + locales (craft-7 M3).
-        meow_runtime::hermetic::pin_deterministic_intl(&hermetic);
-        extensions.extend(meow_runtime::hermetic::extensions(hermetic));
-        // === RT-007 ===
-        let mut node_argv = Vec::with_capacity(argv.len() + 2);
-        node_argv.push("meow".to_owned());
-        node_argv.push(abs.to_string_lossy().into_owned());
-        node_argv.extend(argv.iter().cloned());
-        extensions.extend(meow_runtime::node::extensions(
-            meow_runtime::node::NodeOptions {
-                mode: node_mode,
-                argv: node_argv,
-                cwd: cwd.clone(),
-            },
-        ));
-        // === /RT-007 ===
-        // === /RT-006 ===
-
-        let mut runtime = match meow_runtime::Runtime::new(meow_runtime::RuntimeOptions {
-            module_loader: loader,
-            extensions,
-        }) {
-            Ok(runtime) => runtime,
-            Err(err) => {
-                eprintln!("meow run: {err}");
-                return ExitCode::FAILURE;
-            }
-        };
-
-        // A typed error renders as a diagnostic; never a panic / backtrace.
-        match runtime.run_main_module(&spec).await {
-            Ok(()) => match runtime.take_process_exit_code() {
-                Some(code) => ExitCode::from(code.rem_euclid(256) as u8),
-                None => ExitCode::SUCCESS,
-            },
-            Err(err) => match runtime.take_process_exit_code() {
-                Some(code) => ExitCode::from(code.rem_euclid(256) as u8),
-                None => {
-                    eprintln!("meow run: {err}");
-                    ExitCode::FAILURE
-                }
-            },
-        }
+        let request = prepare_direct_file_run(&cwd, target, flags.argv)?;
+        run_native_request(&request, flags, BTreeMap::new()).await
     })
 }
+
+async fn execute_package_script(
+    package_json: &meow_config::PackageJson,
+    project_dir: &Path,
+    init_cwd: &Path,
+    script_name: &str,
+    flags: RunFlagView<'_>,
+) -> Result<ExitCode, RunCommandError> {
+    let ctx = build_runtime_context(project_dir)?;
+    let pre_name = format!("pre{script_name}");
+    if let Some(pre_script) = package_json.scripts.get(&pre_name) {
+        let status = execute_script_body(&ctx, init_cwd, &pre_name, pre_script, &[], flags).await?;
+        if status != ExitCode::SUCCESS {
+            return Ok(status);
+        }
+    }
+
+    let main_script = package_json
+        .scripts
+        .get(script_name)
+        .ok_or_else(|| RunCommandError::Message(format!("missing script `{script_name}`")))?;
+    let status =
+        execute_script_body(&ctx, init_cwd, script_name, main_script, flags.argv, flags).await?;
+    if status != ExitCode::SUCCESS {
+        return Ok(status);
+    }
+
+    let post_name = format!("post{script_name}");
+    if let Some(post_script) = package_json.scripts.get(&post_name) {
+        return execute_script_body(&ctx, init_cwd, &post_name, post_script, &[], flags).await;
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn execute_script_body(
+    ctx: &RuntimeContext,
+    init_cwd: &Path,
+    event: &str,
+    script: &str,
+    cli_argv: &[String],
+    flags: RunFlagView<'_>,
+) -> Result<ExitCode, RunCommandError> {
+    let env = lifecycle_env(event, script, &ctx.project_dir, init_cwd);
+    match plan_script(ctx, script, cli_argv)? {
+        PlannedScript::Native(request) => run_native_request(&request, flags, env).await,
+        PlannedScript::Shell { script, argv } => {
+            run_shell_command(&ctx.project_dir, &script, &argv, env)
+        }
+    }
+}
+
+async fn run_native_request(
+    request: &NativeRunRequest,
+    flags: RunFlagView<'_>,
+    env: BTreeMap<String, String>,
+) -> Result<ExitCode, RunCommandError> {
+    let ctx = build_runtime_context(&request.project_dir)?;
+    let loader: std::rc::Rc<dyn meow_runtime::deno_core::ModuleLoader> =
+        std::rc::Rc::new(meow_loader::MeowModuleLoader::new(
+            meow_loader::Resolver::from_resolution(
+                &ctx.graph,
+                ctx.cache.clone(),
+                ctx.project_root.clone(),
+                // === RT-005 ===
+                meow_runtime::native::native_module_registry(),
+                // === /RT-005 ===
+            ),
+            std::rc::Rc::new(std::cell::RefCell::new(meow_graph::GraphDb::new())),
+        ));
+
+    // === RT-004 ===
+    let caps: meow_runtime::web::NetCaps = std::sync::Arc::new(meow_runtime::AllowAll);
+    let mut extensions = meow_runtime::web::extensions(meow_runtime::web::WebOptions {
+        caps,
+        user_agent: format!("meow/{}", env!("CARGO_PKG_VERSION")),
+    });
+    // === RT-005 ===
+    extensions.push(meow_runtime::http_extension());
+    // === /RT-005 ===
+    // === /RT-004 ===
+
+    // === RT-006 ===
+    let hermetic = run_hermetic_config(&flags, ctx.node_mode);
+    meow_runtime::hermetic::pin_deterministic_intl(&hermetic);
+    extensions.extend(meow_runtime::hermetic::extensions(hermetic));
+    // === RT-007 ===
+    let mut node_argv = Vec::with_capacity(request.argv.len() + 2);
+    node_argv.push("meow".to_owned());
+    node_argv.push(request.argv1.clone());
+    node_argv.extend(request.argv.iter().cloned());
+    extensions.extend(meow_runtime::node::extensions(
+        meow_runtime::node::NodeOptions {
+            mode: ctx.node_mode,
+            argv: node_argv,
+            cwd: request.process_cwd.clone(),
+            env,
+        },
+    ));
+    // === /RT-007 ===
+    // === /RT-006 ===
+
+    let mut runtime = meow_runtime::Runtime::new(meow_runtime::RuntimeOptions {
+        module_loader: loader,
+        extensions,
+    })
+    .map_err(|err| RunCommandError::Message(err.to_string()))?;
+
+    match runtime.run_main_module(&request.spec).await {
+        Ok(()) => Ok(match runtime.take_process_exit_code() {
+            Some(code) => ExitCode::from(code.rem_euclid(256) as u8),
+            None => ExitCode::SUCCESS,
+        }),
+        Err(err) => match runtime.take_process_exit_code() {
+            Some(code) => Ok(ExitCode::from(code.rem_euclid(256) as u8)),
+            None => Err(RunCommandError::Message(err.to_string())),
+        },
+    }
+}
+
+fn prepare_direct_file_run(
+    cwd: &Path,
+    target: &str,
+    argv: &[String],
+) -> Result<NativeRunRequest, RunCommandError> {
+    let abs = resolve_local_entry(cwd, target, true)?
+        .ok_or_else(|| RunCommandError::Message(format!("cannot find {target}")))?;
+    native_file_request(
+        find_project_root(abs.parent().unwrap_or(&abs)),
+        cwd.to_path_buf(),
+        abs,
+        argv,
+    )
+}
+
+fn native_file_request(
+    project_dir: PathBuf,
+    process_cwd: PathBuf,
+    abs: PathBuf,
+    argv: &[String],
+) -> Result<NativeRunRequest, RunCommandError> {
+    let spec = meow_runtime::ModuleSpecifier::from_file_path(&abs)
+        .map_err(|()| RunCommandError::InvalidEntryPath(abs.display().to_string()))?;
+    Ok(NativeRunRequest {
+        project_dir,
+        process_cwd,
+        spec,
+        argv1: abs.to_string_lossy().into_owned(),
+        argv: argv.to_vec(),
+    })
+}
+
+fn build_runtime_context(project_dir: &Path) -> Result<RuntimeContext, RunCommandError> {
+    let project_root =
+        meow_runtime::ModuleSpecifier::from_directory_path(project_dir).map_err(|()| {
+            RunCommandError::InvalidProjectDirectory(project_dir.display().to_string())
+        })?;
+    let node_mode = runtime_mode(project_dir).map_err(RunCommandError::Message)?;
+    let lockfile = load_lockfile(project_dir)?;
+    let root_deps =
+        load_declared_root_deps(project_dir, &lockfile).map_err(RunCommandError::Message)?;
+    let cache = std::sync::Arc::new(meow_pkg::Cache::in_home(crate::host::host_home()));
+    let graph = meow_pkg::ResolutionGraph::assemble(std::sync::Arc::new(lockfile), root_deps)
+        .map_err(|err| RunCommandError::Message(err.to_string()))?;
+    let graph = std::sync::Arc::new(graph);
+    graph
+        .verify_cached(&cache)
+        .map_err(|err| RunCommandError::Message(err.to_string()))?;
+    Ok(RuntimeContext {
+        project_dir: project_dir.to_path_buf(),
+        project_root,
+        node_mode,
+        graph,
+        cache,
+    })
+}
+
+fn plan_script(
+    ctx: &RuntimeContext,
+    script: &str,
+    cli_argv: &[String],
+) -> Result<PlannedScript, RunCommandError> {
+    let Some(tokens) = tokenize_simple_script(script) else {
+        return Ok(PlannedScript::Shell {
+            script: script.to_owned(),
+            argv: cli_argv.to_vec(),
+        });
+    };
+    if tokens.is_empty() {
+        return Ok(PlannedScript::Shell {
+            script: script.to_owned(),
+            argv: cli_argv.to_vec(),
+        });
+    }
+
+    let first = &tokens[0];
+    if matches!(first.as_str(), "node" | "meow") {
+        if tokens.len() < 2 || tokens[1].starts_with('-') {
+            return Ok(PlannedScript::Shell {
+                script: script.to_owned(),
+                argv: cli_argv.to_vec(),
+            });
+        }
+        if let Some(abs) =
+            resolve_local_entry(&ctx.project_dir, &tokens[1], looks_like_path(&tokens[1]))?
+        {
+            let mut argv = tokens[2..].to_vec();
+            argv.extend(cli_argv.iter().cloned());
+            return Ok(PlannedScript::Native(native_file_request(
+                ctx.project_dir.clone(),
+                ctx.project_dir.clone(),
+                abs,
+                &argv,
+            )?));
+        }
+        return Ok(PlannedScript::Shell {
+            script: script.to_owned(),
+            argv: cli_argv.to_vec(),
+        });
+    }
+
+    if let Some(abs) = resolve_local_entry(&ctx.project_dir, first, looks_like_path(first))? {
+        let mut argv = tokens[1..].to_vec();
+        argv.extend(cli_argv.iter().cloned());
+        return Ok(PlannedScript::Native(native_file_request(
+            ctx.project_dir.clone(),
+            ctx.project_dir.clone(),
+            abs,
+            &argv,
+        )?));
+    }
+
+    let mut argv = tokens[1..].to_vec();
+    argv.extend(cli_argv.iter().cloned());
+    if let Some(bin) = resolve_package_bin(ctx, first, &argv)? {
+        return Ok(PlannedScript::Native(bin));
+    }
+
+    Ok(PlannedScript::Shell {
+        script: script.to_owned(),
+        argv: cli_argv.to_vec(),
+    })
+}
+
+fn resolve_package_bin(
+    ctx: &RuntimeContext,
+    command: &str,
+    argv: &[String],
+) -> Result<Option<NativeRunRequest>, RunCommandError> {
+    let store = meow_pkg::UnpackedStore::new(ctx.cache.root().join("unpacked"), ctx.cache.clone());
+    let mut matches = Vec::new();
+    for (name, version) in ctx.graph.root_deps() {
+        let Some(entry) = ctx.graph.lockfile().get(name, version) else {
+            continue;
+        };
+        let root = store
+            .ensure(&entry.integrity)
+            .map_err(|err| RunCommandError::UnpackBin {
+                package: name.to_string(),
+                reason: err.to_string(),
+            })?;
+        let manifest_path = root.join("package.json");
+        let bytes = std::fs::read(&manifest_path).map_err(|source| {
+            RunCommandError::CachedManifestRead {
+                path: manifest_path.clone(),
+                source,
+            }
+        })?;
+        let manifest: meow_loader::package::PackageJson =
+            serde_json::from_slice(&bytes).map_err(|source| {
+                RunCommandError::CachedManifestParse {
+                    path: manifest_path,
+                    source,
+                }
+            })?;
+        let Some(raw_member) = manifest.bin_entry(command) else {
+            continue;
+        };
+        let member = normalize_cached_member(name.as_str(), raw_member)?;
+        let bin_path = root.join(&member);
+        if !bin_path.is_file() {
+            return Err(RunCommandError::MissingBinFile {
+                package: name.to_string(),
+                command: command.to_owned(),
+                target: member,
+            });
+        }
+        matches.push((
+            name.to_string(),
+            meow_loader::encode_cache_url(&entry.integrity, &member),
+            bin_path,
+        ));
+    }
+
+    match matches.len() {
+        0 => Ok(None),
+        1 => {
+            let (_package, spec, bin_path) = matches.pop().expect("one match");
+            Ok(Some(NativeRunRequest {
+                project_dir: ctx.project_dir.clone(),
+                process_cwd: ctx.project_dir.clone(),
+                spec,
+                argv1: bin_path.to_string_lossy().into_owned(),
+                argv: argv.to_vec(),
+            }))
+        }
+        _ => Err(RunCommandError::AmbiguousBin {
+            command: command.to_owned(),
+            packages: matches
+                .iter()
+                .map(|(package, _, _)| package.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        }),
+    }
+}
+
+fn normalize_cached_member(package: &str, raw: &str) -> Result<String, RunCommandError> {
+    let path = Path::new(raw);
+    let mut member = String::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(segment) => {
+                let segment =
+                    segment
+                        .to_str()
+                        .ok_or_else(|| RunCommandError::InvalidBinTarget {
+                            package: package.to_owned(),
+                            target: raw.to_owned(),
+                        })?;
+                if !member.is_empty() {
+                    member.push('/');
+                }
+                member.push_str(segment);
+            }
+            _ => {
+                return Err(RunCommandError::InvalidBinTarget {
+                    package: package.to_owned(),
+                    target: raw.to_owned(),
+                });
+            }
+        }
+    }
+    if member.is_empty() {
+        return Err(RunCommandError::InvalidBinTarget {
+            package: package.to_owned(),
+            target: raw.to_owned(),
+        });
+    }
+    Ok(member)
+}
+
+fn resolve_local_entry(
+    base: &Path,
+    raw: &str,
+    required: bool,
+) -> Result<Option<PathBuf>, RunCommandError> {
+    let candidate = if Path::new(raw).is_absolute() {
+        PathBuf::from(raw)
+    } else {
+        base.join(raw)
+    };
+    match std::fs::canonicalize(&candidate) {
+        Ok(path) => {
+            if path.is_file() {
+                Ok(Some(path))
+            } else {
+                Err(RunCommandError::EntryNotFile(path.display().to_string()))
+            }
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound && !required => Ok(None),
+        Err(source) => Err(RunCommandError::MissingEntry {
+            target: raw.to_owned(),
+            source,
+        }),
+    }
+}
+
+fn looks_like_path(token: &str) -> bool {
+    token.starts_with('.')
+        || token.starts_with('/')
+        || token.contains('/')
+        || token.contains('\\')
+        || matches!(
+            Path::new(token).extension().and_then(|ext| ext.to_str()),
+            Some("js" | "mjs" | "cjs" | "ts" | "mts" | "cts" | "jsx" | "tsx")
+        )
+}
+
+fn tokenize_simple_script(script: &str) -> Option<Vec<String>> {
+    #[derive(Clone, Copy)]
+    enum Quote {
+        Single,
+        Double,
+    }
+
+    let mut quote = None;
+    let mut chars = script.chars();
+    let mut current = String::new();
+    let mut tokens = Vec::new();
+    while let Some(ch) = chars.next() {
+        match quote {
+            None => match ch {
+                ' ' | '\t' | '\r' => {
+                    if !current.is_empty() {
+                        tokens.push(std::mem::take(&mut current));
+                    }
+                }
+                '\'' => quote = Some(Quote::Single),
+                '"' => quote = Some(Quote::Double),
+                '\\' => current.push(chars.next()?),
+                '&' | '|' | '>' | '<' | ';' | '`' | '(' | ')' | '\n' | '*' | '?' | '[' | ']'
+                | '{' | '}' | '$' => return None,
+                _ => current.push(ch),
+            },
+            Some(Quote::Single) => match ch {
+                '\'' => quote = None,
+                _ => current.push(ch),
+            },
+            Some(Quote::Double) => match ch {
+                '"' => quote = None,
+                '\\' => current.push(chars.next()?),
+                '$' | '`' => return None,
+                _ => current.push(ch),
+            },
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    (!tokens.is_empty()).then_some(tokens)
+}
+
+fn lifecycle_env(
+    event: &str,
+    script: &str,
+    project_dir: &Path,
+    init_cwd: &Path,
+) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    env.insert(
+        "INIT_CWD".to_owned(),
+        init_cwd.to_string_lossy().into_owned(),
+    );
+    env.insert("npm_lifecycle_event".to_owned(), event.to_owned());
+    env.insert("npm_lifecycle_script".to_owned(), script.to_owned());
+    env.insert(
+        "npm_package_json".to_owned(),
+        project_dir
+            .join("package.json")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    env
+}
+
+fn run_shell_command(
+    project_dir: &Path,
+    script: &str,
+    argv: &[String],
+    env: BTreeMap<String, String>,
+) -> Result<ExitCode, RunCommandError> {
+    let mut command_text = script.to_owned();
+    if !argv.is_empty() {
+        command_text.push(' ');
+        command_text.push_str(
+            &argv
+                .iter()
+                .map(|arg| quote_shell_arg(arg))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    }
+    let mut command = shell_command(&command_text);
+    command
+        .current_dir(project_dir)
+        .envs(env)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+    let status = command
+        .status()
+        .map_err(|source| RunCommandError::ShellSpawn {
+            shell: shell_name(),
+            source,
+        })?;
+    match status.code() {
+        Some(code) => Ok(ExitCode::from(code.rem_euclid(256) as u8)),
+        None => Err(RunCommandError::ShellTerminated),
+    }
+}
+
+#[cfg(unix)]
+fn shell_name() -> &'static str {
+    "sh"
+}
+
+#[cfg(windows)]
+fn shell_name() -> &'static str {
+    "cmd"
+}
+
+#[cfg(unix)]
+fn shell_command(script: &str) -> std::process::Command {
+    let mut command = std::process::Command::new("sh");
+    command.arg("-c").arg(script);
+    command
+}
+
+#[cfg(windows)]
+fn shell_command(script: &str) -> std::process::Command {
+    let mut command = std::process::Command::new("cmd");
+    command.arg("/C").arg(script);
+    command
+}
+
+#[cfg(unix)]
+fn quote_shell_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "''".to_owned();
+    }
+    if arg
+        .bytes()
+        .all(|byte| matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'/' | b'.' | b'_' | b'-' | b':' | b'@' | b'=' | b'+'))
+    {
+        return arg.to_owned();
+    }
+    format!("'{}'", arg.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(windows)]
+fn quote_shell_arg(arg: &str) -> String {
+    let escaped = arg.replace('^', "^^").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+fn find_package_root(start: &Path) -> Option<PathBuf> {
+    let mut dir = Some(start);
+    while let Some(current) = dir {
+        if current.join("package.json").is_file() {
+            return Some(current.to_path_buf());
+        }
+        dir = current.parent();
+    }
+    None
+}
+// === /RUN-001 ===
 // === /RT-001 ===
 
 // === LOAD-001 ===
-
-/// Walk UP from `start` to the nearest directory holding a `meow.lock.jsonl` (the
-/// project-root marker) and return it; fall back to `start` when none exists (a
+/// Walk UP from `start` to the nearest directory holding a `meow.lock.jsonl` or
+/// `package.json` and return it; fall back to `start` when neither exists (a
 /// local-only run). Host-pure: it inspects only the given path, reads no env
 /// (`$HOME` stays in `host/`, I-6).
 fn find_project_root(start: &std::path::Path) -> PathBuf {
     let mut dir = start;
     loop {
-        if dir.join("meow.lock.jsonl").is_file() {
+        if dir.join("meow.lock.jsonl").is_file() || dir.join("package.json").is_file() {
             return dir.to_path_buf();
         }
         match dir.parent() {
@@ -1216,11 +1764,10 @@ mod tests {
     }
 
     #[test]
-    fn find_project_root_walks_up_to_the_nearest_lockfile() {
-        // Lockfile at the ROOT, entry nested two levels down: discovery must climb
-        // to the root, not stop at the entry's own directory (finding 1).
+    fn find_project_root_walks_up_to_the_nearest_project_marker() {
+        // A project root is now identified by either lockfile or package.json.
         let root = unit_tmp("root");
-        std::fs::write(root.join("meow.lock.jsonl"), "").expect("write lockfile");
+        std::fs::write(root.join("package.json"), "{}").expect("write package.json");
         let nested = root.join("src").join("inner");
         std::fs::create_dir_all(&nested).expect("nested dirs");
 
@@ -1244,8 +1791,26 @@ mod tests {
     }
 
     #[test]
-    fn find_project_root_falls_back_to_start_without_a_lockfile() {
-        // No lockfile anywhere on the way up: a local-only run uses the entry dir.
+    fn dev_shorthand_parses_trailing_args() {
+        let cli = Cli::try_parse_from(["meow", "dev", "--", "watch"]).expect("parse cli");
+        let Command::Dev(args) = cli.command else {
+            panic!("expected dev command");
+        };
+        assert_eq!(args.argv, vec!["watch".to_string()]);
+    }
+
+    #[test]
+    fn tokenize_simple_script_rejects_shell_operators() {
+        assert_eq!(
+            tokenize_simple_script("node ./dev.cjs --watch").expect("simple script"),
+            vec!["node", "./dev.cjs", "--watch"]
+        );
+        assert!(tokenize_simple_script("echo hi && echo ok").is_none());
+    }
+
+    #[test]
+    fn find_project_root_falls_back_to_start_without_project_markers() {
+        // No lockfile/package.json anywhere on the way up: a local-only run uses the entry dir.
         let dir = unit_tmp("nolock");
         let found = find_project_root(&dir);
         assert_eq!(found, dir);

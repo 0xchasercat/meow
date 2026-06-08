@@ -49,7 +49,6 @@ fn version_and_help_succeed() {
 
 /// `(argv, verb, phase)` for every subcommand, with minimal valid args.
 const CASES: &[(&[&str], &str, &str)] = &[
-    (&["dev", "x.ts"], "dev", "P1"),
     (&["add", "p"], "add", "P2"),
     (&["remove", "p"], "remove", "P2"),
     (&["task", "t"], "task", "P4"),
@@ -69,8 +68,8 @@ const CASES: &[(&[&str], &str, &str)] = &[
 fn every_subcommand_stub_is_honest() {
     assert_eq!(
         CASES.len(),
-        14,
-        "14 stub subcommands (sync/run/install/types/why-dep are real; doctor reverts to the P6 stub after CFG-003 retires package.json ownership)"
+        13,
+        "13 stub subcommands (sync/run/dev/install/types/why-dep are real; doctor reverts to the P6 stub after CFG-003 retires package.json ownership)"
     );
     for (argv, verb, phase) in CASES {
         let expected = format!("meow: not yet implemented — `{verb}` lands in PLAN {phase}");
@@ -234,6 +233,297 @@ fn load_tmp(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("meow-load-{tag}-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     dir
+}
+
+#[test]
+fn run_executes_package_json_script_from_nested_cwd_and_sets_lifecycle_env() {
+    let proj = load_tmp("script-dev");
+    let nested = proj.join("src").join("client");
+    std::fs::create_dir_all(&nested).expect("nested cwd");
+    std::fs::write(
+        proj.join("package.json"),
+        br#"{ "scripts": { "dev": "node ./dev.cjs --script-flag" } }"#,
+    )
+    .expect("write package.json");
+    std::fs::write(
+        proj.join("dev.cjs"),
+        r#"console.log(`EVENT=${process.env.npm_lifecycle_event}`);
+console.log(`SCRIPT=${process.env.npm_lifecycle_script}`);
+console.log(`INIT=${process.env.INIT_CWD}`);
+console.log(`CWD=${process.cwd()}`);
+console.log(`ARGV=${JSON.stringify(process.argv.slice(2))}`);"#,
+    )
+    .expect("write dev script");
+
+    let proj_display = std::fs::canonicalize(&proj)
+        .expect("canon project")
+        .to_string_lossy()
+        .into_owned();
+    let nested_display = std::fs::canonicalize(&nested)
+        .expect("canon nested")
+        .to_string_lossy()
+        .into_owned();
+    meow()
+        .current_dir(&nested)
+        .arg("run")
+        .arg("dev")
+        .arg("--")
+        .arg("from-cli")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("EVENT=dev"))
+        .stdout(predicate::str::contains(
+            "SCRIPT=node ./dev.cjs --script-flag",
+        ))
+        .stdout(predicate::str::contains(format!("INIT={nested_display}")))
+        .stdout(predicate::str::contains(format!("CWD={proj_display}")))
+        .stdout(predicate::str::contains(
+            r#"ARGV=["--script-flag","from-cli"]"#,
+        ));
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[test]
+fn dev_shorthand_runs_the_dev_script() {
+    let proj = load_tmp("dev-short");
+    std::fs::write(
+        proj.join("package.json"),
+        br#"{ "scripts": { "dev": "node ./dev.cjs" } }"#,
+    )
+    .expect("write package.json");
+    std::fs::write(proj.join("dev.cjs"), r#"console.log("dev shortcut ok")"#)
+        .expect("write dev script");
+
+    meow()
+        .current_dir(&proj)
+        .arg("dev")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dev shortcut ok"));
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[test]
+fn run_prefers_a_script_over_a_same_named_file() {
+    let proj = load_tmp("script-wins");
+    std::fs::write(
+        proj.join("package.json"),
+        br#"{ "scripts": { "dev.mjs": "node ./script.cjs" } }"#,
+    )
+    .expect("write package.json");
+    std::fs::write(proj.join("script.cjs"), r#"console.log("script wins")"#)
+        .expect("write script target");
+    std::fs::write(
+        proj.join("dev.mjs"),
+        r#"console.log("file should not run")"#,
+    )
+    .expect("write file target");
+
+    meow()
+        .current_dir(&proj)
+        .arg("run")
+        .arg("dev.mjs")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("script wins"))
+        .stdout(predicate::str::contains("file should not run").not());
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[test]
+fn run_executes_pre_and_post_hooks_in_order() {
+    let proj = load_tmp("hooks");
+    std::fs::write(
+        proj.join("package.json"),
+        br#"{ "scripts": { "predev": "node ./step.cjs pre", "dev": "node ./step.cjs main", "postdev": "node ./step.cjs post" } }"#,
+    )
+    .expect("write package.json");
+    std::fs::write(
+        proj.join("step.cjs"),
+        r#"const fs = require("node:fs");
+let prev = "";
+try { prev = fs.readFileSync("order.txt", "utf8"); } catch {}
+fs.writeFileSync("order.txt", `${prev}${process.argv[2]}\n`);"#,
+    )
+    .expect("write hook script");
+
+    meow()
+        .current_dir(&proj)
+        .arg("run")
+        .arg("dev")
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(proj.join("order.txt")).expect("read order"),
+        "pre\nmain\npost\n"
+    );
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[test]
+fn run_stops_after_a_failing_pre_hook() {
+    let proj = load_tmp("pre-fail");
+    std::fs::write(
+        proj.join("package.json"),
+        br#"{ "scripts": { "predev": "node ./step.cjs pre 17", "dev": "node ./step.cjs main", "postdev": "node ./step.cjs post" } }"#,
+    )
+    .expect("write package.json");
+    std::fs::write(
+        proj.join("step.cjs"),
+        r#"const fs = require("node:fs");
+let prev = "";
+try { prev = fs.readFileSync("order.txt", "utf8"); } catch {}
+fs.writeFileSync("order.txt", `${prev}${process.argv[2]}\n`);
+process.exit(Number(process.argv[3] || 0));"#,
+    )
+    .expect("write hook script");
+
+    meow()
+        .current_dir(&proj)
+        .arg("run")
+        .arg("dev")
+        .assert()
+        .code(17);
+    assert_eq!(
+        std::fs::read_to_string(proj.join("order.txt")).expect("read order"),
+        "pre\n"
+    );
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[test]
+fn run_returns_the_post_hook_exit_code() {
+    let proj = load_tmp("post-fail");
+    std::fs::write(
+        proj.join("package.json"),
+        br#"{ "scripts": { "predev": "node ./step.cjs pre", "dev": "node ./step.cjs main", "postdev": "node ./step.cjs post 23" } }"#,
+    )
+    .expect("write package.json");
+    std::fs::write(
+        proj.join("step.cjs"),
+        r#"const fs = require("node:fs");
+let prev = "";
+try { prev = fs.readFileSync("order.txt", "utf8"); } catch {}
+fs.writeFileSync("order.txt", `${prev}${process.argv[2]}\n`);
+process.exit(Number(process.argv[3] || 0));"#,
+    )
+    .expect("write hook script");
+
+    meow()
+        .current_dir(&proj)
+        .arg("run")
+        .arg("dev")
+        .assert()
+        .code(23);
+    assert_eq!(
+        std::fs::read_to_string(proj.join("order.txt")).expect("read order"),
+        "pre\nmain\npost\n"
+    );
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn run_falls_back_to_the_shell_for_compound_scripts() {
+    let proj = load_tmp("shell");
+    std::fs::write(
+        proj.join("package.json"),
+        br#"{ "scripts": { "say": "echo hi && echo ok" } }"#,
+    )
+    .expect("write package.json");
+
+    meow()
+        .current_dir(&proj)
+        .arg("run")
+        .arg("say")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hi"))
+        .stdout(predicate::str::contains("ok"));
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[test]
+fn run_missing_script_and_file_is_an_honest_error() {
+    let proj = load_tmp("missing");
+    std::fs::write(
+        proj.join("package.json"),
+        br#"{ "scripts": { "dev": "node ./dev.cjs" } }"#,
+    )
+    .expect("write package.json");
+    std::fs::write(proj.join("dev.cjs"), r#"console.log("ok")"#).expect("write dev script");
+
+    meow()
+        .current_dir(&proj)
+        .arg("run")
+        .arg("missing")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot find missing"));
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[test]
+fn run_executes_a_cached_commonjs_package_bin_without_node_modules() {
+    use meow_pkg::{
+        Cache, LockEntry, Lockfile, PackageName, RegistryProvenance, Version, VersionReq,
+    };
+    use std::collections::BTreeMap;
+
+    let proj = load_tmp("bin");
+    let home = proj.join("home");
+    std::fs::create_dir_all(&home).expect("home dir");
+
+    let hash = Cache::in_home(&home)
+        .store(&npm_tarball(&[
+            (
+                "package.json",
+                "{\"name\":\"toolkit\",\"version\":\"1.0.0\",\"type\":\"commonjs\",\"bin\":{\"tool\":\"bin/tool.cjs\"}}",
+            ),
+            (
+                "bin/tool.cjs",
+                "const msg = require(\"../lib.cjs\");\nconsole.log(`BIN=${msg}`);\nconsole.log(`ARGV=${JSON.stringify(process.argv.slice(2))}`);\nconsole.log(`FILE=${__filename}`);\n",
+            ),
+            ("lib.cjs", "module.exports = \"from-bin\";\n"),
+        ]))
+        .expect("store toolkit blob");
+
+    let mut lockfile = Lockfile::new();
+    lockfile.upsert(LockEntry {
+        name: PackageName::new("toolkit"),
+        version: Version::parse("1.0.0").expect("version"),
+        integrity: hash,
+        dependencies: BTreeMap::new(),
+        registry: RegistryProvenance::new("https://registry.npmjs.org"),
+        capabilities: vec![],
+        wasm: vec![],
+        meow: VersionReq::parse(">=0.0.0").expect("req"),
+    });
+    lockfile
+        .write_canonical(&proj.join("meow.lock.jsonl"))
+        .expect("write lockfile");
+    std::fs::write(
+        proj.join("package.json"),
+        br#"{ "devDependencies": { "toolkit": "^1.0.0" }, "scripts": { "dev": "tool --from-script" } }"#,
+    )
+    .expect("write package.json");
+
+    meow()
+        .env("HOME", &home)
+        .current_dir(&proj)
+        .arg("run")
+        .arg("dev")
+        .arg("--")
+        .arg("from-cli")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("BIN=from-bin"))
+        .stdout(predicate::str::contains(
+            r#"ARGV=["--from-script","from-cli"]"#,
+        ))
+        .stdout(predicate::str::contains("FILE=").and(predicate::str::contains("unpacked")));
+    assert!(!proj.join("node_modules").exists(), "no node_modules (I-5)");
+    std::fs::remove_dir_all(&proj).ok();
 }
 
 #[test]
