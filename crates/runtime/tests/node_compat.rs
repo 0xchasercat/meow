@@ -94,6 +94,11 @@ async fn run_src(rt: &mut Runtime, spec: &str, src: &str) -> Result<(), RuntimeE
         .await
 }
 
+async fn run_file(rt: &mut Runtime, path: &Path) -> Result<(), RuntimeError> {
+    let specifier = ModuleSpecifier::from_file_path(path).expect("valid file specifier");
+    rt.run_main_module(&specifier).await
+}
+
 #[tokio::test]
 async fn node_path_bare_and_node_round_trip() {
     let proj = unique_dir("path");
@@ -244,6 +249,51 @@ async fn node_fs_equals_bare_fs() {
     .await
     .expect("module runs");
     assert_eq!(*out.borrow(), "true\n");
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[tokio::test]
+async fn commonjs_require_fs_and_node_fs_round_trip() {
+    let proj = unique_dir("cjs-fs");
+    let entry = proj.join("main.cjs");
+    std::fs::write(
+        &entry,
+        "const fs = require('fs');\nconst nodeFs = require('node:fs');\nconsole.log(String(fs === nodeFs) + ':' + typeof fs.readFileSync);\n",
+    )
+    .expect("write entry");
+    let (out, mut rt) = node_runtime(
+        node::NodeMode::Enabled,
+        &proj,
+        vec!["meow".to_owned(), entry.to_string_lossy().into_owned()],
+    );
+    run_file(&mut rt, &entry).await.expect("CommonJS fs runs");
+    assert_eq!(*out.borrow(), "true:function\n");
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[tokio::test]
+async fn strict_web_commonjs_still_parses_but_fs_is_withdrawn_at_use_time() {
+    let proj = unique_dir("strict-web-cjs");
+    let entry = proj.join("main.cjs");
+    std::fs::write(
+        &entry,
+        "const fs = require('fs');\ntry {\n  fs.readFileSync('nope');\n} catch (error) {\n  console.log(String(error.message ?? error));\n}\n",
+    )
+    .expect("write entry");
+    let (out, mut rt) = node_runtime(
+        node::NodeMode::StrictWeb,
+        &proj,
+        vec!["meow".to_owned(), entry.to_string_lossy().into_owned()],
+    );
+    run_file(&mut rt, &entry)
+        .await
+        .expect("strict-web CJS still instantiates");
+    assert!(
+        out.borrow()
+            .contains("strict-web mode withdraws node:fs access"),
+        "withdrawal stays at API use time: {}",
+        out.borrow()
+    );
     std::fs::remove_dir_all(&proj).ok();
 }
 

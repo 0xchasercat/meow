@@ -18,6 +18,9 @@
 //! return references valid until the next `&mut self`. Batch edits, then read
 //! (the rust-analyzer cadence). The incremental core is documented in [`db`].
 
+// === LOAD-004 ===
+mod cjs;
+// === /LOAD-004 ===
 mod cst;
 mod db;
 mod error;
@@ -26,6 +29,9 @@ mod ir;
 mod semantic;
 mod strip;
 
+// === LOAD-004 ===
+pub use crate::cjs::{analyze_cjs, CjsAnalysis};
+// === /LOAD-004 ===
 pub use crate::cst::Cst;
 pub use crate::error::{GraphError, StripDiagnostic};
 pub use crate::ids::FileId;

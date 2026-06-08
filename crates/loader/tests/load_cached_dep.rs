@@ -137,6 +137,20 @@ fn load_code(loader: &MeowModuleLoader, spec: &ModuleSpecifier) -> Result<String
     }
 }
 
+async fn run_entry(
+    loader: Rc<dyn ModuleLoader>,
+    entry: &Path,
+    extensions: Vec<deno_core::Extension>,
+) -> Result<(), meow_runtime::RuntimeError> {
+    let mut rt = Runtime::new(RuntimeOptions {
+        module_loader: loader,
+        extensions,
+    })
+    .expect("runtime initializes");
+    let spec = ModuleSpecifier::from_file_path(entry).expect("entry → file URL");
+    rt.run_main_module(&spec).await
+}
+
 #[tokio::test]
 async fn cached_dep_runs_end_to_end_with_no_node_modules() {
     let proj = unique_dir("e2e");
@@ -432,6 +446,331 @@ fn tampered_cache_blob_surfaces_integrity_error() {
             ResolveError::Cache(CacheError::IntegrityMismatch { .. })
         ),
         "integrity failure surfaces, got: {err:?}"
+    );
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[tokio::test]
+async fn first_party_js_commonjs_runs_end_to_end() {
+    let proj = unique_dir("first-party-js-cjs");
+    let entry = proj.join("app.js");
+    std::fs::write(proj.join("dep.cjs"), "module.exports = { answer: 42 };\n").expect("write dep");
+    std::fs::write(
+        &entry,
+        "const dep = require('./dep.cjs');\nconsole.log(dep.answer);\n",
+    )
+    .expect("write entry");
+
+    let resolver = resolver_with(&proj.join("cache"), Lockfile::new(), BTreeMap::new(), &proj);
+    let loader: Rc<dyn ModuleLoader> = Rc::new(MeowModuleLoader::new(
+        resolver,
+        Rc::new(RefCell::new(GraphDb::new())),
+    ));
+    let (out, sink_ext) = capture();
+    run_entry(loader, &entry, vec![sink_ext])
+        .await
+        .expect("first-party CommonJS runs");
+
+    assert_eq!(*out.borrow(), "42\n");
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[tokio::test]
+async fn esm_imports_cached_cjs_dependency() {
+    let proj = unique_dir("cached-cjs-esm");
+    let cache_root = proj.join("cache");
+    let cache = Cache::with_root(&cache_root);
+    let dep_hash = cache
+        .store(&archive(&[
+            (
+                "package.json",
+                br#"{"name":"dep","version":"1.0.0","type":"commonjs","exports":"./index.js"}"#,
+            ),
+            ("index.js", b"module.exports = { kind: 'cache-cjs' };\n"),
+        ]))
+        .expect("store dep blob");
+
+    let mut lockfile = Lockfile::new();
+    lockfile.upsert(lock_entry("dep", "1.0.0", dep_hash, &[]));
+    let entry = proj.join("main.mjs");
+    std::fs::write(&entry, "import dep from 'dep';\nconsole.log(dep.kind);\n")
+        .expect("write entry");
+
+    let resolver = resolver_with(&cache_root, lockfile, root_deps(&[("dep", "1.0.0")]), &proj);
+    let loader: Rc<dyn ModuleLoader> = Rc::new(MeowModuleLoader::new(
+        resolver,
+        Rc::new(RefCell::new(GraphDb::new())),
+    ));
+    let (out, sink_ext) = capture();
+    run_entry(loader, &entry, vec![sink_ext])
+        .await
+        .expect("cached CJS dependency imports");
+
+    assert_eq!(*out.borrow(), "cache-cjs\n");
+    assert!(!proj.join("node_modules").exists());
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[tokio::test]
+async fn commonjs_require_uses_require_export_condition_for_cached_dep() {
+    let proj = unique_dir("require-conditions");
+    let cache_root = proj.join("cache");
+    let cache = Cache::with_root(&cache_root);
+    let dep_hash = cache
+        .store(&archive(&[
+            (
+                "package.json",
+                br#"{"name":"dep","version":"1.0.0","type":"module","exports":{".":{"import":"./esm/index.js","require":"./cjs/index.cjs","default":"./fallback.js"}}}"#,
+            ),
+            ("esm/index.js", b"export default { kind: 'esm' };\n"),
+            ("cjs/index.cjs", b"module.exports = { kind: 'cjs' };\n"),
+            ("fallback.js", b"export default { kind: 'fallback' };\n"),
+        ]))
+        .expect("store dep blob");
+
+    let mut lockfile = Lockfile::new();
+    lockfile.upsert(lock_entry("dep", "1.0.0", dep_hash, &[]));
+    let entry = proj.join("main.cjs");
+    std::fs::write(
+        &entry,
+        "const dep = require('dep');\nconsole.log(dep.kind);\n",
+    )
+    .expect("write entry");
+
+    let resolver = resolver_with(&cache_root, lockfile, root_deps(&[("dep", "1.0.0")]), &proj);
+    let loader: Rc<dyn ModuleLoader> = Rc::new(MeowModuleLoader::new(
+        resolver,
+        Rc::new(RefCell::new(GraphDb::new())),
+    ));
+    let (out, sink_ext) = capture();
+    run_entry(loader, &entry, vec![sink_ext])
+        .await
+        .expect("require branch runs");
+
+    assert_eq!(*out.borrow(), "cjs\n");
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[tokio::test]
+async fn esm_imports_cjs_default_named_and_reassignment() {
+    let proj = unique_dir("cjs-named");
+    std::fs::write(
+        proj.join("legacy.cjs"),
+        "exports.foo = 1;\nObject.defineProperty(exports, 'bar', { enumerable: true, value: 2 });\nmodule.exports = { foo: 3, bar: 4, answer: 42 };\n",
+    )
+    .expect("write cjs");
+    let entry = proj.join("main.mjs");
+    std::fs::write(
+        &entry,
+        "import legacy, { foo, bar } from './legacy.cjs';\nconsole.log(JSON.stringify({ answer: legacy.answer, foo, bar }));\n",
+    )
+    .expect("write entry");
+
+    let resolver = resolver_with(&proj.join("cache"), Lockfile::new(), BTreeMap::new(), &proj);
+    let loader: Rc<dyn ModuleLoader> = Rc::new(MeowModuleLoader::new(
+        resolver,
+        Rc::new(RefCell::new(GraphDb::new())),
+    ));
+    let (out, sink_ext) = capture();
+    run_entry(loader, &entry, vec![sink_ext])
+        .await
+        .expect("ESM imports CJS");
+
+    assert_eq!(*out.borrow(), "{\"answer\":42,\"foo\":3,\"bar\":4}\n");
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[tokio::test]
+async fn circular_commonjs_sees_partial_exports_object() {
+    let proj = unique_dir("cjs-cycle");
+    std::fs::write(
+        proj.join("a.cjs"),
+        "exports.done = false;\nconst b = require('./b.cjs');\nexports.seen = b.done;\nexports.done = true;\n",
+    )
+    .expect("write a");
+    std::fs::write(
+        proj.join("b.cjs"),
+        "exports.done = false;\nconst a = require('./a.cjs');\nexports.seen = a.done;\nexports.done = true;\n",
+    )
+    .expect("write b");
+    let entry = proj.join("main.mjs");
+    std::fs::write(
+        &entry,
+        "import a from './a.cjs';\nimport b from './b.cjs';\nconsole.log(JSON.stringify({ aSeen: a.seen, aDone: a.done, bSeen: b.seen, bDone: b.done }));\n",
+    )
+    .expect("write entry");
+
+    let resolver = resolver_with(&proj.join("cache"), Lockfile::new(), BTreeMap::new(), &proj);
+    let loader: Rc<dyn ModuleLoader> = Rc::new(MeowModuleLoader::new(
+        resolver,
+        Rc::new(RefCell::new(GraphDb::new())),
+    ));
+    let (out, sink_ext) = capture();
+    run_entry(loader, &entry, vec![sink_ext])
+        .await
+        .expect("cycle runs");
+
+    assert_eq!(
+        *out.borrow(),
+        "{\"aSeen\":true,\"aDone\":true,\"bSeen\":false,\"bDone\":true}\n"
+    );
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[tokio::test]
+async fn repeated_require_returns_the_same_object() {
+    let proj = unique_dir("repeat-require");
+    std::fs::write(
+        proj.join("dep.cjs"),
+        "let calls = 0;\nmodule.exports = { next() { calls += 1; return calls; } };\n",
+    )
+    .expect("write dep");
+    let entry = proj.join("main.cjs");
+    std::fs::write(
+        &entry,
+        "const a = require('./dep.cjs');\nconst b = require('./dep.cjs');\nconsole.log(JSON.stringify([a === b, a.next(), b.next()]));\n",
+    )
+    .expect("write entry");
+
+    let resolver = resolver_with(&proj.join("cache"), Lockfile::new(), BTreeMap::new(), &proj);
+    let loader: Rc<dyn ModuleLoader> = Rc::new(MeowModuleLoader::new(
+        resolver,
+        Rc::new(RefCell::new(GraphDb::new())),
+    ));
+    let (out, sink_ext) = capture();
+    run_entry(loader, &entry, vec![sink_ext])
+        .await
+        .expect("repeat require runs");
+
+    assert_eq!(*out.borrow(), "[true,1,2]\n");
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[tokio::test]
+async fn dirname_and_filename_use_real_local_and_unpacked_cached_paths() {
+    let proj = unique_dir("dirname-filename");
+    let cache_root = proj.join("cache");
+    let cache = Cache::with_root(&cache_root);
+    let dep_hash = cache
+        .store(&archive(&[
+            (
+                "package.json",
+                br#"{"name":"dep","version":"1.0.0","type":"commonjs","exports":"./lib/index.cjs"}"#,
+            ),
+            (
+                "lib/index.cjs",
+                b"module.exports = { dirname: __dirname, filename: __filename };\n",
+            ),
+        ]))
+        .expect("store dep blob");
+    let mut lockfile = Lockfile::new();
+    lockfile.upsert(lock_entry("dep", "1.0.0", dep_hash.clone(), &[]));
+
+    let local = proj.join("local.cjs");
+    std::fs::write(
+        &local,
+        "module.exports = { dirname: __dirname, filename: __filename };\n",
+    )
+    .expect("write local");
+    let entry = proj.join("main.mjs");
+    std::fs::write(
+        &entry,
+        "import local from './local.cjs';\nimport cached from 'dep';\nconsole.log(JSON.stringify({ local, cached }));\n",
+    )
+    .expect("write entry");
+
+    let resolver = resolver_with(&cache_root, lockfile, root_deps(&[("dep", "1.0.0")]), &proj);
+    let loader: Rc<dyn ModuleLoader> = Rc::new(MeowModuleLoader::new(
+        resolver,
+        Rc::new(RefCell::new(GraphDb::new())),
+    ));
+    let (out, sink_ext) = capture();
+    run_entry(loader, &entry, vec![sink_ext])
+        .await
+        .expect("path metadata runs");
+
+    let value: serde_json::Value = serde_json::from_str(out.borrow().trim()).expect("json");
+    let cached_root = cache_root.join("unpacked").join(dep_hash.to_url_host());
+    assert_eq!(value["local"]["dirname"], proj.to_string_lossy().as_ref());
+    assert_eq!(value["local"]["filename"], local.to_string_lossy().as_ref());
+    assert_eq!(
+        value["cached"]["dirname"],
+        cached_root.join("lib").to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        value["cached"]["filename"],
+        cached_root
+            .join("lib")
+            .join("index.cjs")
+            .to_string_lossy()
+            .as_ref()
+    );
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[tokio::test]
+async fn dynamic_require_without_prewalk_is_an_honest_error() {
+    let proj = unique_dir("dynamic-require");
+    std::fs::write(proj.join("dep.cjs"), "module.exports = 42;\n").expect("write dep");
+    let entry = proj.join("main.cjs");
+    std::fs::write(&entry, "const name = './dep.cjs';\nrequire(name);\n").expect("write entry");
+
+    let resolver = resolver_with(&proj.join("cache"), Lockfile::new(), BTreeMap::new(), &proj);
+    let loader: Rc<dyn ModuleLoader> = Rc::new(MeowModuleLoader::new(
+        resolver,
+        Rc::new(RefCell::new(GraphDb::new())),
+    ));
+    let err = run_entry(loader, &entry, vec![])
+        .await
+        .expect_err("dynamic require must fail");
+    let detail = err.to_string();
+    assert!(detail.contains("./dep.cjs"), "specifier is named: {detail}");
+    assert!(detail.contains("LOAD-005"), "legacy pointer kept: {detail}");
+    assert!(
+        detail.contains(entry.to_string_lossy().as_ref()),
+        "referrer is named: {detail}"
+    );
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[tokio::test]
+async fn erasable_typescript_commonjs_runs() {
+    let proj = unique_dir("ts-cjs");
+    std::fs::write(proj.join("dep.cjs"), "module.exports = { value: 42 };\n").expect("write dep");
+    let entry = proj.join("main.ts");
+    std::fs::write(
+        &entry,
+        "const dep: { value: number } = require('./dep.cjs');\nconsole.log(dep.value);\nmodule.exports = dep;\n",
+    )
+    .expect("write entry");
+
+    let resolver = resolver_with(&proj.join("cache"), Lockfile::new(), BTreeMap::new(), &proj);
+    let loader: Rc<dyn ModuleLoader> = Rc::new(MeowModuleLoader::new(
+        resolver,
+        Rc::new(RefCell::new(GraphDb::new())),
+    ));
+    let (out, sink_ext) = capture();
+    run_entry(loader, &entry, vec![sink_ext])
+        .await
+        .expect("TS CommonJS runs");
+
+    assert_eq!(*out.borrow(), "42\n");
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[test]
+fn ts_export_equals_is_an_honest_commonjs_load_error() {
+    let proj = unique_dir("ts-export-equals");
+    let entry = proj.join("main.ts");
+    std::fs::write(&entry, "const value = 1;\nexport = value;\n").expect("write entry");
+
+    let resolver = resolver_with(&proj.join("cache"), Lockfile::new(), BTreeMap::new(), &proj);
+    let loader = MeowModuleLoader::new(resolver, Rc::new(RefCell::new(GraphDb::new())));
+    let spec = ModuleSpecifier::from_file_path(&entry).expect("file URL");
+    let err = load_code(&loader, &spec).expect_err("export = must fail honestly");
+    assert!(
+        err.contains("export ="),
+        "typed strip diagnostic kept: {err}"
     );
     std::fs::remove_dir_all(&proj).ok();
 }

@@ -94,9 +94,9 @@ pub enum ModuleLocator {
 pub enum ModuleKind {
     Esm,
     Json,
-    /// A *dependency* CJS module (`.cjs`, or `.js` under `"type":"commonjs"`). LOAD-003 resolves
-    /// its LOCATION + format faithfully; synthetic ESM wrapping/execution is LOAD-004 (P5). Until
-    /// then the loader surfaces `ResolveError::CjsDependencyUnsupported` (honest boundary, I-11).
+    /// A CommonJS module (`.cjs`, or `.js` under `"type":"commonjs"`). LOAD-003 resolves
+    /// its LOCATION + format faithfully; LOAD-004 consumes that classification and lowers
+    /// it into runnable synthetic ESM / sync-require interop in the shared loader.
     Cjs,
 }
 ```
@@ -206,8 +206,8 @@ InvalidPackageTarget { package: String, target: String },
 InvalidManifest { package: String, reason: String },
 #[error("malformed package archive for {package:?}: {reason}")]
 InvalidArchive { package: String, reason: String },
-#[error("dependency {package:?} module {member:?} is CommonJS; CJS interop lands in LOAD-004")]
-CjsDependencyUnsupported { package: String, member: String },
+// LOAD-004 removes the old CJS refusal: `ModuleKind::Cjs` is now the successful
+// handoff into synthetic wrapping / execution in `crates/loader/src/lib.rs`.
 ```
 
 ### Behaviors (the acceptance bar)
@@ -247,7 +247,7 @@ Extends `crates/loader` (no new workspace member). Files: `src/resolver.rs` (alg
 Shared-file edits — comment-marker fences (`// === LOAD-003 ===`):
 - `crates/loader/src/resolver.rs` — remove the `bare` stand-in (and its `package_name` bare-only branch is folded into the new bare procedure); fence the new constructor + algorithm.
 - `crates/loader/src/url.rs` — fence the authority-form `encode(pkg, member)` / `decode → (ContentHash, member)`; the old single-arg `encode(hash)` is removed.
-- `crates/loader/src/lib.rs` — fence: `load` reads the resolved `Cached{package,member}` via `Resolver::resolve`; `graph_path_for` uses the member's real extension; map `ModuleKind::Json` → `deno_core::ModuleType::Json`, `Cjs` → the `CjsDependencyUnsupported` error until LOAD-004.
+- `crates/loader/src/lib.rs` — fence: `load` reads the resolved `Cached{package,member}` via `Resolver::resolve`; `graph_path_for` uses the member's real extension; `ModuleKind::Json` stays a JSON module and `ModuleKind::Cjs` is the handoff LOAD-004 consumes for wrapping/execution.
 - `crates/pkg/src/hash.rs` — fence `// === LOAD-003 ===`: add `ContentHash::to_url_host(&self) -> String` (`"<algo>-<lowerhex>"`, reuses `to_hex`) and `from_url_host(&str) -> Result<ContentHash, ParseHashError>` (hex round-trip), so the URL authority round-trips without leaking base64 `/`+`=` into a host. (Small, additive; flagged for Main — see Operator notes.)
 - The run path (`meow run`) where `Resolver::new` is called — fence: build `root_deps` from the project config/lockfile + load the `Lockfile`, drop the `bare` map.
 
@@ -263,7 +263,7 @@ Each corpus case: build a `PackageFs` from a synthetic in-memory archive (or `Ca
 - **Subpath patterns:** `"./feat/*"` longest-match over a competing `"./feat/special"` exact key; `*` capture expanded into the target; `..`-escaping target → `InvalidPackageTarget`.
 - **Self-reference:** importing own name resolves via own `exports`; a subpath not in own `exports` → `SubpathNotExported`.
 - **Nested deps + multi-version:** A→B@1, C→B@2 each resolve their own B archive; B reached only via the owner's `LockEntry.dependencies` (no global flattening).
-- **`main`/`type`/extensionless:** legacy `main` resolves the bare name; extensionless `./x` → `x.js`/`x/index.js`; `"type":"module"` makes `.js` ESM, absent `type` makes `.js` Cjs → `CjsDependencyUnsupported`; `.json` → `ModuleKind::Json` → `ModuleType::Json`.
+- **`main`/`type`/extensionless:** legacy `main` resolves the bare name; extensionless `./x` → `x.js`/`x/index.js`; `"type":"module"` makes `.js` ESM, absent `type` makes `.js` Cjs (now executed by LOAD-004 rather than refused); `.json` → `ModuleKind::Json` → `ModuleType::Json`.
 - **`imports`:** `#internal` resolves via the owning package's `imports`; undefined `#x` → `ImportNotDefined`.
 - **Encapsulation:** a real member that exists in the archive but is not listed in `exports` is **not** reachable (→ `SubpathNotExported`), proving `exports` is authoritative.
 - **No `node_modules` (I-5, `resolver-parity`):** after a full corpus run, assert no path containing `node_modules` was opened and none exists; every resolved dep URL is `meow-cache://…`.

@@ -15,14 +15,14 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use deno_core::url::Url;
-use meow_pkg::{Cache, CacheError, ContentHash, Lockfile, PackageName, Version};
-
+use meow_pkg::{Cache, CacheError, ContentHash, Lockfile, PackageName, UnpackedStore, Version};
 use meow_runtime::native::NativeModuleSource;
 
 use crate::package::{Exports, ExportsTarget, PackageFs, PackageJson};
 use crate::url as virtual_url;
 
-/// Active ESM import conditions, applied in a FIXED meow priority order.
+// === LOAD-004 ===
+/// Active import-context conditions, applied in a FIXED meow priority order.
 ///
 /// Honest divergence from Node (I-11): Node selects the first matching key in the
 /// package.json conditions object in *author insertion order*; meow instead applies
@@ -30,10 +30,30 @@ use crate::url as virtual_url;
 /// order is not preserved). For an object listing both `node` and `import`, meow
 /// deterministically prefers `import` regardless of the authored order — a
 /// deliberate, documented choice (LOAD-003 Operator note 2), not byte-for-byte Node
-/// ESM. `require` is intentionally excluded (CJS context, LOAD-004).
-const CONDITIONS: [&str; 4] = ["meow", "import", "node", "default"];
+/// ESM.
+const IMPORT_CONDITIONS: [&str; 4] = ["meow", "import", "node", "default"];
+/// The same resolver in CommonJS `require()` context: only the condition set changes.
+const REQUIRE_CONDITIONS: [&str; 4] = ["meow", "require", "node", "default"];
+// === /LOAD-004 ===
 const EXTENSIONS: [&str; 4] = [".js", ".mjs", ".cjs", ".json"];
 const INDEX_FILES: [&str; 4] = ["index.js", "index.mjs", "index.cjs", "index.json"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// === LOAD-004 ===
+enum ResolveContext {
+    Import,
+    Require,
+}
+
+impl ResolveContext {
+    fn conditions(self) -> &'static [&'static str] {
+        match self {
+            Self::Import => &IMPORT_CONDITIONS,
+            Self::Require => &REQUIRE_CONDITIONS,
+        }
+    }
+}
+// === /LOAD-004 ===
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModuleKind {
@@ -59,6 +79,9 @@ pub enum ModuleLocator {
 #[derive(Debug, Clone)]
 pub struct ResolvedModule {
     pub url: Url,
+    // === LOAD-004 ===
+    pub locator: ModuleLocator,
+    // === /LOAD-004 ===
     pub source: Arc<str>,
     pub kind: ModuleKind,
 }
@@ -69,12 +92,6 @@ pub enum ResolveError {
     SpecifierNotFound { specifier: String, referrer: Url },
     #[error("bare specifier {name:?} is not resolvable — run `meow install`")]
     BareSpecifierNotInLockfile { name: String },
-    #[error(
-        "first-party CommonJS is not supported — meow is ESM-only (I-2 / ADR-3); \
-         rewrite {} as an ES module (.mjs/.js)",
-        .path.display()
-    )]
-    FirstPartyCjs { path: PathBuf },
     #[error("unsupported module URL scheme {scheme:?} in {url}")]
     UnsupportedScheme { scheme: String, url: Url },
     #[error("reading {}", .path.display())]
@@ -107,8 +124,10 @@ pub enum ResolveError {
     InvalidManifest { package: String, reason: String },
     #[error("malformed package archive for {package:?}: {reason}")]
     InvalidArchive { package: String, reason: String },
-    #[error("dependency {package:?} module {member:?} is CommonJS; CJS interop lands in LOAD-004")]
-    CjsDependencyUnsupported { package: String, member: String },
+    // === LOAD-004 ===
+    #[error("cached package {package:?} could not be projected for CommonJS paths: {reason}")]
+    UnpackedPath { package: String, reason: String },
+    // === /LOAD-004 ===
     // === RT-005 ===
     #[error(
         "unknown meow:{name} — available meow:* modules: {available}; fix the import or run on a meow runtime that provides it"
@@ -187,6 +206,31 @@ impl Resolver {
             .map(|(name, _version)| name.to_string())
             .unwrap_or_else(|| hash.to_sri())
     }
+    // === LOAD-004 ===
+    pub(crate) fn runtime_path_for(
+        &self,
+        locator: &ModuleLocator,
+    ) -> Result<PathBuf, ResolveError> {
+        match locator {
+            ModuleLocator::LocalFile(path) => Ok(path.clone()),
+            ModuleLocator::Cached { package, member } => {
+                let store =
+                    UnpackedStore::new(self.cache.root().join("unpacked"), self.cache.clone());
+                let root = store.ensure(package).map_err(|err| match err {
+                    meow_pkg::MaterializeError::CacheBlob { source, .. } => {
+                        ResolveError::Cache(source)
+                    }
+                    other => ResolveError::UnpackedPath {
+                        package: self.package_label(package),
+                        reason: other.to_string(),
+                    },
+                })?;
+                Ok(root.join(member))
+            }
+            ModuleLocator::Native { name } => Ok(PathBuf::from("meow-native").join(name)),
+        }
+    }
+    // === /LOAD-004 ===
     // === RT-005 ===
     fn native_available_list(&self, node_builtin: bool) -> String {
         if node_builtin {
@@ -254,6 +298,25 @@ impl Resolver {
         specifier: &str,
         referrer: &Url,
     ) -> Result<(Url, ModuleLocator), ResolveError> {
+        self.locate_with_context(specifier, referrer, ResolveContext::Import)
+    }
+
+    // === LOAD-004 ===
+    pub fn locate_require(
+        &self,
+        specifier: &str,
+        referrer: &Url,
+    ) -> Result<(Url, ModuleLocator), ResolveError> {
+        self.locate_with_context(specifier, referrer, ResolveContext::Require)
+    }
+    // === /LOAD-004 ===
+
+    fn locate_with_context(
+        &self,
+        specifier: &str,
+        referrer: &Url,
+        context: ResolveContext,
+    ) -> Result<(Url, ModuleLocator), ResolveError> {
         if let Ok(url) = Url::parse(specifier) {
             // === RT-005 ===
             if url.scheme() == "meow" {
@@ -278,25 +341,44 @@ impl Resolver {
             return self.finalize_joined(joined, specifier, referrer);
         }
         if specifier.starts_with('#') {
-            return self.locate_package_import(specifier, referrer);
+            return self.locate_package_import(specifier, referrer, context);
         }
         // === RT-005 ===
         if let Some(name) = specifier.strip_prefix("meow:") {
             return self.locate_native(name);
         }
         // === /RT-005 ===
-        self.locate_bare(specifier, referrer)
+        self.locate_bare(specifier, referrer, context)
     }
 
     pub fn resolve(&self, specifier: &str, referrer: &Url) -> Result<ResolvedModule, ResolveError> {
-        let (url, locator) = self.locate(specifier, referrer)?;
-        let (bytes, kind) = match &locator {
+        self.resolve_with_context(specifier, referrer, ResolveContext::Import)
+    }
+
+    // === LOAD-004 ===
+    pub fn resolve_require(
+        &self,
+        specifier: &str,
+        referrer: &Url,
+    ) -> Result<ResolvedModule, ResolveError> {
+        self.resolve_with_context(specifier, referrer, ResolveContext::Require)
+    }
+    // === /LOAD-004 ===
+
+    fn resolve_with_context(
+        &self,
+        specifier: &str,
+        referrer: &Url,
+        context: ResolveContext,
+    ) -> Result<ResolvedModule, ResolveError> {
+        let (url, locator) = self.locate_with_context(specifier, referrer, context)?;
+        let kind = self.module_kind(&locator)?;
+        let bytes = match &locator {
             ModuleLocator::LocalFile(path) => {
-                let bytes = std::fs::read(path).map_err(|source| ResolveError::Io {
+                std::fs::read(path).map_err(|source| ResolveError::Io {
                     path: path.clone(),
                     source,
-                })?;
-                (bytes, local_file_kind(path))
+                })?
             }
             ModuleLocator::Cached { package, member } => {
                 let fs = self.package_fs(package)?;
@@ -306,29 +388,38 @@ impl Resolver {
                         specifier: url.to_string(),
                         referrer: referrer.clone(),
                     })?;
-                (bytes.as_ref().to_vec(), cached_file_kind(member, &fs))
+                bytes.as_ref().to_vec()
             }
             // === RT-005 ===
-            ModuleLocator::Native { name } => {
-                let bytes = self
-                    .native
-                    .source(name)
-                    .ok_or_else(|| ResolveError::UnknownNativeModule {
-                        name: name.clone(),
-                        available: self.native_available_list(name.starts_with("node:")),
-                    })?
-                    .as_bytes()
-                    .to_vec();
-                (bytes, ModuleKind::Esm)
-            } // === /RT-005 ===
+            ModuleLocator::Native { name } => self
+                .native
+                .source(name)
+                .ok_or_else(|| ResolveError::UnknownNativeModule {
+                    name: name.clone(),
+                    available: self.native_available_list(name.starts_with("node:")),
+                })?
+                .as_bytes()
+                .to_vec(), // === /RT-005 ===
         };
         let source =
             String::from_utf8(bytes).map_err(|_| ResolveError::NotUtf8 { url: url.clone() })?;
         Ok(ResolvedModule {
             url,
+            locator,
             source: Arc::from(source),
             kind,
         })
+    }
+
+    fn module_kind(&self, locator: &ModuleLocator) -> Result<ModuleKind, ResolveError> {
+        match locator {
+            ModuleLocator::LocalFile(path) => local_file_kind(path),
+            ModuleLocator::Cached { package, member } => {
+                let fs = self.package_fs(package)?;
+                Ok(cached_file_kind(member, &fs))
+            }
+            ModuleLocator::Native { .. } => Ok(ModuleKind::Esm),
+        }
     }
 
     fn locate_url(&self, url: Url) -> Result<(Url, ModuleLocator), ResolveError> {
@@ -340,9 +431,6 @@ impl Resolver {
                         specifier: url.to_string(),
                         referrer: self.project_root.clone(),
                     })?;
-                if is_cjs_path(&path) {
-                    return Err(ResolveError::FirstPartyCjs { path });
-                }
                 Ok((url, ModuleLocator::LocalFile(path)))
             }
             virtual_url::SCHEME => {
@@ -422,6 +510,7 @@ impl Resolver {
         &self,
         specifier: &str,
         referrer: &Url,
+        context: ResolveContext,
     ) -> Result<(Url, ModuleLocator), ResolveError> {
         let owner = self.owner_for_referrer(referrer)?;
         let Some(imports) = owner
@@ -435,7 +524,7 @@ impl Resolver {
         };
         if let Some(target) = imports.get(specifier) {
             return self.target_resolution_to_locator(
-                self.package_target_resolve(&owner, target, None, specifier)?,
+                self.package_target_resolve(&owner, target, None, specifier, context)?,
             );
         }
         if let Some((target, capture)) = longest_pattern_match(imports, specifier) {
@@ -444,6 +533,7 @@ impl Resolver {
                 target,
                 Some(capture),
                 specifier,
+                context,
             )?);
         }
         Err(ResolveError::ImportNotDefined {
@@ -456,6 +546,7 @@ impl Resolver {
         &self,
         specifier: &str,
         referrer: &Url,
+        context: ResolveContext,
     ) -> Result<(Url, ModuleLocator), ResolveError> {
         let owner = self.owner_for_referrer(referrer)?;
         let (package_name_text, subpath) = parse_package_specifier(specifier);
@@ -477,6 +568,7 @@ impl Resolver {
                 &owner,
                 exports,
                 &subpath_for_exports(subpath),
+                context,
             )?);
         }
 
@@ -510,7 +602,12 @@ impl Resolver {
 
         let resolution =
             if let Some(exports) = dep_owner.manifest().and_then(|m| m.exports.as_ref()) {
-                self.package_exports_resolve(&dep_owner, exports, &subpath_for_exports(subpath))?
+                self.package_exports_resolve(
+                    &dep_owner,
+                    exports,
+                    &subpath_for_exports(subpath),
+                    context,
+                )?
             } else {
                 self.legacy_package_resolve(&dep_owner, subpath)?
             };
@@ -624,9 +721,6 @@ impl Resolver {
     }
 
     fn local_target(&self, path: PathBuf) -> Result<(Url, ModuleLocator), ResolveError> {
-        if is_cjs_path(&path) {
-            return Err(ResolveError::FirstPartyCjs { path });
-        }
         let url = Url::from_file_path(&path).map_err(|()| ResolveError::SpecifierNotFound {
             specifier: path.display().to_string(),
             referrer: self.project_root.clone(),
@@ -639,6 +733,7 @@ impl Resolver {
         owner: &OwnerPackage,
         exports: &Exports,
         subpath: &str,
+        context: ResolveContext,
     ) -> Result<TargetResolution, ResolveError> {
         match exports {
             Exports::Single(ExportsTarget::Conditions(map)) if is_conditions_map(map) => {
@@ -648,14 +743,20 @@ impl Resolver {
                         subpath: subpath.to_owned(),
                     });
                 }
-                self.condition_target_resolve(owner, map, None, subpath)
+                self.condition_target_resolve(owner, map, None, subpath, context)
             }
             Exports::Single(ExportsTarget::Conditions(map)) => {
                 if let Some(target) = map.get(subpath) {
-                    return self.package_target_resolve(owner, target, None, subpath);
+                    return self.package_target_resolve(owner, target, None, subpath, context);
                 }
                 if let Some((target, capture)) = longest_pattern_match(map, subpath) {
-                    return self.package_target_resolve(owner, target, Some(capture), subpath);
+                    return self.package_target_resolve(
+                        owner,
+                        target,
+                        Some(capture),
+                        subpath,
+                        context,
+                    );
                 }
                 Err(ResolveError::SubpathNotExported {
                     package: owner.label(),
@@ -669,7 +770,7 @@ impl Resolver {
                         subpath: subpath.to_owned(),
                     });
                 }
-                self.package_target_resolve(owner, target, None, subpath)
+                self.package_target_resolve(owner, target, None, subpath, context)
             }
             Exports::Map(map) if is_conditions_map(map) => {
                 if subpath != "." {
@@ -678,14 +779,20 @@ impl Resolver {
                         subpath: subpath.to_owned(),
                     });
                 }
-                self.condition_target_resolve(owner, map, None, subpath)
+                self.condition_target_resolve(owner, map, None, subpath, context)
             }
             Exports::Map(map) => {
                 if let Some(target) = map.get(subpath) {
-                    return self.package_target_resolve(owner, target, None, subpath);
+                    return self.package_target_resolve(owner, target, None, subpath, context);
                 }
                 if let Some((target, capture)) = longest_pattern_match(map, subpath) {
-                    return self.package_target_resolve(owner, target, Some(capture), subpath);
+                    return self.package_target_resolve(
+                        owner,
+                        target,
+                        Some(capture),
+                        subpath,
+                        context,
+                    );
                 }
                 Err(ResolveError::SubpathNotExported {
                     package: owner.label(),
@@ -701,16 +808,17 @@ impl Resolver {
         map: &BTreeMap<String, ExportsTarget>,
         capture: Option<&str>,
         subpath: &str,
+        context: ResolveContext,
     ) -> Result<TargetResolution, ResolveError> {
-        for condition in CONDITIONS {
+        for &condition in context.conditions() {
             if let Some(target) = map.get(condition) {
-                return self.package_target_resolve(owner, target, capture, subpath);
+                return self.package_target_resolve(owner, target, capture, subpath, context);
             }
         }
         Err(ResolveError::NoMatchingCondition {
             package: owner.label(),
             subpath: subpath.to_owned(),
-            tried: CONDITIONS.to_vec(),
+            tried: context.conditions().to_vec(),
         })
     }
 
@@ -720,6 +828,7 @@ impl Resolver {
         target: &ExportsTarget,
         capture: Option<&str>,
         subpath: &str,
+        context: ResolveContext,
     ) -> Result<TargetResolution, ResolveError> {
         match target {
             ExportsTarget::Path(path) => {
@@ -750,12 +859,12 @@ impl Resolver {
                 }
             }
             ExportsTarget::Conditions(map) => {
-                self.condition_target_resolve(owner, map, capture, subpath)
+                self.condition_target_resolve(owner, map, capture, subpath, context)
             }
             ExportsTarget::Fallback(list) => {
                 let mut last = None;
                 for item in list {
-                    match self.package_target_resolve(owner, item, capture, subpath) {
+                    match self.package_target_resolve(owner, item, capture, subpath, context) {
                         Ok(resolution) => return Ok(resolution),
                         Err(err) => last = Some(err),
                     }
@@ -763,7 +872,7 @@ impl Resolver {
                 Err(last.unwrap_or_else(|| ResolveError::NoMatchingCondition {
                     package: owner.label(),
                     subpath: subpath.to_owned(),
-                    tried: CONDITIONS.to_vec(),
+                    tried: context.conditions().to_vec(),
                 }))
             }
             ExportsTarget::Blocked => Err(ResolveError::SubpathBlocked {
@@ -1087,12 +1196,51 @@ fn cached_file_kind(member: &str, fs: &PackageFs) -> ModuleKind {
     }
 }
 
-fn local_file_kind(path: &Path) -> ModuleKind {
+// === LOAD-004 ===
+fn local_file_kind(path: &Path) -> Result<ModuleKind, ResolveError> {
     match path.extension().and_then(|ext| ext.to_str()) {
-        Some("json") => ModuleKind::Json,
-        _ => ModuleKind::Esm,
+        Some("json") => Ok(ModuleKind::Json),
+        Some("mjs") | Some("mts") => Ok(ModuleKind::Esm),
+        Some("cjs") | Some("cts") => Ok(ModuleKind::Cjs),
+        Some("js") => {
+            if nearest_local_package_type(path)?.as_deref() == Some("module") {
+                Ok(ModuleKind::Esm)
+            } else {
+                Ok(ModuleKind::Cjs)
+            }
+        }
+        _ => Ok(ModuleKind::Esm),
     }
 }
+
+fn nearest_local_package_type(path: &Path) -> Result<Option<String>, ResolveError> {
+    let mut current = path.parent();
+    while let Some(dir) = current {
+        let manifest_path = dir.join("package.json");
+        match std::fs::read(&manifest_path) {
+            Ok(bytes) => {
+                let manifest: PackageJson = serde_json::from_slice(&bytes).map_err(|err| {
+                    ResolveError::InvalidManifest {
+                        package: manifest_path.display().to_string(),
+                        reason: err.to_string(),
+                    }
+                })?;
+                return Ok(manifest.package_type);
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                current = dir.parent();
+            }
+            Err(source) => {
+                return Err(ResolveError::Io {
+                    path: manifest_path,
+                    source,
+                });
+            }
+        }
+    }
+    Ok(None)
+}
+// === /LOAD-004 ===
 
 fn package_name(specifier: &str) -> &str {
     if let Some(rest) = specifier.strip_prefix('@') {
@@ -1108,10 +1256,6 @@ fn package_name(specifier: &str) -> &str {
             None => specifier,
         }
     }
-}
-
-fn is_cjs_path(path: &Path) -> bool {
-    matches!(path.extension().and_then(|ext| ext.to_str()), Some("cjs"))
 }
 
 #[cfg(test)]
@@ -1158,15 +1302,33 @@ mod tests {
     }
 
     #[test]
-    fn first_party_cjs_is_refused() {
+    fn first_party_cjs_locates_and_resolves_as_cjs() {
         let dir = unique_dir("cjs");
         std::fs::write(dir.join("legacy.cjs"), "module.exports = 1;\n").expect("write module");
         let resolver = resolver(&dir);
         let referrer = Url::from_file_path(dir.join("main.mjs")).expect("referrer URL");
-        let err = resolver
+        let (url, locator) = resolver
             .locate("./legacy.cjs", &referrer)
-            .expect_err(".cjs is refused");
-        assert!(matches!(err, ResolveError::FirstPartyCjs { .. }));
+            .expect(".cjs resolves");
+        assert_eq!(url, Url::from_file_path(dir.join("legacy.cjs")).unwrap());
+        assert!(matches!(locator, ModuleLocator::LocalFile(_)));
+        let resolved = resolver
+            .resolve("./legacy.cjs", &referrer)
+            .expect(".cjs resolves");
+        assert_eq!(resolved.kind, ModuleKind::Cjs);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn local_js_defaults_to_commonjs_without_type_module() {
+        let dir = unique_dir("commonjs-js");
+        std::fs::write(dir.join("legacy.js"), "module.exports = 1;\n").expect("write module");
+        let resolver = resolver(&dir);
+        let referrer = Url::from_file_path(dir.join("main.mjs")).expect("referrer URL");
+        let resolved = resolver
+            .resolve("./legacy.js", &referrer)
+            .expect(".js resolves");
+        assert_eq!(resolved.kind, ModuleKind::Cjs);
         std::fs::remove_dir_all(&dir).ok();
     }
 

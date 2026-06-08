@@ -63,6 +63,9 @@ pub fn native_module_registry() -> Arc<dyn NativeModuleSource> {
 pub fn native_module_source(name: &str) -> Option<&'static str> {
     match name {
         "http" => Some(include_str!("js/meow/http.ts")),
+        // === LOAD-004 ===
+        "internal/cjs" => Some(include_str!("js/meow/cjs.ts")),
+        // === /LOAD-004 ===
         // === RT-007 ===
         "node:buffer" => Some(include_str!("js/node/buffer.ts")),
         "node:events" => Some(include_str!("js/node/events.ts")),

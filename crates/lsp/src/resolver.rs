@@ -9,8 +9,9 @@ use meow_runtime::native::NativeModuleSource;
 /// Editor-facing entry point over THE shared resolver.
 ///
 /// This stays locate-only by design: editor parity is about resolving a specifier
-/// to the same URL + locator the runtime would use. CommonJS refusal happens later,
-/// in the runtime load path, after resolution has already agreed.
+/// to the same URL + locator the runtime would use. LOAD-004 moved CommonJS from a
+/// runtime-load refusal into a runtime-load lowering path, so the editor still
+/// stops at locate parity and does not execute or wrap modules itself.
 pub struct EditorResolver {
     resolver: Resolver,
     store: UnpackedStore,

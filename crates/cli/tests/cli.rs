@@ -150,19 +150,22 @@ fn run_surfaces_uncaught_errors_without_panicking() {
 }
 
 #[test]
-fn run_refuses_first_party_cjs() {
-    // First-party CommonJS is refused in every mode (I-2 / ADR-3) — never executed.
+fn run_executes_first_party_cjs() {
     let tmp = std::env::temp_dir().join(format!("meow-run-cjs-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).expect("temp dir");
     let entry = tmp.join("app.cjs");
-    std::fs::write(&entry, r#"console.log("nope")"#).expect("write entry");
+    std::fs::write(
+        &entry,
+        r#"module.exports = { value: "ok" }; console.log(module.exports.value)"#,
+    )
+    .expect("write entry");
     meow()
         .arg("run")
         .arg(&entry)
         .assert()
-        .failure()
-        .stdout(predicate::str::contains("nope").not())
-        .stderr(predicate::str::contains("CommonJS"));
+        .success()
+        .stdout(predicate::str::contains("ok"))
+        .stderr(predicate::str::contains("CommonJS").not());
     std::fs::remove_dir_all(&tmp).ok();
 }
 

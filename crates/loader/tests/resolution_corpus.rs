@@ -443,10 +443,10 @@ fn legacy_main_extensionless_json_and_cjs_boundary_work_end_to_end() {
         _ => panic!("expected synchronous json load"),
     }
 
-    let cjs_err = load_result(&loader, &cjs_spec).expect_err("cjs load is refused");
+    let cjs_code = load_result(&loader, &cjs_spec).expect("cjs load succeeds");
     assert!(
-        cjs_err.contains("CommonJS"),
-        "cjs boundary is honest: {cjs_err}"
+        cjs_code.contains("__meowExecute"),
+        "cjs load now returns a synthetic wrapper: {cjs_code}"
     );
 
     assert!(

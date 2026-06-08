@@ -408,7 +408,7 @@ fn runtime_and_editor_share_locate_time_error_variants() {
 }
 
 #[test]
-fn runtime_load_rejects_cjs_after_shared_resolution() {
+fn runtime_load_accepts_cjs_after_shared_resolution() {
     let fixture = fixture();
     let native = meow_runtime::native::native_module_registry();
     let runtime_resolver = Resolver::from_resolution(
@@ -460,10 +460,10 @@ fn runtime_load_rejects_cjs_after_shared_resolution() {
     );
     assert_eq!(runtime_kind, ModuleKind::Cjs);
 
-    let load_err = load_result(&loader, &runtime_url).expect_err("runtime must refuse CJS load");
+    let loaded = load_result(&loader, &runtime_url).expect("runtime loads CJS");
     assert!(
-        load_err.contains("CommonJS"),
-        "load error stays honest: {load_err}"
+        loaded.contains("__meowExecute"),
+        "runtime now lowers CJS into a synthetic wrapper: {loaded}"
     );
     assert!(!fixture.project.join("node_modules").exists());
 
