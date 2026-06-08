@@ -65,7 +65,7 @@ pub enum Command {
     Profile(RunArgs),
     /// Environment / config / lockfile health.
     Doctor,
-    /// Regenerate shadow configs (.meow/tsconfig.json, root package.json) — ADR-8.
+    /// Regenerate shadow configs (.meow/tsconfig.json + root tsconfig.json shim).
     Sync,
     /// Regenerate or verify the committed `meow:*` declarations (RT-005 / types-fresh).
     Types(TypesArgs),
@@ -246,9 +246,6 @@ impl Cli {
             // === /RT-001 ===
             // HONEST stub (CRAFT — "the action must DO the work"): no fake success path.
             // Structured, single-line, machine-greppable; stderr only; non-zero exit.
-            // === CFG-002 ===
-            Command::Doctor => cmd_doctor(),
-            // === /CFG-002 ===
             // === OBS-001 ===
             Command::WhyDep(args) => cmd_why_dep(&args),
             // === /OBS-001 ===
@@ -390,66 +387,16 @@ fn cmd_sync() -> ExitCode {
     }
     // === /RT-005 ===
     // === /RT-004 ===
-    // === CFG-002 ===
-    // Generate the OWNED root package.json projection from meow.config (ADR-8) —
-    // the surface npm/pnpm/IDEs/`npm publish` read. `meow` owns + overwrites it.
-    if let Err(err) = meow_config::generate_root_package_json(&cfg, &root) {
-        eprintln!("meow sync: {err}");
-        return ExitCode::FAILURE;
-    }
-    // === /CFG-002 ===
+    // === CFG-003 ===
+    // `package.json` is user-owned after CANON Amendment 001; sync refreshes only
+    // the tsconfig/type shadows and never rewrites package.json.
+    // === /CFG-003 ===
     println!(
-        "meow sync: regenerated .meow/tsconfig.json + .meow/strict-web.d.ts + .meow/types/meow/*.d.ts + tsconfig.json shim + package.json"
+        "meow sync: regenerated .meow/tsconfig.json + .meow/strict-web.d.ts + .meow/types/meow/*.d.ts + tsconfig.json shim"
     );
     ExitCode::SUCCESS
 }
 // === /CFG-001 ===
-
-// === CFG-002 ===
-/// `meow doctor` — CFG-002 owns ONLY the root package.json staleness/hand-edit
-/// check (the full doctor surface is a later spec). Read-only; never mutates.
-fn cmd_doctor() -> ExitCode {
-    let root = match std::env::current_dir() {
-        Ok(dir) => dir,
-        Err(err) => {
-            eprintln!("meow doctor: cannot resolve the current directory: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let cfg = match meow_config::MeowConfig::load(&root) {
-        Ok(cfg) => cfg,
-        Err(err) => {
-            eprintln!("meow doctor: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
-    match meow_config::classify_root_package_json(&cfg, &root) {
-        Ok(status) => {
-            use meow_config::PackageJsonStatus::{Fresh, HandEdited, Missing, Stale};
-            match status {
-                Fresh => println!("package.json: in sync"),
-                Missing => println!("package.json: missing — run `meow sync`"),
-                Stale => eprintln!(
-                    "warning: root package.json is out of sync with meow.config; meow owns it \
-                     (ADR-8) and `meow sync` will regenerate it, overwriting any manual edits. \
-                     Edit publishing metadata in meow.config.ts."
-                ),
-                HandEdited => eprintln!(
-                    "warning: root package.json was hand-edited; meow owns it (ADR-8) and \
-                     `meow sync` will overwrite it. Move publishing metadata into meow.config.ts."
-                ),
-            }
-            // NOTE: package.json staleness is the ONLY check CFG-002's doctor performs;
-            // the full environment/config/lockfile health surface is a later spec.
-            ExitCode::SUCCESS
-        }
-        Err(err) => {
-            eprintln!("meow doctor: {err}");
-            ExitCode::FAILURE
-        }
-    }
-}
-// === /CFG-002 ===
 
 // === OBS-001 ===
 /// `meow why-dep <name>` — trace the dependency path(s) from the project's direct
@@ -470,20 +417,29 @@ fn cmd_why_dep(args: &WhyDepArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let config = match meow_config::MeowConfig::load(&root) {
-        Ok(cfg) => cfg,
+    // === CFG-003 ===
+    let package_json = match meow_config::PackageJson::read(&root) {
+        Ok(package_json) => package_json,
         Err(err) => {
             eprintln!("meow why-dep: {err}");
             return ExitCode::FAILURE;
         }
     };
-    let roots = match meow_pkg::resolve_roots(&config.dependencies, &lockfile) {
+    let direct = match package_json.direct_dependencies() {
+        Ok(direct) => direct,
+        Err(err) => {
+            eprintln!("meow why-dep: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let roots = match meow_pkg::resolve_roots(&direct, &lockfile) {
         Ok(roots) => roots,
         Err(err) => {
             eprintln!("meow why-dep: {err}");
             return ExitCode::FAILURE;
         }
     };
+    // === /CFG-003 ===
     let mode = if args.shortest {
         meow_obs::PathMode::Shortest
     } else {
@@ -509,7 +465,7 @@ fn cmd_why_dep(args: &WhyDepArgs) -> ExitCode {
 
     if !report.found {
         eprintln!(
-            "meow: `{}` is not in the dependency tree (no path from any direct dependency in meow.lock.jsonl)",
+            "meow: `{}` is not in the dependency tree (no path from any direct dependency in package.json)",
             args.pkg
         );
         return ExitCode::FAILURE;
@@ -664,14 +620,7 @@ fn cmd_install(args: &InstallArgs) -> ExitCode {
     };
 
     let registry = NpmRegistry::npm();
-    let mut cfg = match load_install_config(&root) {
-        Ok(cfg) => cfg,
-        Err(err) => {
-            eprintln!("meow install: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
-
+    // === CFG-003 ===
     for package in &args.packages {
         let (name, req) = match requested_dependency(&registry, package) {
             Ok(dep) => dep,
@@ -680,15 +629,26 @@ fn cmd_install(args: &InstallArgs) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        cfg.dependencies.insert(name, req);
-    }
-
-    if !args.packages.is_empty() {
-        if let Err(err) = meow_config::write_json_config(&cfg, &root) {
+        if let Err(err) = meow_config::add_dependency(&root, name, req) {
             eprintln!("meow install: {err}");
             return ExitCode::FAILURE;
         }
     }
+    let package_json = match load_install_package_json(&root) {
+        Ok(package_json) => package_json,
+        Err(err) => {
+            eprintln!("meow install: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let direct_deps = match package_json.direct_dependencies() {
+        Ok(direct_deps) => direct_deps,
+        Err(err) => {
+            eprintln!("meow install: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // === /CFG-003 ===
 
     let cache = meow_pkg::Cache::in_home(crate::host::host_home());
     let meow_req = match runtime_meow_requirement() {
@@ -698,8 +658,7 @@ fn cmd_install(args: &InstallArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let direct = cfg
-        .dependencies
+    let direct = direct_deps
         .iter()
         .map(|(name, req)| (name.clone(), meow_pkg::DepSpec::Range(req.clone())))
         .collect::<BTreeMap<_, _>>();
@@ -719,14 +678,10 @@ fn cmd_install(args: &InstallArgs) -> ExitCode {
         eprintln!("meow install: {err}");
         return ExitCode::FAILURE;
     }
-    if let Err(err) = meow_config::generate_root_package_json(&cfg, &root) {
-        eprintln!("meow install: {err}");
-        return ExitCode::FAILURE;
-    }
 
     // === PKG-004 ===
     if let Some(opts) = projection {
-        let roots = match meow_pkg::resolve_roots(&cfg.dependencies, &lockfile) {
+        let roots = match meow_pkg::resolve_roots(&direct_deps, &lockfile) {
             Ok(roots) => roots,
             Err(err) => {
                 eprintln!("meow install: {err}");
@@ -779,13 +734,17 @@ fn cmd_install(args: &InstallArgs) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn load_install_config(root: &Path) -> Result<meow_config::MeowConfig, String> {
-    match meow_config::MeowConfig::load(root) {
-        Ok(cfg) => Ok(cfg),
-        Err(meow_config::ConfigError::NotFound(_)) => Ok(meow_config::MeowConfig::default()),
+// === CFG-003 ===
+fn load_install_package_json(root: &Path) -> Result<meow_config::PackageJson, String> {
+    match meow_config::PackageJson::read(root) {
+        Ok(package_json) => Ok(package_json),
+        Err(meow_config::ConfigError::PackageJsonNotFound(_)) => {
+            Ok(meow_config::PackageJson::default())
+        }
         Err(err) => Err(err.to_string()),
     }
 }
+// === /CFG-003 ===
 
 fn requested_dependency(
     registry: &NpmRegistry,
@@ -1008,9 +967,8 @@ fn cmd_run(
         // === LOAD-001 ===
         // Build THE resolver + content-addressed cache loader. The binary edge owns
         // ambient reads (I-6): it resolves the project root + host home and reads
-        // meow.lock.jsonl. P1 does not yet have a root-entry mechanism, so the
-        // direct-dependency map is empty by default; LOAD-003 still owns all real
-        // package resolution once the caller supplies that map.
+        // meow.lock.jsonl, then derives the root-dependency map from package.json
+        // when present (with a lockfile-only fallback for local-only runs).
         let entry_dir = abs.parent().unwrap_or(&abs);
         let project_dir = find_project_root(entry_dir);
         let project_root = match meow_runtime::ModuleSpecifier::from_directory_path(&project_dir) {
@@ -1030,7 +988,7 @@ fn cmd_run(
                 return ExitCode::FAILURE;
             }
         };
-        // === PKG-002 ===
+        // === CFG-003 ===
         let root_deps = match load_declared_root_deps(&project_dir, &lockfile) {
             Ok(deps) => deps,
             Err(err) => {
@@ -1038,7 +996,7 @@ fn cmd_run(
                 return ExitCode::FAILURE;
             }
         };
-        // === /PKG-002 ===
+        // === /CFG-003 ===
         // === PKG-003 ===
         let cache = std::sync::Arc::new(meow_pkg::Cache::in_home(crate::host::host_home()));
         let graph =
@@ -1152,22 +1110,23 @@ fn load_lockfile(
     meow_pkg::Lockfile::read(&lock_path)
 }
 
-// === PKG-002 ===
-/// Derive runtime roots from the declared config when available. A missing config
-/// keeps the P1 fallback (unique lockfile names only) so local-only runs still work;
-/// a TS-only config with a non-empty lockfile is an honest error until config TS
-/// evaluation lands.
+// === CFG-003 ===
+/// Derive runtime roots from package.json when present. A missing package.json
+/// keeps the lockfile-only fallback so local-only runs still work.
 fn load_declared_root_deps(
     project_root: &Path,
     lockfile: &meow_pkg::Lockfile,
 ) -> Result<BTreeMap<meow_pkg::PackageName, meow_pkg::Version>, String> {
-    match meow_config::MeowConfig::load(project_root) {
-        Ok(cfg) => meow_pkg::resolve_roots(&cfg.dependencies, lockfile).map_err(|err| err.to_string()),
-        Err(meow_config::ConfigError::NotFound(_)) => fallback_root_deps_from_lockfile(lockfile),
-        Err(meow_config::ConfigError::TsNotSupported) if lockfile.is_empty() => Ok(BTreeMap::new()),
-        Err(meow_config::ConfigError::TsNotSupported) => Err(
-            "meow.config.ts exists but cannot be evaluated yet, so root dependencies cannot be derived from a non-empty meow.lock.jsonl; provide meow.config.json for now".to_owned(),
-        ),
+    match meow_config::PackageJson::read(project_root) {
+        Ok(package_json) => {
+            let direct = package_json
+                .direct_dependencies()
+                .map_err(|err| err.to_string())?;
+            meow_pkg::resolve_roots(&direct, lockfile).map_err(|err| err.to_string())
+        }
+        Err(meow_config::ConfigError::PackageJsonNotFound(_)) => {
+            fallback_root_deps_from_lockfile(lockfile)
+        }
         Err(err) => Err(err.to_string()),
     }
 }
@@ -1179,14 +1138,14 @@ fn fallback_root_deps_from_lockfile(
     for entry in lockfile.iter() {
         if let Some(prev) = deps.insert(entry.name.clone(), entry.version.clone()) {
             return Err(format!(
-                "lockfile pins multiple versions of `{}` ({prev}, {}) — root resolution is ambiguous without meow.config dependencies; run `meow install` or add meow.config.json",
+                "lockfile pins multiple versions of `{}` ({prev}, {}) — root resolution is ambiguous without package.json; run `meow install` or add package.json",
                 entry.name, entry.version
             ));
         }
     }
     Ok(deps)
 }
-// === /PKG-002 ===
+// === /CFG-003 ===
 // === /LOAD-001 ===
 
 #[cfg(test)]

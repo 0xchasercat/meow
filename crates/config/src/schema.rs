@@ -8,7 +8,6 @@
 //! is one closed schema). Maps use `BTreeMap` so serialization is deterministically
 //! key-sorted, which feeds byte-stable shadow regeneration.
 
-use meow_pkg::{PackageName, VersionReq};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -35,50 +34,12 @@ pub struct MeowConfig {
     pub test: TestConfig,
     #[serde(default)]
     pub permissions: Permissions,
-    // === PKG-002 ===
-    /// Direct dependencies: package name -> semver requirement. This is the SINGLE
-    /// human-edited dependency source; `meow install` resolves and pins it into
-    /// `meow.lock.jsonl`. `BTreeMap` keeps JSON key order byte-stable.
-    #[serde(default)]
-    pub dependencies: BTreeMap<PackageName, VersionReq>,
-    // === /PKG-002 ===
-    // === CFG-002 ===
-    /// Publishing metadata projected into the generated root `package.json` (ADR-8).
-    /// `meow.config.ts` is the SOLE authority for that file; package.json is derived.
-    #[serde(default)]
-    pub publish: Publish,
-    // === /CFG-002 ===
+    // === CFG-003 ===
+    // `package.json` is the authority for dependencies, scripts, workspaces,
+    // and project metadata after CANON Amendment 001. `MeowConfig` remains
+    // runtime-behavior-only.
+    // === /CFG-003 ===
 }
-
-// === CFG-002 ===
-/// Publishing metadata projected into the generated root `package.json` (ADR-8).
-/// `meow.config.ts` is the SOLE authority for that file; `package.json` is derived,
-/// owned, and overwritten by `meow` (it has no `extends`, so the shim trick used
-/// for `tsconfig` cannot apply — CANON §18.1).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct Publish {
-    /// → `package.json.name`. Absent ⇒ field omitted (a config may be private/unnamed).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// → `package.json.version`. Absent ⇒ omitted.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
-    /// → `package.json.description`. Absent ⇒ omitted.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    /// → `package.json.license`. Absent ⇒ omitted.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub license: Option<String>,
-    /// → `package.json.private`, emitted only when `true`.
-    #[serde(default)]
-    pub private: bool,
-    /// Subpath → target, projected verbatim into `package.json.exports`. `BTreeMap`
-    /// ⇒ key-sorted ⇒ byte-stable (feeds idempotent regeneration).
-    #[serde(default)]
-    pub exports: BTreeMap<String, String>,
-}
-// === /CFG-002 ===
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

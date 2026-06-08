@@ -1,4 +1,4 @@
-//! Integration tests for `meow-config` (CFG-001).
+//! Integration tests for `meow-config` (CFG-001 / CFG-003).
 //!
 //! Mapped to the gated invariants:
 //! - I-9 (`types-fresh`): generated artifacts are marked + regenerate to identical bytes.
@@ -6,10 +6,9 @@
 //! - I-11 (`honesty`): the TS-eval boundary is reported, never faked.
 
 use meow_config::{
-    add_dependency, classify_root_package_json, generate_root_package_json,
-    generate_shadow_tsconfig, remove_dependency, render_root_package_json,
-    write_root_tsconfig_shim, write_shadow_types, ConfigError, MeowConfig, PackageJsonStatus,
-    PackageName, Publish, VersionReq, GENERATED_HEADER, PACKAGE_JSON_MARKER, ROOT_TSCONFIG_SHIM,
+    add_dependency, generate_shadow_tsconfig, remove_dependency, write_root_tsconfig_shim,
+    write_shadow_types, ConfigError, MeowConfig, PackageJson, PackageName, VersionReq,
+    GENERATED_HEADER, ROOT_TSCONFIG_SHIM,
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -24,8 +23,7 @@ impl TempDir {
     fn new() -> TempDir {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("meow-config-it-{}-{}", std::process::id(), n));
+        let path = std::env::temp_dir().join(format!("meow-config-it-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&path).expect("create temp dir");
         TempDir { path }
     }
@@ -220,31 +218,48 @@ fn load_minimal_config_takes_canon_defaults() {
 }
 
 #[test]
-fn load_dependencies_are_typed() {
+fn load_legacy_dependencies_field_is_rejected() {
     let tmp = TempDir::new();
     std::fs::write(
         tmp.path().join("meow.config.json"),
         br#"{ "dependencies": { "p-limit": "^5.0.0" } }"#,
     )
-    .expect("seed deps");
+    .expect("seed legacy dependency field");
 
-    let cfg = MeowConfig::load(tmp.path()).expect("config with deps loads");
-    assert_eq!(
-        cfg.dependencies
-            .get(&PackageName::new("p-limit"))
-            .expect("typed dep")
-            .as_str(),
-        "^5.0.0"
-    );
-    assert!(
-        MeowConfig::default().dependencies.is_empty(),
-        "default deps empty"
-    );
+    let err = MeowConfig::load(tmp.path()).expect_err("legacy dependency field must error");
+    assert!(matches!(err, ConfigError::Parse { .. }), "got {err:?}");
 }
 
 #[test]
-fn add_and_remove_dependency_round_trip_json_config() {
+fn load_legacy_publish_field_is_rejected() {
     let tmp = TempDir::new();
+    std::fs::write(
+        tmp.path().join("meow.config.json"),
+        br#"{ "publish": { "name": "demo" } }"#,
+    )
+    .expect("seed legacy publish field");
+
+    let err = MeowConfig::load(tmp.path()).expect_err("legacy publish field must error");
+    assert!(matches!(err, ConfigError::Parse { .. }), "got {err:?}");
+}
+
+// --- CFG-003: package.json mutation -----------------------------------------------
+
+#[test]
+fn add_and_remove_dependency_round_trip_package_json() {
+    let tmp = TempDir::new();
+    std::fs::write(
+        tmp.path().join("package.json"),
+        r#"{
+  "name": "demo",
+  "scripts": {
+    "dev": "vite"
+  }
+}
+"#,
+    )
+    .expect("seed package.json");
+
     let added = add_dependency(
         tmp.path(),
         PackageName::new("dep"),
@@ -255,19 +270,76 @@ fn add_and_remove_dependency_round_trip_json_config() {
         added
             .dependencies
             .get(&PackageName::new("dep"))
-            .expect("added dep")
-            .as_str(),
-        "^1.2.3"
+            .map(String::as_str),
+        Some("^1.2.3")
     );
+    assert_eq!(added.scripts.get("dev").map(String::as_str), Some("vite"));
 
-    let loaded = MeowConfig::load(tmp.path()).expect("load added dep");
-    assert_eq!(loaded.dependencies, added.dependencies);
+    let raw: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join("package.json")).expect("read package.json"),
+    )
+    .expect("package.json remains valid JSON");
+    assert_eq!(raw["name"], "demo");
+    assert_eq!(raw["scripts"]["dev"], "vite");
+    assert_eq!(raw["dependencies"]["dep"], "^1.2.3");
 
     let removed = remove_dependency(tmp.path(), &PackageName::new("dep")).expect("remove dep");
     assert!(
         removed.dependencies.is_empty(),
-        "dependency removed from persisted config"
+        "dependency removed from persisted package.json"
     );
+
+    let removed_json = PackageJson::read(tmp.path()).expect("read updated package.json");
+    assert!(
+        removed_json.dependencies.is_empty(),
+        "dependencies field removed"
+    );
+    let raw: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join("package.json")).expect("read package.json"),
+    )
+    .expect("package.json remains valid JSON");
+    assert!(
+        raw.get("dependencies").is_none(),
+        "empty dependencies object is removed"
+    );
+    assert_eq!(raw["scripts"]["dev"], "vite");
+}
+
+#[test]
+fn add_dependency_creates_package_json_when_missing() {
+    let tmp = TempDir::new();
+
+    let added = add_dependency(
+        tmp.path(),
+        PackageName::new("dep"),
+        VersionReq::parse("^1.0.0").expect("range"),
+    )
+    .expect("add dep");
+
+    assert_eq!(
+        added
+            .dependencies
+            .get(&PackageName::new("dep"))
+            .map(String::as_str),
+        Some("^1.0.0")
+    );
+    assert!(
+        tmp.path().join("package.json").is_file(),
+        "package.json created"
+    );
+}
+
+#[test]
+fn remove_dependency_requires_existing_package_json() {
+    let tmp = TempDir::new();
+    let err = remove_dependency(tmp.path(), &PackageName::new("dep"))
+        .expect_err("missing package.json must error");
+    match err {
+        ConfigError::PackageJsonNotFound(path) => {
+            assert_eq!(path, tmp.path().join("package.json"));
+        }
+        other => panic!("got {other:?}, want PackageJsonNotFound"),
+    }
 }
 
 // --- mapping fidelity -------------------------------------------------------------
@@ -345,138 +417,4 @@ fn write_shadow_types_writes_verbatim_and_nests() {
     let nested =
         std::fs::read_to_string(tmp.path().join(".meow/types/meow/http.d.ts")).expect("nested");
     assert_eq!(nested, "export declare function serve(): void;\n");
-}
-
-// --- CFG-002: root package.json projection ----------------------------------
-
-fn cfg_with_publish(publish: Publish) -> MeowConfig {
-    MeowConfig {
-        publish,
-        ..MeowConfig::default()
-    }
-}
-
-#[test]
-fn package_json_projection_is_faithful() {
-    let cfg = cfg_with_publish(Publish {
-        name: Some("my-svc".into()),
-        version: Some("1.2.3".into()),
-        exports: std::collections::BTreeMap::from([(
-            ".".to_string(),
-            "./dist/index.js".to_string(),
-        )]),
-        ..Publish::default()
-    });
-    let json: serde_json::Value =
-        serde_json::from_str(&render_root_package_json(&cfg)).expect("valid JSON");
-    assert_eq!(json["name"], "my-svc");
-    assert_eq!(json["version"], "1.2.3");
-    assert_eq!(json["type"], "module", "first-party is ESM-only (I-2)");
-    assert_eq!(json["exports"]["."], "./dist/index.js");
-    assert_eq!(json["//"], PACKAGE_JSON_MARKER, "provenance marker present");
-}
-
-#[test]
-fn minimal_config_projects_valid_minimal_json() {
-    let json: serde_json::Value =
-        serde_json::from_str(&render_root_package_json(&MeowConfig::default()))
-            .expect("valid JSON");
-    assert_eq!(json["//"], PACKAGE_JSON_MARKER);
-    assert_eq!(json["type"], "module");
-    assert!(json.get("name").is_none(), "absent name omitted");
-    assert!(json.get("version").is_none());
-    assert!(json.get("exports").is_none());
-    assert!(json.get("private").is_none(), "private omitted when false");
-}
-
-#[test]
-fn package_json_is_byte_stable_and_idempotent() {
-    let tmp = TempDir::new();
-    let cfg = cfg_with_publish(Publish {
-        name: Some("x".into()),
-        ..Publish::default()
-    });
-    assert_eq!(
-        render_root_package_json(&cfg),
-        render_root_package_json(&cfg)
-    );
-
-    let path = tmp.path().join("package.json");
-    generate_root_package_json(&cfg, tmp.path()).expect("gen 1");
-    let first = std::fs::read(&path).expect("read 1");
-    let mtime1 = std::fs::metadata(&path).unwrap().modified().unwrap();
-    generate_root_package_json(&cfg, tmp.path()).expect("gen 2");
-    let second = std::fs::read(&path).expect("read 2");
-    let mtime2 = std::fs::metadata(&path).unwrap().modified().unwrap();
-    assert_eq!(first, second, "regeneration is byte-identical");
-    assert_eq!(
-        mtime1, mtime2,
-        "unchanged file is not rewritten (mtime stable)"
-    );
-}
-
-#[test]
-fn package_json_status_is_tri_state() {
-    let tmp = TempDir::new();
-    let cfg_a = cfg_with_publish(Publish {
-        version: Some("1.0.0".into()),
-        ..Publish::default()
-    });
-    // (a) absent => Missing.
-    assert_eq!(
-        classify_root_package_json(&cfg_a, tmp.path()).unwrap(),
-        PackageJsonStatus::Missing
-    );
-    // (b) exact projection => Fresh.
-    generate_root_package_json(&cfg_a, tmp.path()).expect("gen");
-    assert_eq!(
-        classify_root_package_json(&cfg_a, tmp.path()).unwrap(),
-        PackageJsonStatus::Fresh
-    );
-    // (c) generated by cfg_a, classified vs a changed cfg => Stale (marker present).
-    let cfg_b = cfg_with_publish(Publish {
-        version: Some("2.0.0".into()),
-        ..Publish::default()
-    });
-    assert_eq!(
-        classify_root_package_json(&cfg_b, tmp.path()).unwrap(),
-        PackageJsonStatus::Stale
-    );
-    // (d) hand-written, no marker => HandEdited.
-    std::fs::write(
-        tmp.path().join("package.json"),
-        "{\n  \"name\": \"hand\"\n}\n",
-    )
-    .unwrap();
-    assert_eq!(
-        classify_root_package_json(&cfg_a, tmp.path()).unwrap(),
-        PackageJsonStatus::HandEdited
-    );
-    // (e) unparseable bytes => HandEdited (not a hard error).
-    std::fs::write(tmp.path().join("package.json"), "not json {{").unwrap();
-    assert_eq!(
-        classify_root_package_json(&cfg_a, tmp.path()).unwrap(),
-        PackageJsonStatus::HandEdited
-    );
-}
-
-#[test]
-fn sync_owns_and_clobbers_handwritten_package_json() {
-    let tmp = TempDir::new();
-    std::fs::write(
-        tmp.path().join("package.json"),
-        "{ \"name\": \"hand\", \"type\": \"commonjs\" }\n",
-    )
-    .unwrap();
-    let cfg = cfg_with_publish(Publish {
-        name: Some("owned".into()),
-        ..Publish::default()
-    });
-    generate_root_package_json(&cfg, tmp.path()).expect("gen");
-    let json: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(tmp.path().join("package.json")).unwrap())
-            .unwrap();
-    assert_eq!(json["name"], "owned", "hand-edit clobbered (ADR-8 owned)");
-    assert_eq!(json["type"], "module");
-    assert_eq!(json["//"], PACKAGE_JSON_MARKER);
 }

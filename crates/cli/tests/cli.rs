@@ -62,14 +62,15 @@ const CASES: &[(&[&str], &str, &str)] = &[
     (&["why-large"], "why-large", "P6"),
     (&["trace", "x.ts"], "trace", "P6"),
     (&["profile", "x.ts"], "profile", "P6"),
+    (&["doctor"], "doctor", "P6"),
 ];
 
 #[test]
 fn every_subcommand_stub_is_honest() {
     assert_eq!(
         CASES.len(),
-        13,
-        "13 stub subcommands (sync/run — CFG-001/RT-001; install — PKG-002; doctor — CFG-002; why-dep — OBS-001)"
+        14,
+        "14 stub subcommands (sync/run/install/types/why-dep are real; doctor reverts to the P6 stub after CFG-003 retires package.json ownership)"
     );
     for (argv, verb, phase) in CASES {
         let expected = format!("meow: not yet implemented — `{verb}` lands in PLAN {phase}");
@@ -106,6 +107,10 @@ fn sync_generates_shadow_configs() {
     assert!(
         tmp.join("tsconfig.json").is_file(),
         "root tsconfig.json shim generated"
+    );
+    assert!(
+        !tmp.join("package.json").exists(),
+        "sync must not generate or overwrite package.json"
     );
     std::fs::remove_dir_all(&tmp).ok();
 }
@@ -244,9 +249,9 @@ fn run_strips_and_runs_typescript_entry() {
 }
 
 #[test]
-fn run_imports_a_cached_dependency_with_no_node_modules() {
-    // A bare import resolves from the content-addressed cache (no node_modules, I-5).
-    // The edge reads meow.lock.jsonl + the host home's ~/.meow/cache.
+fn run_imports_a_cached_dev_dependency_from_stock_package_json() {
+    // A stock package.json project's devDependencies participate in direct root
+    // resolution; no meow.config.json is required.
     use meow_pkg::{
         Cache, LockEntry, Lockfile, PackageName, RegistryProvenance, Version, VersionReq,
     };
@@ -283,10 +288,10 @@ fn run_imports_a_cached_dependency_with_no_node_modules() {
         .write_canonical(&proj.join("meow.lock.jsonl"))
         .expect("write lockfile");
     std::fs::write(
-        proj.join("meow.config.json"),
-        br#"{ "dependencies": { "dep": "^1.0.0" } }"#,
+        proj.join("package.json"),
+        br#"{ "devDependencies": { "dep": "^1.0.0" } }"#,
     )
-    .expect("write config");
+    .expect("write package.json");
 
     let entry = proj.join("main.ts");
     std::fs::write(
@@ -327,8 +332,8 @@ fn run_rejects_non_erasable_typescript_with_an_honest_diagnostic() {
 #[test]
 fn run_finds_root_lockfile_from_a_nested_entry() {
     // Finding 1: the lockfile lives at the project ROOT and the entry is nested at
-    // `src/main.ts`. `meow run src/main.ts` must climb to the root lockfile (not
-    // look for `src/meow.lock.jsonl`) so the pinned bare import resolves.
+    // `src/main.ts`. `meow run src/main.ts` must climb to the root lockfile + root
+    // package.json (not look for `src/meow.lock.jsonl`) so the pinned bare import resolves.
     use meow_pkg::{
         Cache, LockEntry, Lockfile, PackageName, RegistryProvenance, Version, VersionReq,
     };
@@ -363,10 +368,10 @@ fn run_finds_root_lockfile_from_a_nested_entry() {
         .write_canonical(&proj.join("meow.lock.jsonl"))
         .expect("write lockfile");
     std::fs::write(
-        proj.join("meow.config.json"),
+        proj.join("package.json"),
         br#"{ "dependencies": { "dep": "^1.0.0" } }"#,
     )
-    .expect("write config");
+    .expect("write package.json");
 
     let src = proj.join("src");
     std::fs::create_dir_all(&src).expect("src dir");
@@ -434,7 +439,7 @@ fn run_rejects_a_lockfile_with_duplicate_package_names() {
 #[test]
 #[ignore = "real network reality-check"]
 fn install_real_registry_package_and_run_without_node_modules() {
-    use meow_pkg::{resolve_roots, Lockfile, PackageName, VersionReq};
+    use meow_pkg::{resolve_roots, Lockfile, PackageName};
 
     let proj = load_tmp("real-install");
     let home = proj.join("home");
@@ -473,17 +478,21 @@ fn install_real_registry_package_and_run_without_node_modules() {
         "transitive dependency pinned"
     );
 
-    let cfg = meow_config::MeowConfig::load(&proj).expect("load written config");
-    let roots = resolve_roots(&cfg.dependencies, &lockfile).expect("resolve roots");
+    let package_json = meow_config::PackageJson::read(&proj).expect("read package.json");
+    let direct = package_json
+        .direct_dependencies()
+        .expect("package.json direct deps");
+    let roots = resolve_roots(&direct, &lockfile).expect("resolve roots");
     assert!(
         roots.contains_key(&PackageName::new("camelcase-keys")),
-        "config + lockfile derive the runtime root"
+        "package.json + lockfile derive the runtime root"
     );
     assert_eq!(
-        cfg.dependencies
+        package_json
+            .dependencies
             .get(&PackageName::new("camelcase-keys"))
-            .expect("written dependency"),
-        &VersionReq::parse("^10").expect("req")
+            .map(String::as_str),
+        Some("^10")
     );
 
     let entry = proj.join("main.ts");
@@ -590,22 +599,22 @@ fn why_dep_entry(name: &str, version: &str, deps: &[(&str, &str)]) -> meow_pkg::
     }
 }
 
-/// Write a temp project: meow.config.json (declared deps) + a canonical lockfile.
+/// Write a temp project: stock package.json (declared deps) + a canonical lockfile.
 fn why_dep_project(
     tag: &str,
-    config_deps: &[(&str, &str)],
+    direct_deps: &[(&str, &str)],
     entries: Vec<meow_pkg::LockEntry>,
 ) -> std::path::PathBuf {
     let proj = load_tmp(tag);
-    let deps_json: Vec<String> = config_deps
+    let deps_json: Vec<String> = direct_deps
         .iter()
         .map(|(n, r)| format!("\"{n}\":\"{r}\""))
         .collect();
     std::fs::write(
-        proj.join("meow.config.json"),
+        proj.join("package.json"),
         format!("{{\"dependencies\":{{{}}}}}", deps_json.join(",")),
     )
-    .expect("write config");
+    .expect("write package.json");
     let mut lf = meow_pkg::Lockfile::new();
     for e in entries {
         lf.upsert(e);
@@ -656,7 +665,7 @@ fn why_dep_not_found_exits_1_honestly() {
 #[test]
 fn why_dep_malformed_lockfile_errors_without_panic() {
     let proj = load_tmp("whydepbad");
-    std::fs::write(proj.join("meow.config.json"), "{\"dependencies\":{}}").expect("config");
+    std::fs::write(proj.join("package.json"), "{\"dependencies\":{}}").expect("package.json");
     std::fs::write(
         proj.join("meow.lock.jsonl"),
         "this is not canonical jsonl {{{\n",

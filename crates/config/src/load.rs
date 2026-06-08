@@ -10,8 +10,9 @@
 use crate::schema::MeowConfig;
 use std::path::{Path, PathBuf};
 
-/// Typed, causal errors for config resolution and parsing (CRAFT Part B). No path
-/// here `panic!`s/`unwrap()`s on user input.
+/// Typed, causal errors for config resolution, package.json dependency authority,
+/// and package.json mutation (CRAFT Part B). No path here `panic!`s/`unwrap()`s on
+/// user input.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("no meow config found under {0} (looked for meow.config.json / meow.config.ts)")]
@@ -35,6 +36,46 @@ pub enum ConfigError {
         path: PathBuf,
         #[source]
         source: serde_json::Error,
+    },
+
+    #[error("no package.json found at {0}")]
+    PackageJsonNotFound(PathBuf),
+
+    #[error("package.json at {path} is invalid: {source}")]
+    PackageJsonParse {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    #[error("package.json at {path} must be a JSON object")]
+    PackageJsonRootMustBeObject { path: PathBuf },
+
+    #[error("package.json at {path} has non-object {field}; expected an object")]
+    PackageJsonFieldMustBeObject { path: PathBuf, field: &'static str },
+
+    #[error("failed to render package.json at {path}: {source}")]
+    PackageJsonSerialize {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    #[error("unsupported dependency specifier {name}: {spec} — lands in a later slice")]
+    UnsupportedDependencySpecifier {
+        name: String,
+        spec: String,
+        #[source]
+        source: meow_pkg::ParseVersionError,
+    },
+
+    #[error(
+        "dependency {name} is declared in both dependencies and devDependencies with different specifiers ({dependencies_spec} vs {dev_dependencies_spec})"
+    )]
+    ConflictingDependencySpecifier {
+        name: String,
+        dependencies_spec: String,
+        dev_dependencies_spec: String,
     },
 
     #[error("failed to {action} {path}: {source}")]

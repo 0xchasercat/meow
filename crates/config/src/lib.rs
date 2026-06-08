@@ -1,13 +1,16 @@
-//! `meow-config` — the single human-edited config source for a `meow` project.
+//! `meow-config` — the single human-edited runtime-behavior config source for a
+//! `meow` project.
 //!
 //! CANON §18 / principle 11 / ADR-8: `meow` collapses the per-tool config graveyard
-//! into one source. CFG-001 stands up:
+//! into one source. This crate owns:
 //!
-//! - the typed [`MeowConfig`] shape of `defineMeow({...})` (a serde model), and
+//! - the typed [`MeowConfig`] shape of `defineMeow({...})`,
 //! - `tsconfig` *shadow* generation — [`generate_shadow_tsconfig`] writes the
 //!   gitignored `.meow/tsconfig.json` the delegated typechecker (ADR-5) consumes,
 //!   and [`write_root_tsconfig_shim`] writes the committed one-line root
-//!   `tsconfig.json` `extends` shim every legacy tool reads (I-1).
+//!   `tsconfig.json` `extends` shim every legacy tool reads (I-1), and
+//! - CFG-003's [`PackageJson`] reader + mutation helpers for the user-owned root
+//!   `package.json` dependency authority.
 //!
 //! [`MeowConfig::load`] is the HONEST pre-runtime boundary (I-11): it reads the
 //! static `meow.config.json`; evaluating a real `meow.config.ts` needs the runtime
@@ -15,28 +18,23 @@
 
 mod deps;
 mod load;
+// === CFG-003 ===
+mod package_json;
+// === /CFG-003 ===
 mod schema;
 mod shadow;
-// === CFG-002 ===
-mod package;
-// === /CFG-002 ===
 
+// === CFG-003 ===
+pub use deps::{add_dependency, remove_dependency};
 pub use load::ConfigError;
 pub use meow_pkg::{PackageName, VersionReq};
+pub use package_json::{PackageJson, PackageJsonWorkspaceConfig, PackageJsonWorkspaces};
+// === /CFG-003 ===
 pub use schema::{
     Clock, Format, FormatStyle, Install, InstallMode, Lint, MeowConfig, Mode, Network, Permissions,
-    Publish, Runtime, Severity, TestConfig, TsHandling, Types, Workspace,
+    Runtime, Severity, TestConfig, TsHandling, Types, Workspace,
 };
 pub use shadow::{
     generate_shadow_tsconfig, write_root_tsconfig_shim, write_shadow_types, GENERATED_HEADER,
     ROOT_TSCONFIG_SHIM, STRICT_WEB_DTS_FILE,
 };
-// === PKG-002 ===
-pub use deps::{add_dependency, remove_dependency, write_json_config};
-// === /PKG-002 ===
-// === CFG-002 ===
-pub use package::{
-    classify_root_package_json, generate_root_package_json, render_root_package_json,
-    PackageJsonStatus, PACKAGE_JSON_MARKER,
-};
-// === /CFG-002 ===
