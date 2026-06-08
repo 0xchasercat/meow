@@ -1,6 +1,6 @@
 {
   "version": 3,
-  "updated_at": "2026-06-08T06:00:00Z",
+  "updated_at": "2026-06-08T07:00:00Z",
   "mode": "incubating",
   "phase": {
     "id": "P1",
@@ -12,7 +12,7 @@
     "GRAPH": { "status": "active", "note": "GRAPH-001 + RT-003 merged: Oxc pipeline (single parser, I-1) + erasable type-strip (I-3)" },
     "RT": { "status": "active", "note": "RT-001/002/004/005/006 merged: V8, meow run, async I/O seam, strict-web globals, meow:http serve + typegen, determinism harness" },
     "LOAD": { "status": "active", "note": "LOAD-001 + LOAD-003 merged: the single resolver with full Node resolution (exports/imports/conditions/patterns/self-ref), no node_modules" },
-    "PKG": { "status": "active", "note": "PKG-001/002/003 merged: meow.lock.jsonl + content-addressed cache + meow install + ResolutionGraph (the shared in-memory PnP model -> one Resolver via from_resolution); deps install + run with NO node_modules" },
+    "PKG": { "status": "active", "note": "PKG-001/002/003/004 merged: meow.lock.jsonl + content-addressed cache + meow install + ResolutionGraph (shared PnP model -> one Resolver) + --materialize/--vendor (isolated no-hoist disk projection of the same graph); deps install + run with NO node_modules, escape hatch for foreign tools" },
     "WS": { "status": "planned", "note": "monorepo graph discovery + linking (P4)" },
     "TASK": { "status": "planned", "note": "typed tasks, in/out hashing, artifact->task (P4)" },
     "TEST": { "status": "planned", "note": "isolate-per-file, deterministic clock (P6); RT-006 substrate ready" },
@@ -40,10 +40,11 @@
     { "id": 12, "specs": ["RT-005"], "outcome": "merged" },
     { "id": 13, "specs": ["PKG-002"], "outcome": "merged" },
     { "id": 14, "specs": ["OBS-001"], "outcome": "merged" },
-    { "id": 15, "specs": ["PKG-003"], "outcome": "merged" }
+    { "id": 15, "specs": ["PKG-003"], "outcome": "merged" },
+    { "id": 16, "specs": ["PKG-004"], "outcome": "merged" }
   ],
   "gates": {
-    "footprint": { "status": "green", "at": "2026-06-08T04:00:00Z", "evidence_ref": "scripts/footprint.sh gzip 27.5MB <= 60MB (PKG-002 ureq+rustls; TLS dedup with deno_fetch)" },
+    "footprint": { "status": "green", "at": "2026-06-08T07:00:00Z", "evidence_ref": "scripts/footprint.sh gzip 27.5MB <= 60MB (PKG-004 flate2+tar already linked via LOAD-003, no new cost)" },
     "craft": { "status": "green", "at": "2026-06-08T01:15:00Z", "evidence_ref": "harness/reality-checks/craft-7.md" },
     "strip-fidelity": { "status": "green", "at": "2026-06-07T17:30:00Z", "evidence_ref": "harness/reality-checks/strip-fidelity-1.md" },
     "types-fresh": { "status": "green", "at": "2026-06-08T01:45:00Z", "evidence_ref": "RT-005 meow types --check fresh; committed crates/runtime/types/meow" },
@@ -68,7 +69,7 @@
       "harness/PLAN.md",
       "harness/CANON.md"
     ],
-    "active": "P2 BUILDING - PKG-002 (meow install) + OBS-001 (meow why-dep) + PKG-003 (ResolutionGraph: shared in-memory PnP model -> the one Resolver via from_resolution, no node_modules) merged + gated. P2 default-mode path complete (install + run + reproducible + resolver-parity seam). 3 of 5 P2 specs built; PKG-004 (--materialize) + LSP-001 (editor wiring) remain.",
-    "next_pull_hint": "Continue P2: PKG-004 --materialize/--vendor (ADR-4 pair, walks ResolutionGraph::packages() to project the graph on disk) + LSP-001 (constructs via Resolver::from_resolution + enumerates packages() for the .meow/deps symlink map). Then P3 (toolchain). PKG-004.md needs name reconciliation (PnpManifest -> ResolutionGraph); 16+ decisions.json forks open + PKG-004 forks to consolidate."
+    "active": "P2 BUILDING - PKG-002 (install) + OBS-001 (why-dep) + PKG-003 (ResolutionGraph) + PKG-004 (--materialize/--vendor: isolated no-hoist disk projection of the same graph, atomic + integrity-verified + deterministic) merged + gated. 4 of 5 P2 specs built; only LSP-001 (editor wiring over the shared seam) remains.",
+    "next_pull_hint": "Finish P2: LSP-001 (constructs via Resolver::from_resolution + enumerates ResolutionGraph::packages() for the .meow/deps shadow symlink map). NOTE LSP-001.md cites for_project (shipped: from_project) + expects meow_pkg::UnpackedStore (NOT defined by PKG-004; add it over archive::unpack_to). Then P3 (toolchain). 16 decisions.json forks open."
   }
 }
