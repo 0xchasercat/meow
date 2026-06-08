@@ -181,13 +181,24 @@ fn typegen_roundtrips() {
 
     let committed_http =
         fs::read(committed_dir.join("http.d.ts")).expect("read committed http.d.ts");
+    let committed_ui = fs::read(committed_dir.join("ui.d.ts")).expect("read committed ui.d.ts");
     let emit_a_http = fs::read(emit_a.join("http.d.ts")).expect("read emitted A http.d.ts");
     let emit_b_http = fs::read(emit_b.join("http.d.ts")).expect("read emitted B http.d.ts");
+    let emit_a_ui = fs::read(emit_a.join("ui.d.ts")).expect("read emitted A ui.d.ts");
+    let emit_b_ui = fs::read(emit_b.join("ui.d.ts")).expect("read emitted B ui.d.ts");
     assert_eq!(
         emit_a_http, committed_http,
-        "emit matches the committed declaration"
+        "emit matches the committed http declaration"
     );
-    assert_eq!(emit_a_http, emit_b_http, "emit is byte-stable across runs");
+    assert_eq!(
+        emit_a_http, emit_b_http,
+        "http emit is byte-stable across runs"
+    );
+    assert_eq!(
+        emit_a_ui, committed_ui,
+        "emit matches the committed ui declaration"
+    );
+    assert_eq!(emit_a_ui, emit_b_ui, "ui emit is byte-stable across runs");
 
     let drift_dir = unique_dir("drift");
     fs::create_dir_all(&drift_dir).expect("create drift dir");
@@ -195,10 +206,11 @@ fn typegen_roundtrips() {
         drift_dir.join("http.d.ts"),
         format!(
             "{}\n// drift\n",
-            String::from_utf8(committed_http).expect("utf8 dts")
+            String::from_utf8(committed_http).expect("utf8 http dts")
         ),
     )
-    .expect("seed drifted dts");
+    .expect("seed drifted http dts");
+    fs::write(drift_dir.join("ui.d.ts"), committed_ui).expect("seed ui dts");
     let drift_layout = TypegenLayout {
         source_dir: &source_dir,
         committed_types_dir: &drift_dir,
@@ -244,6 +256,10 @@ fn editor_resolves_meow_http() {
     assert!(
         ok_root.join(".meow/types/meow/http.d.ts").is_file(),
         "meow:http declaration synced into .meow/types/"
+    );
+    assert!(
+        ok_root.join(".meow/types/meow/ui.d.ts").is_file(),
+        "meow:ui declaration synced into .meow/types/"
     );
     fs::write(
         ok_root.join("ok.ts"),

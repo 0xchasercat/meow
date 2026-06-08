@@ -12,11 +12,19 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-
+use meow_ui::Ui;
 /// Reserved exit code: command recognized, but its implementation has not landed
 /// yet. Distinct from 0 (success), 1 (generic failure), and clap's 2 (usage error)
 /// so a harness can tell "not built yet" from "you held it wrong".
 pub const EXIT_UNIMPLEMENTED: u8 = 3;
+
+fn purr(body: &str) {
+    Ui::auto_with_no_color(crate::host::host_no_color()).purr(body);
+}
+
+fn hiss(body: &str) {
+    Ui::auto_with_no_color(crate::host::host_no_color()).hiss(body);
+}
 
 /// meow — a standards-first JavaScript/TypeScript runtime + unified toolchain.
 #[derive(Debug, Parser)]
@@ -266,7 +274,9 @@ impl Cli {
             // === /OBS-001 ===
             other => {
                 let (verb, phase) = other.landing();
-                eprintln!("meow: not yet implemented — `{verb}` lands in PLAN {phase}");
+                hiss(&format!(
+                    "meow: not yet implemented — `{verb}` lands in PLAN {phase}"
+                ));
                 ExitCode::from(EXIT_UNIMPLEMENTED)
             }
         }
@@ -305,17 +315,19 @@ fn cmd_types(args: &TypesArgs) -> ExitCode {
     let cwd = match std::env::current_dir() {
         Ok(dir) => dir,
         Err(err) => {
-            eprintln!("meow types: cannot resolve the current directory: {err}");
+            hiss(&format!(
+                "meow types: cannot resolve the current directory: {err}"
+            ));
             return ExitCode::FAILURE;
         }
     };
     let workspace_root = match find_runtime_workspace_root(&cwd) {
         Some(root) => root,
         None => {
-            eprintln!(
+            hiss(&format!(
                 "meow types: cannot find the meow workspace root from {}; run this inside the repo checkout",
                 cwd.display()
-            );
+            ));
             return ExitCode::FAILURE;
         }
     };
@@ -343,14 +355,14 @@ fn cmd_types(args: &TypesArgs) -> ExitCode {
     match result {
         Ok(()) => {
             if args.emit {
-                println!("meow types: regenerated crates/runtime/types/meow/*.d.ts");
+                purr("meow types: regenerated crates/runtime/types/meow/*.d.ts");
             } else {
-                println!("meow types: declarations are fresh");
+                purr("meow types: declarations are fresh");
             }
             ExitCode::SUCCESS
         }
         Err(err) => {
-            eprintln!("meow types: {err}");
+            hiss(&format!("meow types: {err}"));
             ExitCode::FAILURE
         }
     }
@@ -365,23 +377,25 @@ fn cmd_sync() -> ExitCode {
     let root = match std::env::current_dir() {
         Ok(dir) => dir,
         Err(err) => {
-            eprintln!("meow sync: cannot resolve the current directory: {err}");
+            hiss(&format!(
+                "meow sync: cannot resolve the current directory: {err}"
+            ));
             return ExitCode::FAILURE;
         }
     };
     let cfg = match meow_config::MeowConfig::load(&root) {
         Ok(cfg) => cfg,
         Err(err) => {
-            eprintln!("meow sync: {err}");
+            hiss(&format!("meow sync: {err}"));
             return ExitCode::FAILURE;
         }
     };
     if let Err(err) = meow_config::generate_shadow_tsconfig(&cfg, &root) {
-        eprintln!("meow sync: {err}");
+        hiss(&format!("meow sync: {err}"));
         return ExitCode::FAILURE;
     }
     if let Err(err) = meow_config::write_root_tsconfig_shim(&root) {
-        eprintln!("meow sync: {err}");
+        hiss(&format!("meow sync: {err}"));
         return ExitCode::FAILURE;
     }
     // === RT-004 ===
@@ -390,14 +404,14 @@ fn cmd_sync() -> ExitCode {
     // runtime owns the content (I-9, curated-from-upstream); config owns the shadow dir.
     // === RT-005 ===
     // `meow sync` also refreshes the shipped `meow:*` declarations into `.meow/types/`
-    // so editors resolve `meow:http` without any registry package or install step.
+    // so editors resolve modules like `meow:http` and `meow:ui` without any install step.
     let shadow_types = shadow_type_files();
     let shadow_refs = shadow_types
         .iter()
         .map(|(path, content)| (path.as_str(), *content))
         .collect::<Vec<_>>();
     if let Err(err) = meow_config::write_shadow_types(&root, &shadow_refs) {
-        eprintln!("meow sync: {err}");
+        hiss(&format!("meow sync: {err}"));
         return ExitCode::FAILURE;
     }
     // === /RT-005 ===
@@ -406,8 +420,8 @@ fn cmd_sync() -> ExitCode {
     // `package.json` is user-owned after CANON Amendment 001; sync refreshes only
     // the tsconfig/type shadows and never rewrites package.json.
     // === /CFG-003 ===
-    println!(
-        "meow sync: regenerated .meow/tsconfig.json + .meow/strict-web.d.ts + .meow/types/meow/*.d.ts + tsconfig.json shim"
+    purr(
+        "meow sync: regenerated .meow/tsconfig.json + .meow/strict-web.d.ts + .meow/types/meow/*.d.ts + tsconfig.json shim",
     );
     ExitCode::SUCCESS
 }
@@ -421,14 +435,16 @@ fn cmd_why_dep(args: &WhyDepArgs) -> ExitCode {
     let root = match std::env::current_dir() {
         Ok(dir) => find_project_root(&dir),
         Err(err) => {
-            eprintln!("meow why-dep: cannot resolve the current directory: {err}");
+            hiss(&format!(
+                "meow why-dep: cannot resolve the current directory: {err}"
+            ));
             return ExitCode::FAILURE;
         }
     };
     let lockfile = match load_lockfile(&root) {
         Ok(lf) => lf,
         Err(err) => {
-            eprintln!("meow why-dep: {err}");
+            hiss(&format!("meow why-dep: {err}"));
             return ExitCode::FAILURE;
         }
     };
@@ -436,21 +452,21 @@ fn cmd_why_dep(args: &WhyDepArgs) -> ExitCode {
     let package_json = match meow_config::PackageJson::read(&root) {
         Ok(package_json) => package_json,
         Err(err) => {
-            eprintln!("meow why-dep: {err}");
+            hiss(&format!("meow why-dep: {err}"));
             return ExitCode::FAILURE;
         }
     };
     let direct = match package_json.direct_dependencies() {
         Ok(direct) => direct,
         Err(err) => {
-            eprintln!("meow why-dep: {err}");
+            hiss(&format!("meow why-dep: {err}"));
             return ExitCode::FAILURE;
         }
     };
     let roots = match meow_pkg::resolve_roots(&direct, &lockfile) {
         Ok(roots) => roots,
         Err(err) => {
-            eprintln!("meow why-dep: {err}");
+            hiss(&format!("meow why-dep: {err}"));
             return ExitCode::FAILURE;
         }
     };
@@ -467,7 +483,7 @@ fn cmd_why_dep(args: &WhyDepArgs) -> ExitCode {
         match serde_json::to_string_pretty(&report) {
             Ok(json) => println!("{json}"),
             Err(err) => {
-                eprintln!("meow why-dep: {err}");
+                hiss(&format!("meow why-dep: {err}"));
                 return ExitCode::FAILURE;
             }
         }
@@ -479,10 +495,10 @@ fn cmd_why_dep(args: &WhyDepArgs) -> ExitCode {
     }
 
     if !report.found {
-        eprintln!(
+        hiss(&format!(
             "meow: `{}` is not in the dependency tree (no path from any direct dependency in package.json)",
             args.pkg
-        );
+        ));
         return ExitCode::FAILURE;
     }
     render_why_dep(&report);
@@ -491,14 +507,17 @@ fn cmd_why_dep(args: &WhyDepArgs) -> ExitCode {
 
 /// Render a found `why-dep` report as prose chains (stdout).
 fn render_why_dep(report: &meow_obs::WhyDep) {
-    println!(
+    let mut lines = Vec::new();
+    lines.push(format!(
         "{} is in the dependency tree — {} version(s).",
         report.target,
         report.versions.len()
-    );
-    println!("(each chain starts at a project direct dependency)");
-    for tv in &report.versions {
-        println!();
+    ));
+    lines.push("(each chain starts at a project direct dependency)".to_owned());
+    for (idx, tv) in report.versions.iter().enumerate() {
+        if idx > 0 {
+            lines.push(String::new());
+        }
         let integrity = match &tv.integrity {
             Some(hash) => hash.to_sri(),
             None => "none — referenced but not in lockfile".to_string(),
@@ -508,25 +527,35 @@ fn render_why_dep(report: &meow_obs::WhyDep) {
         } else {
             ""
         };
-        println!(
+        lines.push(format!(
             "{}@{}  integrity {integrity}{direct}",
             tv.node.name, tv.node.version
-        );
+        ));
         for path in &tv.paths {
-            let chain: Vec<String> = path
+            let chain = path
                 .nodes
                 .iter()
                 .map(|n| format!("{}@{}", n.name, n.version))
-                .collect();
-            println!("  {}", chain.join(" → "));
+                .collect::<Vec<_>>()
+                .join(" → ");
+            lines.push(format!("  {chain}"));
         }
         if tv.truncated {
-            println!(
+            lines.push(format!(
                 "  … showing first {} of more chains (raise with --limit)",
                 tv.paths.len()
-            );
+            ));
         }
     }
+    let title = format!("why-dep {}", report.target);
+    println!(
+        "{}",
+        meow_ui::bento::render(
+            Ui::auto_with_no_color(crate::host::host_no_color()).stdout_style(),
+            &title,
+            &lines
+        )
+    );
 }
 // === /OBS-001 ===
 
@@ -611,17 +640,17 @@ impl meow_pkg::RegistrySource for NpmRegistry {
 /// `meow install`: resolve declared deps, populate the cache, and write the lockfile.
 fn cmd_install(args: &InstallArgs) -> ExitCode {
     if matches!(args.mode, InstallMode::Vfs) {
-        eprintln!(
+        hiss(&format!(
             "meow install: `--mode {}` lands in PKG-004 (P2)",
             install_mode_name(&args.mode)
-        );
+        ));
         return ExitCode::from(EXIT_UNIMPLEMENTED);
     }
 
     let projection = match install_projection(args) {
         Ok(projection) => projection,
         Err(err) => {
-            eprintln!("meow install: {err}");
+            hiss(&format!("meow install: {err}"));
             return ExitCode::FAILURE;
         }
     };
@@ -629,7 +658,9 @@ fn cmd_install(args: &InstallArgs) -> ExitCode {
     let root = match std::env::current_dir() {
         Ok(dir) => dir,
         Err(err) => {
-            eprintln!("meow install: cannot resolve the current directory: {err}");
+            hiss(&format!(
+                "meow install: cannot resolve the current directory: {err}"
+            ));
             return ExitCode::FAILURE;
         }
     };
@@ -640,26 +671,26 @@ fn cmd_install(args: &InstallArgs) -> ExitCode {
         let (name, req) = match requested_dependency(&registry, package) {
             Ok(dep) => dep,
             Err(err) => {
-                eprintln!("meow install: {err}");
+                hiss(&format!("meow install: {err}"));
                 return ExitCode::FAILURE;
             }
         };
         if let Err(err) = meow_config::add_dependency(&root, name, req) {
-            eprintln!("meow install: {err}");
+            hiss(&format!("meow install: {err}"));
             return ExitCode::FAILURE;
         }
     }
     let package_json = match load_install_package_json(&root) {
         Ok(package_json) => package_json,
         Err(err) => {
-            eprintln!("meow install: {err}");
+            hiss(&format!("meow install: {err}"));
             return ExitCode::FAILURE;
         }
     };
     let direct_deps = match package_json.direct_dependencies() {
         Ok(direct_deps) => direct_deps,
         Err(err) => {
-            eprintln!("meow install: {err}");
+            hiss(&format!("meow install: {err}"));
             return ExitCode::FAILURE;
         }
     };
@@ -669,7 +700,7 @@ fn cmd_install(args: &InstallArgs) -> ExitCode {
     let meow_req = match runtime_meow_requirement() {
         Ok(req) => req,
         Err(err) => {
-            eprintln!("meow install: {err}");
+            hiss(&format!("meow install: {err}"));
             return ExitCode::FAILURE;
         }
     };
@@ -682,7 +713,7 @@ fn cmd_install(args: &InstallArgs) -> ExitCode {
     {
         Ok(lockfile) => lockfile,
         Err(err) => {
-            eprintln!("meow install: {err}");
+            hiss(&format!("meow install: {err}"));
             return ExitCode::FAILURE;
         }
     };
@@ -690,7 +721,7 @@ fn cmd_install(args: &InstallArgs) -> ExitCode {
     let installed = lockfile.len();
     let lock_path = root.join("meow.lock.jsonl");
     if let Err(err) = lockfile.write_canonical(&lock_path) {
-        eprintln!("meow install: {err}");
+        hiss(&format!("meow install: {err}"));
         return ExitCode::FAILURE;
     }
 
@@ -699,7 +730,7 @@ fn cmd_install(args: &InstallArgs) -> ExitCode {
         let roots = match meow_pkg::resolve_roots(&direct_deps, &lockfile) {
             Ok(roots) => roots,
             Err(err) => {
-                eprintln!("meow install: {err}");
+                hiss(&format!("meow install: {err}"));
                 return ExitCode::FAILURE;
             }
         };
@@ -707,45 +738,45 @@ fn cmd_install(args: &InstallArgs) -> ExitCode {
         {
             Ok(graph) => graph,
             Err(err) => {
-                eprintln!("meow install: {err}");
+                hiss(&format!("meow install: {err}"));
                 return ExitCode::FAILURE;
             }
         };
         let report = match meow_pkg::Materializer::new(&cache, &graph, &root).materialize(&opts) {
             Ok(report) => report,
             Err(err) => {
-                eprintln!("meow install: {err}");
+                hiss(&format!("meow install: {err}"));
                 return ExitCode::FAILURE;
             }
         };
-        println!(
+        purr(&format!(
             "installed {} packages → {}",
             installed,
             lock_path
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("meow.lock.jsonl")
-        );
-        println!(
+        ));
+        purr(&format!(
             "materialized {} packages / {} edges / {} bytes → {}{}",
             report.packages,
             report.edges,
             report.bytes_written,
             report.root.display(),
             if report.skipped { " (skipped)" } else { "" }
-        );
+        ));
         return ExitCode::SUCCESS;
     }
     // === /PKG-004 ===
 
-    println!(
+    purr(&format!(
         "installed {} packages → {} (no node_modules)",
         installed,
         lock_path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("meow.lock.jsonl")
-    );
+    ));
     ExitCode::SUCCESS
 }
 
@@ -1101,7 +1132,7 @@ fn cmd_run_inner(verb: &'static str, target: &str, flags: RunFlagView<'_>) -> Ex
     match cmd_run_result(target, flags) {
         Ok(code) => code,
         Err(err) => {
-            eprintln!("meow {verb}: {err}");
+            hiss(&format!("meow {verb}: {err}"));
             ExitCode::FAILURE
         }
     }
@@ -1205,6 +1236,9 @@ async fn run_native_request(
     });
     // === RT-005 ===
     extensions.push(meow_runtime::http_extension());
+    // === UI-001 ===
+    extensions.push(meow_runtime::ui_extension());
+    // === /UI-001 ===
     // === /RT-005 ===
     // === /RT-004 ===
 

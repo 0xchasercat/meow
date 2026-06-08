@@ -93,12 +93,76 @@ fn install_vfs_mode_remains_an_honest_stub() {
 }
 
 #[test]
+fn install_success_uses_purr_envelope_in_plain_output() {
+    let proj = load_tmp("install-ok");
+    std::fs::write(proj.join("package.json"), "{}\n").expect("package.json");
+    let out = meow()
+        .current_dir(&proj)
+        .arg("install")
+        .output()
+        .expect("run install");
+    assert!(out.status.success(), "install should succeed: {out:?}");
+    let stdout = String::from_utf8(out.stdout).expect("stdout utf8");
+    let stderr = String::from_utf8(out.stderr).expect("stderr utf8");
+    assert_eq!(
+        stdout,
+        "😸 [Purrfect!] installed 0 packages → meow.lock.jsonl (no node_modules)\n"
+    );
+    assert!(
+        stderr.is_empty(),
+        "install success should keep stderr empty: {stderr:?}"
+    );
+    assert!(proj.join("meow.lock.jsonl").is_file(), "lockfile written");
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[test]
+fn install_parse_error_uses_hiss_envelope_in_plain_output() {
+    let proj = load_tmp("install-bad");
+    std::fs::write(proj.join("package.json"), "{\n").expect("package.json");
+    let out = meow()
+        .current_dir(&proj)
+        .arg("install")
+        .output()
+        .expect("run install");
+    assert!(
+        !out.status.success(),
+        "install should fail on invalid package.json"
+    );
+    let stdout = String::from_utf8(out.stdout).expect("stdout utf8");
+    let stderr = String::from_utf8(out.stderr).expect("stderr utf8");
+    assert!(
+        stdout.is_empty(),
+        "install errors stay off stdout: {stdout:?}"
+    );
+    assert!(
+        stderr.contains("🙀 [Bad Kitty!] meow install:"),
+        "install error should use the hiss envelope: {stderr:?}"
+    );
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[test]
 fn sync_generates_shadow_configs() {
     // `meow sync` is real (CFG-001): regenerates the shadow tsconfig + root shim.
-    let tmp = std::env::temp_dir().join(format!("meow-sync-{}", std::process::id()));
-    std::fs::create_dir_all(&tmp).expect("temp dir");
+    let tmp = load_tmp("sync");
     std::fs::write(tmp.join("meow.config.json"), "{}").expect("write config");
-    meow().current_dir(&tmp).arg("sync").assert().success();
+    let out = meow()
+        .current_dir(&tmp)
+        .arg("sync")
+        .output()
+        .expect("run sync");
+    assert!(out.status.success(), "sync should succeed: {out:?}");
+    let stdout = String::from_utf8(out.stdout).expect("stdout utf8");
+    let stderr = String::from_utf8(out.stderr).expect("stderr utf8");
+    assert!(
+        stdout.contains("😸 [Purrfect!] meow sync: regenerated .meow/tsconfig.json"),
+        "sync success should use the purr envelope: {stdout:?}"
+    );
+    assert!(
+        stderr.is_empty(),
+        "sync success keeps stderr empty: {stderr:?}"
+    );
     assert!(
         tmp.join(".meow/tsconfig.json").is_file(),
         "shadow .meow/tsconfig.json generated"
@@ -108,8 +172,31 @@ fn sync_generates_shadow_configs() {
         "root tsconfig.json shim generated"
     );
     assert!(
+        tmp.join(".meow/types/meow/ui.d.ts").is_file(),
+        "sync writes the meow:ui declaration"
+    );
+    assert!(
         !tmp.join("package.json").exists(),
         "sync must not generate or overwrite package.json"
+    );
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[test]
+fn sync_missing_config_uses_hiss_envelope_in_plain_output() {
+    let tmp = load_tmp("sync-missing");
+    let out = meow()
+        .current_dir(&tmp)
+        .arg("sync")
+        .output()
+        .expect("run sync");
+    assert!(!out.status.success(), "sync without config should fail");
+    let stdout = String::from_utf8(out.stdout).expect("stdout utf8");
+    let stderr = String::from_utf8(out.stderr).expect("stderr utf8");
+    assert!(stdout.is_empty(), "sync errors stay off stdout: {stdout:?}");
+    assert!(
+        stderr.contains("🙀 [Bad Kitty!] meow sync:"),
+        "sync error should use the hiss envelope: {stderr:?}"
     );
     std::fs::remove_dir_all(&tmp).ok();
 }
@@ -127,6 +214,40 @@ fn run_executes_a_trivial_mjs_module() {
         .assert()
         .success()
         .stdout(predicate::str::contains("hello from meow"));
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[test]
+fn run_imports_meow_ui_and_keeps_console_output_raw() {
+    let tmp = load_tmp("run-ui");
+    let entry = tmp.join("ui.mjs");
+    std::fs::write(
+        &entry,
+        r#"import { ui } from "meow:ui";
+console.log("raw stdout");
+ui.purr("hello");
+console.error("raw stderr");
+ui.hiss("boom");
+"#,
+    )
+    .expect("write entry");
+    let out = meow()
+        .current_dir(&tmp)
+        .arg("run")
+        .arg(&entry)
+        .output()
+        .expect("run meow:ui entry");
+    assert!(out.status.success(), "meow run should succeed: {out:?}");
+    let stdout = String::from_utf8(out.stdout).expect("stdout utf8");
+    let stderr = String::from_utf8(out.stderr).expect("stderr utf8");
+    assert!(
+        stdout.contains("raw stdout\n😸 [Purrfect!] hello\n"),
+        "console.log stays raw while ui.purr is wrapped: {stdout:?}"
+    );
+    assert!(
+        stderr.contains("raw stderr\n🙀 [Bad Kitty!] boom\n"),
+        "console.error stays raw while ui.hiss is wrapped: {stderr:?}"
+    );
     std::fs::remove_dir_all(&tmp).ok();
 }
 
@@ -930,13 +1051,22 @@ fn why_dep_traces_the_chain() {
             why_dep_entry("target", "1.0.0", &[]),
         ],
     );
-    meow()
+    let out = meow()
         .current_dir(&proj)
         .arg("why-dep")
         .arg("target")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("a@1.0.0 → target@1.0.0"));
+        .output()
+        .expect("run why-dep");
+    assert!(out.status.success(), "why-dep should succeed: {out:?}");
+    let stdout = String::from_utf8(out.stdout).expect("stdout utf8");
+    assert!(
+        stdout.contains("╭"),
+        "human why-dep should render a bento box: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("a@1.0.0 → target@1.0.0"),
+        "dependency chain stays precise inside the bento body: {stdout:?}"
+    );
     std::fs::remove_dir_all(&proj).ok();
 }
 
@@ -995,6 +1125,19 @@ fn why_dep_json_is_machine_readable() {
         .output()
         .expect("run");
     assert!(out.status.success());
+    assert!(
+        out.stderr.is_empty(),
+        "json mode should keep stderr empty: {out:?}"
+    );
+    let stdout = String::from_utf8(out.stdout.clone()).expect("stdout utf8");
+    assert!(
+        stdout.starts_with("{\n"),
+        "json mode should stay raw: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("[Purrfect!]") && !stdout.contains("╭"),
+        "json mode must not be wrapped by the UI layer: {stdout:?}"
+    );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json output");
     assert_eq!(v["found"], true);
     assert_eq!(v["versions"][0]["node"]["name"], "target");

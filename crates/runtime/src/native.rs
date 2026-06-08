@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 /// The embedded `meow:*` module names in stable order. This order drives typegen
 /// output and shadow-sync writes, so keep it byte-stable.
-pub const NATIVE_MODULES: &[&str] = &["http"];
+pub const NATIVE_MODULES: &[&str] = &["http", "ui"];
 
 /// The common-surface `node:*` built-ins shipped by RT-007. Keep this list in a
 /// stable order: resolver diagnostics and tests snapshot it.
@@ -64,6 +64,7 @@ pub fn native_module_registry() -> Arc<dyn NativeModuleSource> {
 pub fn native_module_source(name: &str) -> Option<&'static str> {
     match name {
         "http" => Some(include_str!("js/meow/http.ts")),
+        "ui" => Some(include_str!("js/meow/ui.ts")),
         // === LOAD-004 ===
         "internal/cjs" => Some(include_str!("js/meow/cjs.ts")),
         // === /LOAD-004 ===
@@ -86,6 +87,7 @@ pub fn native_module_source(name: &str) -> Option<&'static str> {
 pub fn native_module_declaration(name: &str) -> Option<&'static str> {
     match name {
         "http" => Some(include_str!("../types/meow/http.d.ts")),
+        "ui" => Some(include_str!("../types/meow/ui.d.ts")),
         _ => None,
     }
 }

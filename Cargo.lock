@@ -2746,6 +2746,7 @@ dependencies = [
  "meow-obs",
  "meow-pkg",
  "meow-runtime",
+ "meow-ui",
  "predicates",
  "semver",
  "serde_json",
@@ -2855,6 +2856,7 @@ dependencies = [
  "meow-graph",
  "meow-loader",
  "meow-pkg",
+ "meow-ui",
  "parking_lot",
  "rand_chacha 0.9.0",
  "rand_core 0.9.5",
@@ -2863,6 +2865,10 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
 ]
+
+[[package]]
+name = "meow-ui"
+version = "0.0.0"
 
 [[package]]
 name = "minimal-lexical"

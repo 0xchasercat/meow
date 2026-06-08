@@ -1,0 +1,16 @@
+# === UI-001 ===
+# The terminal UX engine ("structural cuteness"). Zero external dependencies: the
+# palette is raw 24-bit ANSI, tty detection is std::io::IsTerminal, the spinner is
+# std::thread. Keeping it dep-free protects the <60MB binary budget (I-10) and means
+# the cuteness layer can never become an adoption tax.
+[package]
+name = "meow-ui"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[lib]
+doctest = false
+# === /UI-001 ===

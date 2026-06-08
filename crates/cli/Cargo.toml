@@ -13,6 +13,9 @@ path = "src/main.rs"
 clap = { workspace = true }
 # === CFG-001 === intra-workspace: the CLI dispatches `meow sync` to the config library.
 meow-config = { path = "../config" }
+# === UI-001 === shared structural-cuteness engine for meow-owned diagnostics.
+meow-ui = { path = "../ui" }
+# === /UI-001 ===
 # === /CFG-001 ===
 # === RT-001 === `meow run` drives one ESM module to completion through V8.
 meow-runtime = { path = "../runtime" }

@@ -24,3 +24,8 @@ pub(crate) fn host_home() -> PathBuf {
 pub(crate) fn host_meow_tsc() -> Option<OsString> {
     std::env::var_os("MEOW_TSC")
 }
+
+/// Whether the user requested no ANSI color. Host-boundary read for UI-001.
+pub(crate) fn host_no_color() -> bool {
+    std::env::var_os("NO_COLOR").is_some()
+}

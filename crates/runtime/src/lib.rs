@@ -10,8 +10,8 @@
 //!   user input is a typed [`RuntimeError`]; `unwrap`/`expect` are reserved for
 //!   internal invariants only.
 //! - **No ambient host reads** (I-6): the crate introduces no ambient env, clock,
-//!   or randomness reads. The only host boundary is the op seam (at P0, `op_print`
-//!   -> stdout/stderr).
+//!   or randomness reads. The only host boundary is the op seam (`console`/print
+//!   by default, plus explicitly-installed `meow:*` host extensions).
 //! - **Single-threaded**: [`Runtime`] is not `Send`/`Sync`. Construct and drive
 //!   it on one thread inside a current-thread tokio runtime — deno_core requires
 //!   an active tokio context at isolate creation and initializes the V8 platform
@@ -68,7 +68,7 @@ pub use deno_core::ModuleSpecifier;
 
 pub use error::{JsExceptionReport, RuntimeError};
 pub use ext::http::ops::HttpError;
-pub use ext::{http_extension, print_sink_extension, PrintSink};
+pub use ext::{http_extension, print_sink_extension, ui_extension, PrintSink};
 pub use loader::TrivialModuleLoader;
 // === RT-002 ===
 pub use io::{

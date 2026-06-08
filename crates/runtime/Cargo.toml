@@ -11,6 +11,9 @@ license.workspace = true
 # `deno_core::v8` (re-exported here as `meow_runtime::v8`).
 deno_core = { workspace = true }
 thiserror = { workspace = true }
+# === UI-001 === shared structural-cuteness renderer for `meow:ui`.
+meow-ui = { path = "../ui" }
+# === /UI-001 ===
 # === RT-002 ===
 # Async host I/O (ADR-9): tokio/mio is the committed portable layer. Consumed by
 # the `io` ops (tokio::fs / tokio::net) + driven on the current-thread runtime.
