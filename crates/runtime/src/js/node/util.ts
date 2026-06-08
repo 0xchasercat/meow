@@ -1,4 +1,7 @@
 import { Buffer } from "node:buffer";
+export const TextEncoder = globalThis.TextEncoder;
+export const TextDecoder = globalThis.TextDecoder;
+
 
 type InspectSeen = Set<object>;
 type Callback<T> = (error: unknown, value: T) => void;
@@ -103,5 +106,5 @@ export const types = {
 
 const api = { inspect, promisify, types, TextEncoder, TextDecoder };
 
-export { TextEncoder, TextDecoder };
+
 export default api;

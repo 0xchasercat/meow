@@ -365,3 +365,35 @@ async fn event_emitter_emit_and_on() {
     assert_eq!(*out.borrow(), "true:meow\n");
     std::fs::remove_dir_all(&proj).ok();
 }
+
+#[tokio::test]
+async fn node_assert_module_works() {
+    let proj = unique_dir("assert");
+    let (out, mut rt) = node_runtime(
+        node::NodeMode::Enabled,
+        &proj,
+        vec![
+            "meow".to_owned(),
+            proj.join("main.mjs").to_string_lossy().into_owned(),
+        ],
+    );
+    run_src(
+        &mut rt,
+        "file:///assert.mjs",
+        r#"
+        import assert from "node:assert";
+        assert.strictEqual(1 + 1, 2);
+        let failed = false;
+        try {
+          assert.ok(false, "nope");
+        } catch (error) {
+          failed = error.code === "ERR_ASSERTION";
+        }
+        console.log(String(failed));
+        "#,
+    )
+    .await
+    .expect("module runs");
+    assert_eq!(*out.borrow(), "true\n");
+    std::fs::remove_dir_all(&proj).ok();
+}

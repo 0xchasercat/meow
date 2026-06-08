@@ -18,6 +18,7 @@ pub const NATIVE_MODULES: &[&str] = &["http"];
 /// The common-surface `node:*` built-ins shipped by RT-007. Keep this list in a
 /// stable order: resolver diagnostics and tests snapshot it.
 pub const NODE_BUILTINS: &[&str] = &[
+    "assert",
     "buffer",
     "events",
     "fs",
@@ -67,6 +68,7 @@ pub fn native_module_source(name: &str) -> Option<&'static str> {
         "internal/cjs" => Some(include_str!("js/meow/cjs.ts")),
         // === /LOAD-004 ===
         // === RT-007 ===
+        "node:assert" => Some(include_str!("js/node/assert.ts")),
         "node:buffer" => Some(include_str!("js/node/buffer.ts")),
         "node:events" => Some(include_str!("js/node/events.ts")),
         "node:fs" => Some(include_str!("js/node/fs.ts")),

@@ -61,7 +61,24 @@ impl Analyzer {
         }
     }
 
+    fn is_safe_named_export(name: &str) -> bool {
+        if name == "default" {
+            return false;
+        }
+        let mut chars = name.chars();
+        let Some(first) = chars.next() else {
+            return false;
+        };
+        if !(first == '_' || first == '$' || first.is_ascii_alphabetic()) {
+            return false;
+        }
+        chars.all(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphanumeric())
+    }
+
     fn push_named_export(&mut self, name: &str) {
+        if !Self::is_safe_named_export(name) {
+            return;
+        }
         if self.named_exports_seen.insert(name.to_owned()) {
             self.named_exports.push(name.to_owned());
         }
@@ -200,6 +217,15 @@ mod tests {
         assert_eq!(analysis.named_exports, vec!["foo", "bar", "baz"]);
         assert!(analysis.has_commonjs_syntax);
         assert!(!analysis.has_esm_syntax);
+    }
+
+    #[test]
+    fn skips_default_and_non_identifier_named_exports() {
+        let analysis = analyze(
+            "module.exports.default = 1;\nexports['a-b'] = 2;\nexports.good_name = 3;\n",
+            SourceType::cjs(),
+        );
+        assert_eq!(analysis.named_exports, vec!["good_name"]);
     }
 
     #[test]
