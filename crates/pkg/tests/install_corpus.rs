@@ -303,6 +303,18 @@ fn resolve_roots_picks_the_max_satisfying_declared_pin() {
 }
 
 #[test]
+fn resolve_roots_supports_disjunction_ranges() {
+    let mut lockfile = Lockfile::new();
+    lockfile.upsert(entry("a", "4.1.0"));
+    lockfile.upsert(entry("a", "5.2.0"));
+    lockfile.upsert(entry("a", "6.3.0"));
+
+    let roots = resolve_roots(&declared("a", "^4.0.2 || ^5.0 || ^6.0"), &lockfile)
+        .expect("disjunction root resolves");
+    assert_eq!(roots.get(&PackageName::new("a")), Some(&ver("6.3.0")));
+}
+
+#[test]
 fn resolve_roots_errors_when_declared_dep_is_absent() {
     let mut lockfile = Lockfile::new();
     lockfile.upsert(entry("a", "1.0.0"));

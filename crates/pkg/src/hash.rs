@@ -271,6 +271,113 @@ impl fmt::Display for Version {
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize)]
 pub struct VersionReq(String);
 
+fn parse_partial_version(s: &str) -> Option<Vec<u64>> {
+    let parts: Vec<u64> = s
+        .split('.')
+        .map(str::trim)
+        .map(str::parse)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    if parts.is_empty() || parts.len() > 3 {
+        return None;
+    }
+    Some(parts)
+}
+
+fn lower_partial_version(parts: &[u64]) -> String {
+    match parts {
+        [major] => format!("{major}.0.0"),
+        [major, minor] => format!("{major}.{minor}.0"),
+        [major, minor, patch] => format!("{major}.{minor}.{patch}"),
+        _ => unreachable!("validated by parse_partial_version"),
+    }
+}
+
+fn upper_partial_bound(parts: &[u64]) -> (String, bool) {
+    match parts {
+        [major] => (format!("{}.0.0", major + 1), false),
+        [major, minor] => (format!("{major}.{}.0", minor + 1), false),
+        [major, minor, patch] => (format!("{major}.{minor}.{patch}"), true),
+        _ => unreachable!("validated by parse_partial_version"),
+    }
+}
+
+fn normalize_hyphen_arm(trimmed: &str) -> Option<String> {
+    let (left, right) = trimmed.split_once(" - ")?;
+    let left = parse_partial_version(left.trim())?;
+    let right = parse_partial_version(right.trim())?;
+    let lower = lower_partial_version(&left);
+    let (upper, inclusive) = upper_partial_bound(&right);
+    Some(if inclusive {
+        format!(">={lower}, <={upper}")
+    } else {
+        format!(">={lower}, <{upper}")
+    })
+}
+
+fn normalize_version_req_arm(arm: &str) -> String {
+    let trimmed = arm.trim();
+    if trimmed.contains(',') {
+        return trimmed.to_owned();
+    }
+    if let Some(hyphen) = normalize_hyphen_arm(trimmed) {
+        return hyphen;
+    }
+
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    let mut comparators = Vec::new();
+    let mut i = 0usize;
+    while i < tokens.len() {
+        let token = tokens[i];
+        match token {
+            ">" | ">=" | "<" | "<=" | "=" | "^" | "~" => {
+                if let Some(version) = tokens.get(i + 1) {
+                    comparators.push(format!("{token}{version}"));
+                    i += 2;
+                    continue;
+                }
+                comparators.push(token.to_owned());
+                i += 1;
+            }
+            _ => {
+                comparators.push(token.to_owned());
+                i += 1;
+            }
+        }
+    }
+
+    if comparators.len() > 1 {
+        comparators.join(", ")
+    } else {
+        comparators.into_iter().next().unwrap_or_default()
+    }
+}
+
+fn parse_version_req_arms(s: &str) -> Result<Vec<semver::VersionReq>, ParseVersionError> {
+    let mut arms = Vec::new();
+    for raw_arm in s.split("||") {
+        let arm = raw_arm.trim();
+        if arm.is_empty() {
+            return Err(ParseVersionError::Req {
+                value: s.to_owned(),
+                reason: "empty `||` disjunction arm in version requirement".to_owned(),
+            });
+        }
+        let normalized = normalize_version_req_arm(arm);
+        let parsed =
+            semver::VersionReq::parse(&normalized).map_err(|e| ParseVersionError::Req {
+                value: s.to_owned(),
+                reason: if s.contains("||") || arm != normalized {
+                    format!("invalid range arm {arm:?}: {e}")
+                } else {
+                    e.to_string()
+                },
+            })?;
+        arms.push(parsed);
+    }
+    Ok(arms)
+}
+
 impl VersionReq {
     /// Test-only convenience for known-valid literals; production uses
     /// [`VersionReq::parse`] (validated).
@@ -280,12 +387,14 @@ impl VersionReq {
     }
 
     /// Parse + validate a semver requirement range, preserving the original text.
+    /// Supports npm-style `||` disjunctions of ordinary semver clauses.
     pub fn parse(s: &str) -> Result<VersionReq, ParseVersionError> {
-        semver::VersionReq::parse(s).map_err(|e| ParseVersionError::Req {
-            value: s.to_owned(),
-            reason: e.to_string(),
-        })?;
+        parse_version_req_arms(s)?;
         Ok(VersionReq(s.to_owned()))
+    }
+
+    pub(crate) fn disjunctions(&self) -> Result<Vec<semver::VersionReq>, ParseVersionError> {
+        parse_version_req_arms(self.as_str())
     }
 
     /// The underlying constraint text.
@@ -415,6 +524,14 @@ mod tests {
     fn version_req_parse_accepts_range_rejects_garbage() {
         assert!(VersionReq::parse("^0.1").is_ok());
         assert!(VersionReq::parse(">=1.2, <2").is_ok());
+        assert!(VersionReq::parse(">= 2.1.2 < 3").is_ok());
+        assert!(VersionReq::parse("1 - 2").is_ok());
+        assert!(VersionReq::parse("1.2.3 - 2.3.4").is_ok());
+        assert!(VersionReq::parse("^4.0.2 || ^5.0 || ^6.0").is_ok());
+        assert!(matches!(
+            VersionReq::parse("|| ^1").unwrap_err(),
+            ParseVersionError::Req { .. }
+        ));
         assert!(matches!(
             VersionReq::parse("definitely not a range").unwrap_err(),
             ParseVersionError::Req { .. }

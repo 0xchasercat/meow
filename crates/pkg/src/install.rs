@@ -102,7 +102,7 @@ pub enum PkgInstallError {
     #[error("no published version of {name} satisfies {req}")]
     NoMatchingVersion { name: String, req: String },
     #[error(
-        "unsupported requirement {req:?} for {name}: meow resolves the `semver` crate's range grammar + dist-tags; node-semver `||`/hyphen/x-range forms are not yet supported"
+        "unsupported requirement {req:?} for {name}: meow resolves semver clauses, `||` disjunctions, and dist-tags; unsupported npm specifier forms (git/file/workspace/alias) still fail honestly"
     )]
     UnsupportedRange { name: String, req: String },
     #[error("registry metadata for {name} is missing version {version}")]
@@ -134,12 +134,12 @@ pub fn resolve_roots(
     let mut roots = BTreeMap::new();
 
     for (name, req) in declared {
-        let semver_req = semver::VersionReq::parse(req.as_str()).map_err(|_| {
-            RootResolveError::UnsupportedRange {
+        let req_arms = req
+            .disjunctions()
+            .map_err(|_| RootResolveError::UnsupportedRange {
                 name: name.to_string(),
                 req: req.to_string(),
-            }
-        })?;
+            })?;
 
         let mut selected: Option<(semver::Version, Version)> = None;
         for entry in lockfile.iter() {
@@ -151,7 +151,7 @@ pub fn resolve_roots(
                     name: name.to_string(),
                 }
             })?;
-            if !semver_req.matches(&version) {
+            if !req_arms.iter().any(|arm| arm.matches(&version)) {
                 continue;
             }
             match &selected {
@@ -216,8 +216,9 @@ fn select_version_for_range(
     meta: &PackageMetadata,
     req: &VersionReq,
 ) -> Result<Version, InstallError> {
-    let semver_req =
-        semver::VersionReq::parse(req.as_str()).map_err(|_| InstallError::UnsupportedRange {
+    let req_arms = req
+        .disjunctions()
+        .map_err(|_| InstallError::UnsupportedRange {
             name: name.to_string(),
             req: req.to_string(),
         })?;
@@ -230,7 +231,7 @@ fn select_version_for_range(
                 reason: format!("published version {} failed semver re-parse", version),
             })
         })?;
-        if !semver_req.matches(&candidate) {
+        if !req_arms.iter().any(|arm| arm.matches(&candidate)) {
             continue;
         }
         match &selected {

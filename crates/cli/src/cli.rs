@@ -18,12 +18,16 @@ use meow_ui::Ui;
 /// so a harness can tell "not built yet" from "you held it wrong".
 pub const EXIT_UNIMPLEMENTED: u8 = 3;
 
+fn ui() -> Ui {
+    Ui::auto_with_no_color(crate::host::host_no_color())
+}
+
 fn purr(body: &str) {
-    Ui::auto_with_no_color(crate::host::host_no_color()).purr(body);
+    ui().purr(body);
 }
 
 fn hiss(body: &str) {
-    Ui::auto_with_no_color(crate::host::host_no_color()).hiss(body);
+    ui().hiss(body);
 }
 
 /// meow — a standards-first JavaScript/TypeScript runtime + unified toolchain.
@@ -561,6 +565,9 @@ fn render_why_dep(report: &meow_obs::WhyDep) {
 
 // === PKG-002 ===
 const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org";
+const NPM_INSTALL_METADATA_ACCEPT: &str = "application/vnd.npm.install-v1+json";
+const NPM_METADATA_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+const NPM_TARBALL_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Production npm registry client. Lives at the CLI edge so `meow-pkg` stays
 /// network-free; all registry I/O is explicit here.
@@ -590,7 +597,10 @@ impl meow_pkg::RegistrySource for NpmRegistry {
         name: &meow_pkg::PackageName,
     ) -> Result<meow_pkg::PackageMetadata, meow_pkg::RegistryError> {
         let url = self.metadata_url(name);
-        let mut response = match ureq::get(&url).call() {
+        let mut response = match ureq::get(&url)
+            .header("Accept", NPM_INSTALL_METADATA_ACCEPT)
+            .call()
+        {
             Ok(response) => response,
             Err(ureq::Error::StatusCode(status)) => {
                 return Err(meow_pkg::RegistryError::Status { url, status });
@@ -604,6 +614,8 @@ impl meow_pkg::RegistrySource for NpmRegistry {
         };
         response
             .body_mut()
+            .with_config()
+            .limit(NPM_METADATA_LIMIT_BYTES)
             .read_json::<meow_pkg::PackageMetadata>()
             .map_err(|err| meow_pkg::RegistryError::Metadata {
                 name: name.to_string(),
@@ -629,12 +641,26 @@ impl meow_pkg::RegistrySource for NpmRegistry {
         };
         response
             .body_mut()
+            .with_config()
+            .limit(NPM_TARBALL_LIMIT_BYTES)
             .read_to_vec()
             .map_err(|err| meow_pkg::RegistryError::Fetch {
                 target: url.to_owned(),
                 reason: err.to_string(),
             })
     }
+}
+
+enum InstallSuccess {
+    Pnp {
+        installed: usize,
+        lock_path: PathBuf,
+    },
+    Materialized {
+        installed: usize,
+        lock_path: PathBuf,
+        report: meow_pkg::MaterializeReport,
+    },
 }
 
 /// `meow install`: resolve declared deps, populate the cache, and write the lockfile.
@@ -665,119 +691,104 @@ fn cmd_install(args: &InstallArgs) -> ExitCode {
         }
     };
 
-    let registry = NpmRegistry::npm();
-    // === CFG-003 ===
-    for package in &args.packages {
-        let (name, req) = match requested_dependency(&registry, package) {
-            Ok(dep) => dep,
-            Err(err) => {
-                hiss(&format!("meow install: {err}"));
-                return ExitCode::FAILURE;
-            }
-        };
-        if let Err(err) = meow_config::add_dependency(&root, name, req) {
-            hiss(&format!("meow install: {err}"));
-            return ExitCode::FAILURE;
+    let spinner = ui().spinner("installing dependencies");
+    let outcome = (|| -> Result<InstallSuccess, String> {
+        let registry = NpmRegistry::npm();
+        // === CFG-003 ===
+        for package in &args.packages {
+            let (name, req) =
+                requested_dependency(&registry, package).map_err(|err| err.to_string())?;
+            meow_config::add_dependency(&root, name, req).map_err(|err| err.to_string())?;
         }
-    }
-    let package_json = match load_install_package_json(&root) {
-        Ok(package_json) => package_json,
-        Err(err) => {
-            hiss(&format!("meow install: {err}"));
-            return ExitCode::FAILURE;
-        }
-    };
-    let direct_deps = match package_json.direct_dependencies() {
-        Ok(direct_deps) => direct_deps,
-        Err(err) => {
-            hiss(&format!("meow install: {err}"));
-            return ExitCode::FAILURE;
-        }
-    };
-    // === /CFG-003 ===
+        let package_json = load_install_package_json(&root)?;
+        let direct_deps = package_json
+            .direct_dependencies()
+            .map_err(|err| err.to_string())?;
+        // === /CFG-003 ===
 
-    let cache = meow_pkg::Cache::in_home(crate::host::host_home());
-    let meow_req = match runtime_meow_requirement() {
-        Ok(req) => req,
-        Err(err) => {
-            hiss(&format!("meow install: {err}"));
-            return ExitCode::FAILURE;
-        }
-    };
-    let direct = direct_deps
-        .iter()
-        .map(|(name, req)| (name.clone(), meow_pkg::DepSpec::Range(req.clone())))
-        .collect::<BTreeMap<_, _>>();
-    let lockfile = match meow_pkg::Installer::new(&registry, &cache, registry.base_url(), meow_req)
-        .resolve(&direct)
-    {
-        Ok(lockfile) => lockfile,
-        Err(err) => {
-            hiss(&format!("meow install: {err}"));
-            return ExitCode::FAILURE;
-        }
-    };
+        let cache = meow_pkg::Cache::in_home(crate::host::host_home());
+        let meow_req = runtime_meow_requirement().map_err(|err| err.to_string())?;
+        let direct = direct_deps
+            .iter()
+            .map(|(name, req)| (name.clone(), meow_pkg::DepSpec::Range(req.clone())))
+            .collect::<BTreeMap<_, _>>();
+        let lockfile = meow_pkg::Installer::new(&registry, &cache, registry.base_url(), meow_req)
+            .resolve(&direct)
+            .map_err(|err| err.to_string())?;
 
-    let installed = lockfile.len();
-    let lock_path = root.join("meow.lock.jsonl");
-    if let Err(err) = lockfile.write_canonical(&lock_path) {
-        hiss(&format!("meow install: {err}"));
-        return ExitCode::FAILURE;
-    }
+        let installed = lockfile.len();
+        let lock_path = root.join("meow.lock.jsonl");
+        lockfile
+            .write_canonical(&lock_path)
+            .map_err(|err| err.to_string())?;
 
-    // === PKG-004 ===
-    if let Some(opts) = projection {
-        let roots = match meow_pkg::resolve_roots(&direct_deps, &lockfile) {
-            Ok(roots) => roots,
-            Err(err) => {
-                hiss(&format!("meow install: {err}"));
-                return ExitCode::FAILURE;
-            }
-        };
-        let graph = match meow_pkg::ResolutionGraph::assemble(std::sync::Arc::new(lockfile), roots)
-        {
-            Ok(graph) => graph,
-            Err(err) => {
-                hiss(&format!("meow install: {err}"));
-                return ExitCode::FAILURE;
-            }
-        };
-        let report = match meow_pkg::Materializer::new(&cache, &graph, &root).materialize(&opts) {
-            Ok(report) => report,
-            Err(err) => {
-                hiss(&format!("meow install: {err}"));
-                return ExitCode::FAILURE;
-            }
-        };
-        purr(&format!(
-            "installed {} packages → {}",
+        // === PKG-004 ===
+        if let Some(opts) = projection {
+            let roots =
+                meow_pkg::resolve_roots(&direct_deps, &lockfile).map_err(|err| err.to_string())?;
+            let graph = meow_pkg::ResolutionGraph::assemble(std::sync::Arc::new(lockfile), roots)
+                .map_err(|err| err.to_string())?;
+            let report = meow_pkg::Materializer::new(&cache, &graph, &root)
+                .materialize(&opts)
+                .map_err(|err| err.to_string())?;
+            return Ok(InstallSuccess::Materialized {
+                installed,
+                lock_path,
+                report,
+            });
+        }
+        // === /PKG-004 ===
+
+        Ok(InstallSuccess::Pnp {
             installed,
-            lock_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("meow.lock.jsonl")
-        ));
-        purr(&format!(
-            "materialized {} packages / {} edges / {} bytes → {}{}",
-            report.packages,
-            report.edges,
-            report.bytes_written,
-            report.root.display(),
-            if report.skipped { " (skipped)" } else { "" }
-        ));
-        return ExitCode::SUCCESS;
-    }
-    // === /PKG-004 ===
+            lock_path,
+        })
+    })();
+    spinner.stop();
 
-    purr(&format!(
-        "installed {} packages → {} (no node_modules)",
-        installed,
-        lock_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("meow.lock.jsonl")
-    ));
-    ExitCode::SUCCESS
+    match outcome {
+        Ok(InstallSuccess::Materialized {
+            installed,
+            lock_path,
+            report,
+        }) => {
+            purr(&format!(
+                "installed {} packages → {}",
+                installed,
+                lock_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("meow.lock.jsonl")
+            ));
+            purr(&format!(
+                "materialized {} packages / {} edges / {} bytes → {}{}",
+                report.packages,
+                report.edges,
+                report.bytes_written,
+                report.root.display(),
+                if report.skipped { " (skipped)" } else { "" }
+            ));
+            ExitCode::SUCCESS
+        }
+        Ok(InstallSuccess::Pnp {
+            installed,
+            lock_path,
+        }) => {
+            purr(&format!(
+                "installed {} packages → {} (no node_modules)",
+                installed,
+                lock_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("meow.lock.jsonl")
+            ));
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            hiss(&format!("meow install: {err}"));
+            ExitCode::FAILURE
+        }
+    }
 }
 
 // === CFG-003 ===
