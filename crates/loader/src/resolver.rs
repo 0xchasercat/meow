@@ -160,6 +160,22 @@ impl Resolver {
             native,
         }
     }
+    // === PKG-003 ===
+    pub fn from_resolution(
+        graph: &meow_pkg::ResolutionGraph,
+        cache: Arc<Cache>,
+        project_root: Url,
+        native: Arc<dyn NativeModuleSource>,
+    ) -> Resolver {
+        Resolver::new(
+            cache,
+            graph.lockfile().clone(),
+            graph.root_deps().clone(),
+            project_root,
+            native,
+        )
+    }
+    // === /PKG-003 ===
 
     pub fn project_root(&self) -> &Url {
         &self.project_root

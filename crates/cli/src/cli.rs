@@ -913,12 +913,25 @@ fn cmd_run(
             }
         };
         // === /PKG-002 ===
+        // === PKG-003 ===
+        let cache = std::sync::Arc::new(meow_pkg::Cache::in_home(crate::host::host_home()));
+        let graph =
+            match meow_pkg::ResolutionGraph::assemble(std::sync::Arc::new(lockfile), root_deps) {
+                Ok(graph) => std::sync::Arc::new(graph),
+                Err(err) => {
+                    eprintln!("meow run: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
+        if let Err(err) = graph.verify_cached(&cache) {
+            eprintln!("meow run: {err}");
+            return ExitCode::FAILURE;
+        }
         let loader: std::rc::Rc<dyn meow_runtime::deno_core::ModuleLoader> =
             std::rc::Rc::new(meow_loader::MeowModuleLoader::new(
-                meow_loader::Resolver::new(
-                    std::sync::Arc::new(meow_pkg::Cache::in_home(crate::host::host_home())),
-                    std::sync::Arc::new(lockfile),
-                    root_deps,
+                meow_loader::Resolver::from_resolution(
+                    &graph,
+                    cache,
                     project_root,
                     // === RT-005 ===
                     meow_runtime::native::native_module_registry(),
@@ -926,6 +939,7 @@ fn cmd_run(
                 ),
                 std::rc::Rc::new(std::cell::RefCell::new(meow_graph::GraphDb::new())),
             ));
+        // === /PKG-003 ===
         // === /LOAD-001 ===
 
         // === RT-004 ===

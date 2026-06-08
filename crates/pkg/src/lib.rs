@@ -21,6 +21,9 @@ mod error;
 mod hash;
 mod install;
 mod lockfile;
+// === PKG-003 ===
+mod pnp;
+// === /PKG-003 ===
 mod registry;
 
 use std::path::{Path, PathBuf};
@@ -29,6 +32,9 @@ pub use cache::Cache;
 pub use error::{CacheError, LockError, ParseHashError, ParseVersionError};
 pub use hash::{ContentHash, HashAlgo, PackageName, Version, VersionReq};
 pub use install::{resolve_roots, InstallError, Installer, PkgInstallError, RootResolveError};
+// === PKG-003 ===
+pub use pnp::{PnpError, ResolutionGraph, ResolvedPackage};
+// === /PKG-003 ===
 pub use lockfile::{CapabilityGrant, LockEntry, Lockfile, RegistryProvenance};
 pub use registry::{
     DepSpec, DistInfo, FixtureRegistry, PackageMetadata, RegistryError, RegistrySource,
