@@ -79,9 +79,6 @@ rustc-hash = "2"
 # === TOOL-001 ===
 oxc_codegen = "0.134"
 # === /TOOL-001 ===
-# === TOOL-003 ===
-rolldown = "1.1.0"
-# === /TOOL-003 ===
 # === RT-003 ===
 # Position-preserving type-stripping (CANON §9, I-3) walks the stage-1 Oxc AST and
 # blanks type-only spans to whitespace over the source string. This needs the Oxc

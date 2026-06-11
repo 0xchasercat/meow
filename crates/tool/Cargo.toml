@@ -11,5 +11,3 @@ meow-graph = { path = "../graph" }
 thiserror = { workspace = true }
 oxc_codegen = { workspace = true }
 oxc_diagnostics = { workspace = true }
-# Rolldown is wired in after bundle runtime bridge lands; keep as a pinned edge.
-rolldown = { workspace = true }
