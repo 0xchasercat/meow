@@ -13,9 +13,11 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-/// The host home directory (to locate `~/.meow`), falling back to the cwd.
+/// The host home directory (to locate `~/.meow`), with `MEOW_HOME` overriding
+/// `HOME` for child runtimes that must inherit the parent's cache root exactly.
 pub(crate) fn host_home() -> PathBuf {
-    std::env::var_os("HOME")
+    std::env::var_os("MEOW_HOME")
+        .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
 }

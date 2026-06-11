@@ -9,7 +9,8 @@ use std::future::Future;
 use std::pin::Pin;
 
 use base64::Engine as _;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
+
 use sha2::{Digest, Sha512};
 
 use crate::{PackageName, Version, VersionReq};
@@ -46,8 +47,37 @@ pub struct VersionMetadata {
     /// Runtime dependencies, keyed by package name.
     #[serde(default)]
     pub dependencies: BTreeMap<PackageName, String>,
+    /// Optional dependencies, keyed by package name.
+    #[serde(rename = "optionalDependencies", default)]
+    pub optional_dependencies: BTreeMap<PackageName, String>,
+    /// Optional platform constraints from npm package metadata.
+    #[serde(default, deserialize_with = "deserialize_platform_constraint_list")]
+    pub os: Vec<String>,
+    /// Optional CPU constraints from npm package metadata.
+    #[serde(default, deserialize_with = "deserialize_platform_constraint_list")]
+    pub cpu: Vec<String>,
     /// Tarball location + registry-published integrity.
     pub dist: DistInfo,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum PlatformConstraintList {
+    One(String),
+    Many(Vec<String>),
+}
+
+fn deserialize_platform_constraint_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(list) = Option::<PlatformConstraintList>::deserialize(deserializer)? else {
+        return Ok(Vec::new());
+    };
+    Ok(match list {
+        PlatformConstraintList::One(value) => vec![value],
+        PlatformConstraintList::Many(values) => values,
+    })
 }
 
 /// Tarball URL + integrity metadata from the registry.
@@ -161,8 +191,15 @@ impl FixtureRegistry {
         deps: &[(&str, &str)],
         bytes: Vec<u8>,
     ) -> &mut Self {
-        let integrity = sha512_sri(&bytes);
-        self.publish_with_integrity(name, version, deps, bytes, &integrity)
+        self.publish_with_optional_dependencies_and_platform(
+            name,
+            version,
+            deps,
+            &[],
+            &[],
+            &[],
+            bytes,
+        )
     }
 
     /// Publish one version with an explicit integrity string.
@@ -174,19 +211,77 @@ impl FixtureRegistry {
         bytes: Vec<u8>,
         integrity: &str,
     ) -> &mut Self {
+        self.publish_with_optional_dependencies_and_platform_and_integrity(
+            name,
+            version,
+            deps,
+            &[],
+            &[],
+            &[],
+            bytes,
+            integrity,
+        )
+    }
+
+    /// Publish one version with optional dependencies and platform constraints.
+    pub fn publish_with_optional_dependencies_and_platform(
+        &mut self,
+        name: &str,
+        version: &str,
+        deps: &[(&str, &str)],
+        optional_deps: &[(&str, &str)],
+        os: &[&str],
+        cpu: &[&str],
+        bytes: Vec<u8>,
+    ) -> &mut Self {
+        let integrity = sha512_sri(&bytes);
+        self.publish_with_optional_dependencies_and_platform_and_integrity(
+            name,
+            version,
+            deps,
+            optional_deps,
+            os,
+            cpu,
+            bytes,
+            &integrity,
+        )
+    }
+
+    /// Publish one version with explicit integrity, optional dependencies and platform
+    /// constraints.
+    pub fn publish_with_optional_dependencies_and_platform_and_integrity(
+        &mut self,
+        name: &str,
+        version: &str,
+        deps: &[(&str, &str)],
+        optional_deps: &[(&str, &str)],
+        os: &[&str],
+        cpu: &[&str],
+        bytes: Vec<u8>,
+        integrity: &str,
+    ) -> &mut Self {
         let package = PackageName::new(name);
         let version = Version::parse(version).expect("fixture version must be valid semver");
         let dep_map = deps
             .iter()
             .map(|(dep, req)| (PackageName::new(*dep), (*req).to_owned()))
             .collect();
+        let optional_dep_map = optional_deps
+            .iter()
+            .map(|(dep, req)| (PackageName::new(*dep), (*req).to_owned()))
+            .collect();
         let tarball = fixture_tarball_url(package.as_str(), version.as_str());
+        let os = os.iter().map(|value| (*value).to_owned()).collect();
+        let cpu = cpu.iter().map(|value| (*value).to_owned()).collect();
 
         let versions = &mut self.metadata.entry(package).or_default().versions;
         versions.insert(
             version,
             VersionMetadata {
                 dependencies: dep_map,
+                optional_dependencies: optional_dep_map,
+                os,
+                cpu,
                 dist: DistInfo {
                     tarball: tarball.clone(),
                     integrity: integrity.to_owned(),
@@ -253,4 +348,47 @@ pub(crate) fn sha512_sri(bytes: &[u8]) -> String {
     let digest = hasher.finalize();
     let body = base64::engine::general_purpose::STANDARD.encode(digest);
     format!("sha512-{body}")
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn package_metadata_parses_optional_dependencies() {
+        let raw = r#"{
+  "dist-tags": {
+    "latest": "1.2.3"
+  },
+  "versions": {
+    "1.2.3": {
+      "dependencies": {
+        "left-pad": "^1.0.0"
+      },
+      "optionalDependencies": {
+        "fsevents": "^2.3.0"
+      },
+      "os": ["darwin"],
+      "cpu": ["arm64"],
+      "dist": {
+        "tarball": "fixture://host/1.2.3.tgz",
+        "integrity": "sha512-example"
+      }
+    }
+  }
+}"#;
+
+        let metadata: PackageMetadata = serde_json::from_str(raw).expect("metadata parses");
+        let version = metadata
+            .versions
+            .get(&Version::parse("1.2.3").expect("valid fixture version"))
+            .expect("version exists");
+        assert_eq!(
+            version
+                .optional_dependencies
+                .get(&PackageName::new("fsevents")),
+            Some(&"^2.3.0".to_owned())
+        );
+        assert_eq!(version.os, vec!["darwin".to_owned()]);
+        assert_eq!(version.cpu, vec!["arm64".to_owned()]);
+    }
 }

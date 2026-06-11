@@ -142,13 +142,8 @@ fn spawn_runtime(source: &str, policy: Policy) -> RuntimeThread {
                     Rc::new(std::cell::RefCell::new(GraphDb::new())),
                 ));
 
+            let caps = Arc::new(meow_runtime::AllowAll);
             let mut extensions = vec![sink];
-            extensions.extend(meow_runtime::web::extensions(
-                meow_runtime::web::WebOptions {
-                    caps: Arc::new(meow_runtime::AllowAll),
-                    user_agent: "meow-test/rt005".to_owned(),
-                },
-            ));
             extensions.extend(meow_runtime::hermetic::extensions(
                 meow_runtime::hermetic::HermeticConfig::default(),
             ));
@@ -162,7 +157,9 @@ fn spawn_runtime(source: &str, policy: Policy) -> RuntimeThread {
                     ],
                     cwd: join_root.clone(),
                     env: BTreeMap::new(),
-                    cjs_resolver: None,
+                    deno_node_services: None,
+                    caps: Some(caps),
+                    user_agent: Some("meow-test/rt005".to_owned()),
                 },
             ));
             if let Policy::DenyNetListen(shared) = policy {

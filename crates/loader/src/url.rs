@@ -42,9 +42,6 @@ pub fn decode(url: &Url) -> Result<(ContentHash, String), ResolveError> {
         .path()
         .strip_prefix('/')
         .ok_or_else(|| ResolveError::InvalidVirtualUrl(url.clone()))?;
-    if member.is_empty() {
-        return Err(ResolveError::InvalidVirtualUrl(url.clone()));
-    }
     Ok((package, member.to_owned()))
 }
 
@@ -69,6 +66,13 @@ mod tests {
     }
 
     #[test]
+    fn decodes_package_root() {
+        let hash = ContentHash::of(b"package root");
+        let url = Url::parse(&format!("{SCHEME}://{}/", hash.to_url_host())).unwrap();
+        assert_eq!(decode(&url).expect("decodes root"), (hash, String::new()));
+    }
+
+    #[test]
     fn rejects_wrong_scheme() {
         let url = Url::parse("file:///proj/main.ts").unwrap();
         assert!(matches!(
@@ -87,7 +91,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_decorated_or_memberless_meow_cache_urls() {
+    fn rejects_decorated_meow_cache_urls() {
         let hash = ContentHash::of(b"decorated url payload");
         let plain = format!("{SCHEME}://{}/dist/index.js", hash.to_url_host());
         let ok = Url::parse(&plain).expect("plain parses");
@@ -97,7 +101,6 @@ mod tests {
             format!("{plain}#x"),
             format!("{plain}?q=1"),
             format!("{SCHEME}:{}", hash.to_sri()),
-            format!("{SCHEME}://{}/", hash.to_url_host()),
             format!("{SCHEME}://user@{}/dist/index.js", hash.to_url_host()),
         ] {
             let url = Url::parse(&decorated).expect("decorated form parses");

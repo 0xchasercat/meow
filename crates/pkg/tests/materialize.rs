@@ -7,9 +7,9 @@ use std::sync::Arc;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use meow_pkg::{
-    Cache, CacheError, LinkStrategy, LockEntry, Lockfile, MaterializeError, MaterializeOptions,
-    Materializer, PackageName, Projection, RegistryProvenance, ResolutionGraph, Version,
-    VersionReq,
+    Cache, CacheError, ContentHash, LinkStrategy, LockEntry, Lockfile, MaterializeError,
+    MaterializeOptions, Materializer, PackageName, Projection, RegistryProvenance, ResolutionGraph,
+    Version, VersionReq,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -236,8 +236,8 @@ fn resolve_in_projection(
             path.push(segment);
             path
         });
-    let projection_root = fs::canonicalize(projection_root).ok()?;
-    let mut current = fs::canonicalize(start_dir).ok()?;
+    let projection_root = projection_root.to_path_buf();
+    let mut current = start_dir.to_path_buf();
     loop {
         let candidate = if current == projection_root {
             projection_root.join(&spec_path)
@@ -259,6 +259,28 @@ fn read_package_identity(path: &Path) -> (String, String) {
     let json = fs::read(path.join("package.json")).expect("read package.json");
     let manifest: PackageJson = serde_json::from_slice(&json).expect("parse package.json");
     (manifest.name, manifest.version)
+}
+fn package_integrity(graph: &ResolutionGraph, name: &str, version: &str) -> ContentHash {
+    graph
+        .packages()
+        .find(|entry| entry.name.as_str() == name && entry.version.to_string() == version)
+        .expect("package in graph")
+        .integrity
+        .to_owned()
+}
+
+fn assert_global_unpacked_link(cache: &Cache, package_dir: &Path, expected: &ContentHash) {
+    let raw = fs::read_link(package_dir).expect("package symlink target");
+    let target = if raw.is_absolute() {
+        raw
+    } else {
+        package_dir.parent().expect("package link parent").join(raw)
+    };
+    let expected = cache.root().join("unpacked").join(expected.to_url_host());
+    assert_eq!(
+        fs::canonicalize(&target).expect("canonicalize package target"),
+        expected
+    );
 }
 
 #[test]
@@ -493,6 +515,12 @@ fn materialized_tree_matches_graph_and_preserves_multi_version_edges() {
 
     let a_dir = store_package_dir(&projection, "a", "1.0.0");
     let c_dir = store_package_dir(&projection, "c", "1.0.0");
+    let b1_dir = store_package_dir(&projection, "b", "1.0.0");
+    let b2_dir = store_package_dir(&projection, "b", "2.0.0");
+    assert_global_unpacked_link(&cache, &a_dir, &package_integrity(&graph, "a", "1.0.0"));
+    assert_global_unpacked_link(&cache, &c_dir, &package_integrity(&graph, "c", "1.0.0"));
+    assert_global_unpacked_link(&cache, &b1_dir, &package_integrity(&graph, "b", "1.0.0"));
+    assert_global_unpacked_link(&cache, &b2_dir, &package_integrity(&graph, "b", "2.0.0"));
     assert_eq!(
         resolve_in_projection(&projection, &a_dir, "b"),
         Some(("b".to_owned(), "1.0.0".to_owned()))
@@ -521,6 +549,18 @@ fn materialized_tree_matches_graph_and_preserves_multi_version_edges() {
         "../../b@2.0.0/node_modules/b"
     );
     assert_eq!(
+        fs::read_link(projection.join("a"))
+            .expect("root a target")
+            .to_string_lossy(),
+        ".meow/a@1.0.0/node_modules/a"
+    );
+    assert_eq!(
+        fs::read_link(projection.join("c"))
+            .expect("root c target")
+            .to_string_lossy(),
+        ".meow/c@1.0.0/node_modules/c"
+    );
+    assert_eq!(
         resolve_in_projection(&projection, &projection, "a"),
         Some(("a".to_owned(), "1.0.0".to_owned()))
     );
@@ -528,7 +568,6 @@ fn materialized_tree_matches_graph_and_preserves_multi_version_edges() {
         resolve_in_projection(&projection, &projection, "c"),
         Some(("c".to_owned(), "1.0.0".to_owned()))
     );
-
     fs::remove_dir_all(cache.root()).ok();
     fs::remove_dir_all(root).ok();
 }
@@ -561,7 +600,7 @@ fn tampered_cache_blob_refuses_to_materialize() {
         .expect_err("tampered cache must fail");
     assert!(matches!(
         err,
-        MaterializeError::Cache {
+        MaterializeError::CacheBlob {
             source: CacheError::IntegrityMismatch { .. },
             ..
         }
@@ -723,6 +762,11 @@ fn scoped_package_names_use_escaped_store_keys_and_relative_edges() {
     let projection = root.join("node_modules");
 
     let scoped_store = projection.join(".meow/@scope+pkg@1.2.0/node_modules/@scope/pkg");
+    assert_global_unpacked_link(
+        &cache,
+        &scoped_store,
+        &package_integrity(&graph, "@scope/pkg", "1.2.0"),
+    );
     assert!(scoped_store.join("package.json").is_file());
     let edge = projection.join(".meow/consumer@1.0.0/node_modules/@scope/pkg");
     assert_eq!(

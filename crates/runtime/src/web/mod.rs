@@ -153,7 +153,7 @@ fn fetch_extensions(caps: NetCaps, user_agent: String) -> Vec<Extension> {
 /// `Once` makes it idempotent + thread-safe; an Err means a default is already set
 /// (fine — any installed default stops the panic). web-fetch-gated.
 #[cfg(feature = "web-fetch")]
-fn ensure_crypto_provider() {
+pub(crate) fn ensure_crypto_provider() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();

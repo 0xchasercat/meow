@@ -18,6 +18,36 @@ use serde::Serialize;
 use crate::io::backend;
 use crate::io::capability::{CapDenied, CapRequest, CapabilityCheck};
 
+#[derive(Debug, Clone)]
+pub struct PropStr(pub String);
+
+impl std::fmt::Display for PropStr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<&PropStr> for deno_error::PropertyValue {
+    fn from(p: &PropStr) -> Self {
+        deno_error::PropertyValue::String(Cow::Owned(p.0.clone()))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PropStaticStr(pub &'static str);
+
+impl std::fmt::Display for PropStaticStr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<&PropStaticStr> for deno_error::PropertyValue {
+    fn from(p: &PropStaticStr) -> Self {
+        deno_error::PropertyValue::String(Cow::Borrowed(p.0))
+    }
+}
+
 /// Typed failure surface for host-I/O ops. Implements `deno_error::JsError` so it
 /// crosses into JS as a thrown error (rejected promise), never a Rust panic.
 #[derive(Debug, thiserror::Error, deno_error::JsError)]
@@ -32,11 +62,16 @@ pub enum RuntimeIoError {
     ),
     /// Filesystem operation failure (`readFile`, `stat`, `mkdir`, ...).
     #[class(inherit)]
-    #[error("{code}: {detail}, {op} '{path}'")]
+    #[error("{code}: {detail}, {syscall} '{path}'")]
     Fs {
-        op: &'static str,
-        path: String,
-        code: &'static str,
+        #[property]
+        syscall: PropStaticStr,
+        #[property]
+        path: PropStr,
+        #[property]
+        code: PropStaticStr,
+        #[property]
+        errno: i32,
         detail: &'static str,
         #[source]
         #[inherit]
@@ -71,18 +106,19 @@ pub enum RuntimeIoError {
 
 impl RuntimeIoError {
     fn fs(op: &'static str, path: String, source: std::io::Error) -> Self {
-        let (code, detail) = io_code_and_detail(source.kind());
+        let (code, detail, errno) = io_code_detail_and_errno(source.kind());
         Self::Fs {
-            op,
-            path,
-            code,
+            syscall: PropStaticStr(op),
+            path: PropStr(path),
+            code: PropStaticStr(code),
+            errno,
             detail,
             source,
         }
     }
 
     fn cwd(source: std::io::Error) -> Self {
-        let (code, detail) = io_code_and_detail(source.kind());
+        let (code, detail, _) = io_code_detail_and_errno(source.kind());
         Self::Cwd {
             code,
             detail,
@@ -91,7 +127,7 @@ impl RuntimeIoError {
     }
 
     fn connect(addr: String, source: std::io::Error) -> Self {
-        let (code, detail) = io_code_and_detail(source.kind());
+        let (code, detail, _) = io_code_detail_and_errno(source.kind());
         Self::Connect {
             addr,
             code,
@@ -101,27 +137,27 @@ impl RuntimeIoError {
     }
 }
 
-fn io_code_and_detail(kind: std::io::ErrorKind) -> (&'static str, &'static str) {
+fn io_code_detail_and_errno(kind: std::io::ErrorKind) -> (&'static str, &'static str, i32) {
     use std::io::ErrorKind;
 
     match kind {
-        ErrorKind::NotFound => ("ENOENT", "no such file or directory"),
-        ErrorKind::PermissionDenied => ("EACCES", "permission denied"),
-        ErrorKind::AlreadyExists => ("EEXIST", "file already exists"),
-        ErrorKind::InvalidInput => ("EINVAL", "invalid argument"),
-        ErrorKind::InvalidData => ("EINVAL", "invalid data"),
-        ErrorKind::IsADirectory => ("EISDIR", "illegal operation on a directory"),
-        ErrorKind::NotADirectory => ("ENOTDIR", "not a directory"),
-        ErrorKind::DirectoryNotEmpty => ("ENOTEMPTY", "directory not empty"),
-        ErrorKind::ReadOnlyFilesystem => ("EROFS", "read-only file system"),
-        ErrorKind::StorageFull => ("ENOSPC", "no space left on device"),
-        ErrorKind::BrokenPipe => ("EPIPE", "broken pipe"),
-        ErrorKind::ConnectionRefused => ("ECONNREFUSED", "connection refused"),
-        ErrorKind::ConnectionAborted => ("ECONNABORTED", "connection aborted"),
-        ErrorKind::ConnectionReset => ("ECONNRESET", "connection reset by peer"),
-        ErrorKind::TimedOut => ("ETIMEDOUT", "operation timed out"),
-        ErrorKind::Unsupported => ("ENOSYS", "operation not supported"),
-        _ => ("EIO", "I/O error"),
+        ErrorKind::NotFound => ("ENOENT", "no such file or directory", -2),
+        ErrorKind::PermissionDenied => ("EACCES", "permission denied", -13),
+        ErrorKind::AlreadyExists => ("EEXIST", "file already exists", -17),
+        ErrorKind::InvalidInput => ("EINVAL", "invalid argument", -22),
+        ErrorKind::InvalidData => ("EINVAL", "invalid data", -22),
+        ErrorKind::IsADirectory => ("EISDIR", "illegal operation on a directory", -21),
+        ErrorKind::NotADirectory => ("ENOTDIR", "not a directory", -20),
+        ErrorKind::DirectoryNotEmpty => ("ENOTEMPTY", "directory not empty", -39),
+        ErrorKind::ReadOnlyFilesystem => ("EROFS", "read-only file system", -30),
+        ErrorKind::StorageFull => ("ENOSPC", "no space left on device", -28),
+        ErrorKind::BrokenPipe => ("EPIPE", "broken pipe", -32),
+        ErrorKind::ConnectionRefused => ("ECONNREFUSED", "connection refused", -111),
+        ErrorKind::ConnectionAborted => ("ECONNABORTED", "connection aborted", -103),
+        ErrorKind::ConnectionReset => ("ECONNRESET", "connection reset by peer", -104),
+        ErrorKind::TimedOut => ("ETIMEDOUT", "operation timed out", -110),
+        ErrorKind::Unsupported => ("ENOSYS", "operation not supported", -38),
+        _ => ("EIO", "I/O error", -5),
     }
 }
 

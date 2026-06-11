@@ -225,15 +225,31 @@ fn install_success_uses_purr_envelope_in_plain_output() {
     assert!(out.status.success(), "install should succeed: {out:?}");
     let stdout = String::from_utf8(out.stdout).expect("stdout utf8");
     let stderr = String::from_utf8(out.stderr).expect("stderr utf8");
-    assert_eq!(
-        stdout,
-        "😸 [Purrfect!] installed 0 packages → meow.lock.jsonl (no node_modules)\n"
+    assert!(
+        stdout.starts_with("😸 [Purrfect!] installed 0 packages → meow.lock.jsonl"),
+        "install output should report lockfile write"
+    );
+    assert!(
+        stdout.contains("materialized"),
+        "install should default to materialized output"
+    );
+    assert!(
+        stdout.contains("node_modules"),
+        "install output should name the default node_modules projection: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("virtual"),
+        "install output should not frame materialized install as virtual: {stdout:?}"
     );
     assert!(
         stderr.is_empty(),
         "install success should keep stderr empty: {stderr:?}"
     );
     assert!(proj.join("meow.lock.jsonl").is_file(), "lockfile written");
+    assert!(
+        proj.join("node_modules").exists(),
+        "default install should create node_modules"
+    );
     std::fs::remove_dir_all(&proj).ok();
 }
 
@@ -706,7 +722,7 @@ fn run_missing_script_and_file_is_an_honest_error() {
 }
 
 #[test]
-fn run_executes_a_cached_commonjs_package_bin_without_node_modules() {
+fn run_executes_a_cached_commonjs_package_bin_from_unpacked_store() {
     use meow_pkg::{
         Cache, LockEntry, Lockfile, PackageName, RegistryProvenance, Version, VersionReq,
     };
@@ -771,7 +787,10 @@ fn run_executes_a_cached_commonjs_package_bin_without_node_modules() {
             r#"ARGV=["--from-script","from-cli"]"#,
         ))
         .stdout(predicate::str::contains("FILE=").and(predicate::str::contains("unpacked")));
-    assert!(!proj.join("node_modules").exists(), "no node_modules (I-5)");
+    assert!(
+        !proj.join("node_modules").exists(),
+        "run must not synthesize an install projection"
+    );
     std::fs::remove_dir_all(&proj).ok();
 }
 
@@ -789,7 +808,10 @@ fn run_strips_and_runs_typescript_entry() {
         .assert()
         .success()
         .stdout(predicate::str::contains("ts ok"));
-    assert!(!tmp.join("node_modules").exists(), "no node_modules (I-5)");
+    assert!(
+        !tmp.join("node_modules").exists(),
+        "run must not synthesize an install projection"
+    );
     std::fs::remove_dir_all(&tmp).ok();
 }
 
@@ -852,7 +874,10 @@ fn run_imports_a_cached_dev_dependency_from_stock_package_json() {
         .assert()
         .success()
         .stdout(predicate::str::contains("from cache"));
-    assert!(!proj.join("node_modules").exists(), "no node_modules (I-5)");
+    assert!(
+        !proj.join("node_modules").exists(),
+        "run must not synthesize an install projection"
+    );
     std::fs::remove_dir_all(&proj).ok();
 }
 
@@ -983,7 +1008,7 @@ fn run_rejects_a_lockfile_with_duplicate_package_names() {
 
 #[test]
 #[ignore = "real network reality-check"]
-fn install_real_registry_package_and_run_without_node_modules() {
+fn install_real_registry_package_materializes_node_modules_by_default() {
     use meow_pkg::{resolve_roots, Lockfile, PackageName};
 
     let proj = load_tmp("real-install");
@@ -1003,8 +1028,8 @@ fn install_real_registry_package_and_run_without_node_modules() {
         "stdout was {first_stdout:?}"
     );
     assert!(
-        !proj.join("node_modules").exists(),
-        "install must not materialize node_modules"
+        proj.join("node_modules").exists(),
+        "install must materialize node_modules by default"
     );
 
     let lock_path = proj.join("meow.lock.jsonl");
@@ -1057,8 +1082,8 @@ fn install_real_registry_package_and_run_without_node_modules() {
         .success()
         .stdout(predicate::str::contains("{\"fooBar\":true}"));
     assert!(
-        !proj.join("node_modules").exists(),
-        "run must resolve from the cache, not node_modules"
+        proj.join("node_modules").exists(),
+        "run should still succeed with the default materialized install layout"
     );
 
     std::fs::remove_file(&lock_path).expect("remove first lockfile");

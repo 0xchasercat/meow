@@ -11,6 +11,117 @@ use crate::{
     Cache, CacheError, LockEntry, Lockfile, PackageName, RegistryProvenance, Version, VersionReq,
 };
 
+#[derive(Copy, Clone)]
+struct HostPlatform {
+    os: &'static str,
+    cpu: &'static str,
+}
+
+impl HostPlatform {
+    fn current() -> HostPlatform {
+        HostPlatform {
+            os: if cfg!(target_os = "macos") {
+                "darwin"
+            } else if cfg!(target_os = "ios") {
+                "ios"
+            } else if cfg!(target_os = "linux") {
+                "linux"
+            } else if cfg!(target_os = "windows") {
+                "win32"
+            } else if cfg!(target_os = "android") {
+                "android"
+            } else if cfg!(target_os = "freebsd") {
+                "freebsd"
+            } else if cfg!(target_os = "openbsd") {
+                "openbsd"
+            } else if cfg!(target_os = "netbsd") {
+                "netbsd"
+            } else if cfg!(target_os = "dragonfly") {
+                "dragonflybsd"
+            } else if cfg!(target_os = "solaris") {
+                "sunos"
+            } else {
+                "unknown"
+            },
+            cpu: if cfg!(target_arch = "x86_64") {
+                "x64"
+            } else if cfg!(target_arch = "aarch64") {
+                "arm64"
+            } else if cfg!(target_arch = "x86") {
+                "ia32"
+            } else if cfg!(target_arch = "arm") {
+                "arm"
+            } else if cfg!(target_arch = "riscv64") {
+                "riscv64"
+            } else {
+                "unknown"
+            },
+        }
+    }
+}
+
+fn is_compatible_optional_dependency(
+    package: &PackageName,
+    version_meta: &crate::VersionMetadata,
+    host: HostPlatform,
+) -> bool {
+    if !version_meta.os.is_empty() || !version_meta.cpu.is_empty() {
+        return constraints_match(&version_meta.os, host.os)
+            && constraints_match(&version_meta.cpu, host.cpu);
+    }
+
+    package_name_is_next_swc_for_host(package, host)
+}
+
+fn package_name_is_next_swc_for_host(name: &PackageName, host: HostPlatform) -> bool {
+    let Some(rest) = name.as_str().strip_prefix("@next/swc-") else {
+        return true;
+    };
+
+    let mut parts = rest.split('-');
+    let package_os = match parts.next() {
+        Some(package_os) => package_os,
+        None => return true,
+    };
+    match package_os {
+        "darwin" | "linux" | "win32" | "freebsd" | "android" => {}
+        _ => return true,
+    }
+    if !package_os.eq_ignore_ascii_case(host.os) {
+        return false;
+    }
+    let package_cpu = match parts.next() {
+        Some(package_cpu) => package_cpu,
+        None => return false,
+    };
+
+    package_cpu.eq_ignore_ascii_case(host.cpu)
+}
+
+fn constraints_match(values: &[String], target: &str) -> bool {
+    if values.is_empty() {
+        return true;
+    }
+
+    let mut has_allowed = false;
+    let mut is_allowed = false;
+
+    for value in values {
+        if let Some(unset) = value.strip_prefix('!') {
+            if unset.eq_ignore_ascii_case(target) {
+                return false;
+            }
+        } else {
+            has_allowed = true;
+            if value.eq_ignore_ascii_case(target) {
+                is_allowed = true;
+            }
+        }
+    }
+
+    !has_allowed || is_allowed
+}
+
 const INSTALL_HTTP_CONCURRENCY: usize = 40;
 
 #[derive(Debug, Clone)]
@@ -92,6 +203,7 @@ impl<'a> Installer<'a> {
         self.reuse_lockfile = Some(lockfile);
         self
     }
+
     /// Resolve, verify, cache, and pin the complete dependency graph.
     pub fn resolve(
         &self,
@@ -137,6 +249,7 @@ impl<'a> Installer<'a> {
     {
         let mut metadata = BTreeMap::new();
         let mut queue = VecDeque::new();
+        let host = HostPlatform::current();
 
         let direct_names = direct
             .iter()
@@ -196,6 +309,14 @@ impl<'a> Installer<'a> {
                         DepSpec::parse(raw_req).registry_package(dep).clone()
                     }),
                 );
+                dep_names.extend(version_meta.optional_dependencies.iter().filter_map(
+                    |(dep, raw_req)| {
+                        let dep_spec = DepSpec::parse(raw_req);
+                        let dep_registry_name = dep_spec.registry_package(dep);
+                        package_name_is_next_swc_for_host(dep_registry_name, host)
+                            .then(|| dep_registry_name.clone())
+                    },
+                ));
                 planned.push(PlannedNode {
                     name: node.name,
                     version: node.version,
@@ -219,6 +340,37 @@ impl<'a> Installer<'a> {
                     })?;
                     let dep_version =
                         select_version(&dep_registry_name, dep_meta, dep_spec.selection_spec())?;
+                    dependencies.insert(dep.clone(), dep_version.clone());
+                    queue.push_back(QueueNode {
+                        name: dep.clone(),
+                        registry_name: dep_registry_name,
+                        version: dep_version,
+                    });
+                }
+                for (dep, raw_req) in &node.version_meta.optional_dependencies {
+                    let dep_spec = DepSpec::parse(raw_req);
+                    let dep_registry_name = dep_spec.registry_package(dep).clone();
+                    if !package_name_is_next_swc_for_host(&dep_registry_name, host) {
+                        continue;
+                    }
+                    let dep_meta = metadata.get(&dep_registry_name).ok_or_else(|| {
+                        InstallError::Registry(RegistryError::Metadata {
+                            name: dep_registry_name.to_string(),
+                            reason: "metadata missing after prefetch".to_owned(),
+                        })
+                    })?;
+                    let dep_version =
+                        select_version(&dep_registry_name, dep_meta, dep_spec.selection_spec())?;
+                    let dep_locked_meta = dep_meta.versions.get(&dep_version).ok_or_else(|| {
+                        InstallError::MissingVersion {
+                            name: dep_registry_name.to_string(),
+                            version: dep_version.to_string(),
+                        }
+                    })?;
+                    if !is_compatible_optional_dependency(&dep_registry_name, dep_locked_meta, host)
+                    {
+                        continue;
+                    }
                     dependencies.insert(dep.clone(), dep_version.clone());
                     queue.push_back(QueueNode {
                         name: dep.clone(),
@@ -305,6 +457,7 @@ impl<'a> Installer<'a> {
             Err(err) => Err(InstallError::Cache(err)),
         }
     }
+
     async fn fetch_tarballs_parallel<F>(
         &self,
         jobs: Vec<ResolvedNode>,

@@ -152,6 +152,78 @@ fn npm_alias_fetches_target_metadata_but_pins_alias_name() {
     std::fs::remove_dir_all(root).ok();
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn darwin_arm64_optional_dependencies_are_filtered_by_platform_support() {
+    let root = tmp_dir("optional-filter");
+    let cache = Cache::with_root(root.join("cache"));
+    let mut registry = FixtureRegistry::new();
+
+    registry.publish_with_optional_dependencies_and_platform(
+        "next",
+        "15.0.0",
+        &[],
+        &[
+            ("@next/swc-darwin-arm64", "15.0.0"),
+            ("@next/swc-linux-x64-gnu", "15.0.0"),
+        ],
+        &[],
+        &[],
+        b"next".to_vec(),
+    );
+    registry.publish_with_optional_dependencies_and_platform(
+        "@next/swc-darwin-arm64",
+        "15.0.0",
+        &[],
+        &[],
+        &["darwin"],
+        &["arm64"],
+        b"swc-darwin-arm64".to_vec(),
+    );
+    registry.publish_with_optional_dependencies_and_platform(
+        "@next/swc-linux-x64-gnu",
+        "15.0.0",
+        &[],
+        &[],
+        &["linux"],
+        &["x64"],
+        b"swc-linux-x64-gnu".to_vec(),
+    );
+
+    let lockfile = installer(&registry, &cache)
+        .resolve(&dep("next", DepSpec::Range(req("^15.0.0"))))
+        .expect("install succeeds");
+    let next = lockfile
+        .get(&PackageName::new("next"), &ver("15.0.0"))
+        .expect("root package is present");
+
+    assert_eq!(
+        next.dependencies
+            .get(&PackageName::new("@next/swc-darwin-arm64")),
+        Some(&ver("15.0.0")),
+        "darwin/arm64 optional dependency is included in the graph"
+    );
+    assert!(
+        lockfile
+            .get(&PackageName::new("@next/swc-darwin-arm64"), &ver("15.0.0"))
+            .is_some(),
+        "compatible optional dependency package is pinned"
+    );
+    assert!(
+        next.dependencies
+            .get(&PackageName::new("@next/swc-linux-x64-gnu"))
+            .is_none(),
+        "linux/x64 optional dependency is not in the graph"
+    );
+    assert!(
+        lockfile
+            .get(&PackageName::new("@next/swc-linux-x64-gnu"), &ver("15.0.0"))
+            .is_none(),
+        "incompatible optional dependency package is not pinned"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
 #[test]
 fn multi_version_graph_keeps_both_pins() {
     let root = tmp_dir("multiver");

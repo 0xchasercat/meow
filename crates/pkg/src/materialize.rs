@@ -4,11 +4,12 @@ use std::io::{self, ErrorKind, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use crate::archive;
-use crate::{tmp_path, Cache, ContentHash, PackageName, ResolutionGraph, Version};
+use crate::{tmp_path, Cache, ContentHash, PackageName, ResolutionGraph, UnpackedStore, Version};
 
 const STORE_DIR: &str = ".meow";
 const SIDECAR_NAME: &str = ".materialized";
@@ -133,7 +134,7 @@ pub enum MaterializeError {
         version: String,
         member: String,
     },
-    #[error("symlinks unsupported at {} on this filesystem; rerun with --copy (or --vendor)", .path.display())]
+    #[error("symlinks unsupported at {} on this filesystem; use --vendor for a copy-based projection", .path.display())]
     SymlinkUnsupported { path: PathBuf },
     #[error("dependency edge {dep}@{ver} of {name}@{version} is not in the resolved closure")]
     DanglingEdge {
@@ -313,7 +314,7 @@ impl<'a> Materializer<'a> {
     ) -> Result<MaterializeReport, MaterializeError> {
         let plan = self.plan(opts)?;
         let tree_hash = plan.tree_hash();
-        if tree_is_current(&plan, opts, &tree_hash)? {
+        if tree_is_current(&plan, opts, &tree_hash, self.cache)? {
             return Ok(MaterializeReport {
                 root: plan.root.clone(),
                 tree_hash,
@@ -340,70 +341,96 @@ impl<'a> Materializer<'a> {
             ensure_dir(&tmp_root)?;
             ensure_dir(&tmp_root.join(STORE_DIR))?;
 
+            let link = effective_link(opts);
+            let unpacked_store = if matches!(link, LinkStrategy::Symlink) {
+                let cache_root = self.cache.root().to_path_buf();
+                Some(UnpackedStore::new(
+                    cache_root.join("unpacked"),
+                    Arc::new(Cache::with_root(cache_root)),
+                ))
+            } else {
+                None
+            };
+
             for node in &plan.nodes {
-                let rel = path_inside_root(&node.path, &root_rel)?;
-                let abs = tmp_root.join(&rel);
-                if let PlanEntry::Package {
+                let PlanEntry::Package {
                     integrity,
                     name,
                     version,
                 } = &node.entry
-                {
-                    let bytes =
-                        self.cache
-                            .read(integrity)
-                            .map_err(|source| MaterializeError::Cache {
+                else {
+                    continue;
+                };
+                let rel = path_inside_root(&node.path, &root_rel)?;
+                let abs = tmp_root.join(&rel);
+                match link {
+                    LinkStrategy::Copy => {
+                        let bytes = self.cache.read(integrity).map_err(|source| {
+                            MaterializeError::Cache {
                                 name: name.to_string(),
                                 version: version.to_string(),
                                 source,
+                            }
+                        })?;
+                        let stats = archive::unpack_to(&bytes, &abs)
+                            .map_err(|err| err.with_package(name, version))?;
+                        bytes_written += stats.bytes;
+                    }
+                    LinkStrategy::Symlink => {
+                        if needs_real_tree_for_native_walkers(&rel) {
+                            let bytes = self.cache.read(integrity).map_err(|source| {
+                                MaterializeError::Cache {
+                                    name: name.to_string(),
+                                    version: version.to_string(),
+                                    source,
+                                }
                             })?;
-                    let stats = archive::unpack_to(&bytes, &abs)
-                        .map_err(|err| err.with_package(name, version))?;
-                    bytes_written += stats.bytes;
+                            let stats = archive::unpack_to(&bytes, &abs)
+                                .map_err(|err| err.with_package(name, version))?;
+                            bytes_written += stats.bytes;
+                        } else {
+                            let store = unpacked_store.as_ref().expect("unpacked store");
+                            let source = store.ensure(integrity)?;
+                            ensure_dir(abs.parent().unwrap_or(&tmp_root))?;
+                            create_symlink(&source, &abs)?;
+                        }
+                    }
+                    LinkStrategy::Auto => unreachable!("effective link policy resolves auto"),
                 }
             }
 
             for node in &plan.nodes {
+                let PlanEntry::Edge { target } = &node.entry else {
+                    continue;
+                };
                 let rel = path_inside_root(&node.path, &root_rel)?;
                 let abs = tmp_root.join(&rel);
-                if let PlanEntry::Edge { target } = &node.entry {
-                    let parent_rel = rel.parent().unwrap_or(Path::new(""));
-                    let parent_abs = abs.parent().unwrap_or(&tmp_root).to_path_buf();
-                    ensure_dir(&parent_abs)?;
-                    let target_rel = normalize_relative_join(parent_rel, target)?;
-                    let Some(key) = path_index.get(&target_rel) else {
-                        return Err(MaterializeError::DanglingEdge {
-                            name: rel.display().to_string(),
-                            version: rel.display().to_string(),
-                            dep: target.display().to_string(),
-                            ver: target_rel.display().to_string(),
-                        });
-                    };
-                    match opts.link {
-                        LinkStrategy::Symlink => {
-                            create_symlink(target, &abs)?;
-                        }
-                        LinkStrategy::Copy => {
+                let parent_rel = rel.parent().unwrap_or(Path::new(""));
+                let parent_abs = abs.parent().unwrap_or(&tmp_root).to_path_buf();
+                ensure_dir(&parent_abs)?;
+                let target_rel = normalize_relative_join(parent_rel, target)?;
+                let Some(key) = path_index.get(&target_rel) else {
+                    return Err(MaterializeError::DanglingEdge {
+                        name: rel.display().to_string(),
+                        version: rel.display().to_string(),
+                        dep: target.display().to_string(),
+                        ver: target_rel.display().to_string(),
+                    });
+                };
+                match link {
+                    LinkStrategy::Symlink => {
+                        if needs_real_tree_for_native_walkers(&rel) {
                             bytes_written +=
                                 copy_edge_tree(&abs, key, &catalog, &tmp_root, &mut Vec::new())?;
-                        }
-                        LinkStrategy::Auto => {
-                            if let Err(err) = create_symlink(target, &abs) {
-                                if matches!(err, MaterializeError::SymlinkUnsupported { .. }) {
-                                    cleanup_best_effort(&abs);
-                                    bytes_written += copy_edge_tree(
-                                        &abs,
-                                        key,
-                                        &catalog,
-                                        &tmp_root,
-                                        &mut Vec::new(),
-                                    )?;
-                                } else {
-                                    return Err(err);
-                                }
-                            }
+                        } else {
+                            create_symlink(target, &abs)?;
                         }
                     }
+                    LinkStrategy::Copy => {
+                        bytes_written +=
+                            copy_edge_tree(&abs, key, &catalog, &tmp_root, &mut Vec::new())?;
+                    }
+                    LinkStrategy::Auto => unreachable!("effective link policy resolves auto"),
                 }
             }
 
@@ -492,6 +519,17 @@ fn package_catalog(
     records
 }
 
+fn needs_real_tree_for_native_walkers(rel: &Path) -> bool {
+    let mut parts = rel.components();
+    let first = parts.next().map(|part| part.as_os_str().to_string_lossy());
+    let second = parts.next().map(|part| part.as_os_str().to_string_lossy());
+    match (first.as_deref(), second.as_deref(), parts.next()) {
+        (Some(scope), Some(_name), None) if scope.starts_with('@') => true,
+        (Some(_name), None, None) => true,
+        _ => false,
+    }
+}
+
 fn path_index(
     catalog: &BTreeMap<(PackageName, Version), PackageRecord>,
 ) -> BTreeMap<PathBuf, (PackageName, Version)> {
@@ -502,10 +540,13 @@ fn path_index(
     index
 }
 
+
+
 fn tree_is_current(
     plan: &MaterializePlan,
     opts: &MaterializeOptions,
     tree_hash: &ContentHash,
+    cache: &Cache,
 ) -> Result<bool, MaterializeError> {
     let sidecar = read_sidecar(plan.root())?;
     let Some(sidecar) = sidecar else {
@@ -521,16 +562,22 @@ fn tree_is_current(
         return Ok(false);
     }
     let root_rel = projection_root_relative(opts, plan.root.parent().unwrap_or(Path::new("")))?;
+    let link = effective_link(opts);
     for node in &plan.nodes {
         let rel = path_inside_root(&node.path, &root_rel)?;
-        let abs = plan.root.join(rel);
+        let abs = plan.root.join(&rel);
         match &node.entry {
-            PlanEntry::Package { .. } => {
-                if !abs.is_dir() {
-                    return Ok(false);
+            PlanEntry::Package { integrity, .. } => match link {
+                LinkStrategy::Copy => {
+                    let meta = match fs::symlink_metadata(&abs) {
+                        Ok(meta) => meta,
+                        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
+                        Err(err) => return Err(MaterializeError::io(&abs, err)),
+                    };
+                    if !meta.is_dir() || meta.file_type().is_symlink() {
+                        return Ok(false);
+                    }
                 }
-            }
-            PlanEntry::Edge { target } => match opts.link {
                 LinkStrategy::Symlink => {
                     let meta = match fs::symlink_metadata(&abs) {
                         Ok(meta) => meta,
@@ -540,33 +587,51 @@ fn tree_is_current(
                     if !meta.file_type().is_symlink() {
                         return Ok(false);
                     }
-                    let actual =
+                    let target =
                         fs::read_link(&abs).map_err(|source| MaterializeError::io(&abs, source))?;
-                    if actual != *target {
+                    let expected = cache.root().join("unpacked").join(integrity.to_url_host());
+                    if target != expected {
                         return Ok(false);
                     }
-                }
-                LinkStrategy::Copy => {
                     if !abs.is_dir() {
                         return Ok(false);
                     }
                 }
-                LinkStrategy::Auto => {
+                LinkStrategy::Auto => unreachable!("effective link policy resolves auto"),
+            },
+            PlanEntry::Edge { target } => match link {
+                LinkStrategy::Symlink => {
                     let meta = match fs::symlink_metadata(&abs) {
                         Ok(meta) => meta,
                         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
                         Err(err) => return Err(MaterializeError::io(&abs, err)),
                     };
-                    if meta.file_type().is_symlink() {
-                        let actual = fs::read_link(&abs)
-                            .map_err(|source| MaterializeError::io(&abs, source))?;
+                    if needs_real_tree_for_native_walkers(&rel) {
+                        if !meta.is_dir() || meta.file_type().is_symlink() {
+                            return Ok(false);
+                        }
+                    } else {
+                        if !meta.file_type().is_symlink() {
+                            return Ok(false);
+                        }
+                        let actual =
+                            fs::read_link(&abs).map_err(|source| MaterializeError::io(&abs, source))?;
                         if actual != *target {
                             return Ok(false);
                         }
-                    } else if !meta.is_dir() {
+                    }
+                }
+                LinkStrategy::Copy => {
+                    let meta = match fs::symlink_metadata(&abs) {
+                        Ok(meta) => meta,
+                        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
+                        Err(err) => return Err(MaterializeError::io(&abs, err)),
+                    };
+                    if !meta.is_dir() || meta.file_type().is_symlink() {
                         return Ok(false);
                     }
                 }
+                LinkStrategy::Auto => unreachable!("effective link policy resolves auto"),
             },
         }
     }
@@ -963,6 +1028,13 @@ fn parts_to_path(parts: &[String]) -> PathBuf {
     path
 }
 
+fn effective_link(opts: &MaterializeOptions) -> LinkStrategy {
+    match opts.projection {
+        Projection::NodeModules => LinkStrategy::Symlink,
+        Projection::Vendor => LinkStrategy::Copy,
+    }
+}
+
 fn projection_name(projection: Projection) -> &'static str {
     match projection {
         Projection::NodeModules => "node_modules",
@@ -1043,6 +1115,22 @@ mod tests {
             )),
             "../../left-pad@4.5.6/node_modules/left-pad"
         );
+    }
+
+    #[test]
+    fn projection_link_policy_is_strict() {
+        let mut node_modules = MaterializeOptions::node_modules();
+        assert_eq!(effective_link(&node_modules), LinkStrategy::Symlink);
+
+        node_modules.link = LinkStrategy::Copy;
+        assert_eq!(effective_link(&node_modules), LinkStrategy::Symlink);
+
+        node_modules.link = LinkStrategy::Auto;
+        assert_eq!(effective_link(&node_modules), LinkStrategy::Symlink);
+
+        let mut vendor = MaterializeOptions::vendor();
+        vendor.link = LinkStrategy::Symlink;
+        assert_eq!(effective_link(&vendor), LinkStrategy::Copy);
     }
 
     #[test]

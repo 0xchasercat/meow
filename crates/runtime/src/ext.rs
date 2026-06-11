@@ -10,6 +10,7 @@
 //! `meow:*` surfaces (RT-005 `meow:http`, UI-001 `meow:ui`) live in separate
 //! extensions layered through [`crate::RuntimeOptions`].
 
+use std::cell::RefCell;
 use std::io::{self, Write};
 use std::rc::Rc;
 
@@ -29,6 +30,9 @@ pub type PrintFn = Rc<dyn Fn(&str, bool)>;
 /// I/O point at P0 (I-6: no other ambient reads/writes are introduced).
 #[derive(Clone)]
 pub struct PrintSink(pub PrintFn);
+
+#[derive(Clone)]
+pub(crate) struct ProcessExitCell(pub Rc<RefCell<Option<i32>>>);
 
 /// The ONLY host I/O op in the base runtime extension. Synchronous, infallible-by-
 /// contract write that honors a [`PrintSink`] override when present, else writes
@@ -59,9 +63,70 @@ pub(crate) fn write_output(state: &mut OpState, msg: &str, is_err: bool) -> Resu
     Ok(())
 }
 
+#[op2(fast)]
+fn op_current_thread_cpu_usage(#[buffer] out: &mut [f64]) {
+    if out.len() >= 2 {
+        out[0] = 0.0;
+        out[1] = 0.0;
+    }
+}
+
+#[op2(fast)]
+fn op_bootstrap_color_depth() -> i32 {
+    24
+}
+
+#[op2]
+#[serde]
+fn op_http_serve_address_override() -> (i32, String, u16, bool) {
+    (0, String::new(), 0, false)
+}
+
+#[op2]
+#[serde]
+fn op_bootstrap_unstable_args() -> Vec<String> {
+    Vec::new()
+}
+
+#[op2(fast)]
+fn op_meow_record_process_exit(state: &mut OpState, code: i32) {
+    if let Some(cell) = state.try_borrow::<ProcessExitCell>() {
+        *cell.0.borrow_mut() = Some(code);
+    }
+}
+
+#[op2]
+#[string]
+fn op_meow_host_platform() -> String {
+    match std::env::consts::OS {
+        "macos" => "darwin".to_owned(),
+        "windows" => "win32".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+#[op2]
+#[string]
+fn op_meow_host_arch() -> String {
+    match std::env::consts::ARCH {
+        "aarch64" => "arm64".to_owned(),
+        "x86_64" => "x64".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
 deno_core::extension!(
     meow_runtime,
-    ops = [op_meow_print],
+    ops = [
+        op_meow_print,
+        op_current_thread_cpu_usage,
+        op_bootstrap_color_depth,
+        op_bootstrap_unstable_args,
+        op_meow_host_platform,
+        op_meow_host_arch,
+        op_meow_record_process_exit,
+        op_http_serve_address_override
+    ],
     esm_entry_point = "ext:meow_runtime/bootstrap.js",
     esm = [dir "src/js", "bootstrap.js"],
 );

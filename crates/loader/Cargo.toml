@@ -13,11 +13,13 @@ version.workspace = true
 # V8 module-loader trait + `url::Url` (re-exported, so the `Url`/`ModuleSpecifier`
 # types unify with the runtime's). No direct `url` pin — avoids a second version.
 deno_core = { workspace = true }
+deno_error = { workspace = true }
 # The ONE parser/graph (I-1): feed text in, pull type-erased runtime IR out.
 meow-graph = { path = "../graph" }
 # The content-addressed cache + lockfile types (I-7). Depend, never redefine.
 meow-pkg = { path = "../pkg" }
 thiserror = { workspace = true }
+node_resolver = { workspace = true }
 # === LOAD-003 ===
 flate2 = { workspace = true }
 serde = { workspace = true }

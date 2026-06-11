@@ -117,6 +117,9 @@ impl Runtime {
         let js_runtime = JsRuntime::try_new(DenoRuntimeOptions {
             module_loader: Some(options.module_loader),
             extensions,
+            extension_transpiler: Some(std::rc::Rc::new(|specifier, source| {
+                maybe_transpile_source(specifier, source)
+            })),
             ..Default::default()
         })
         .map_err(|err| RuntimeError::Init(err.to_string()))?;
@@ -190,19 +193,106 @@ impl Runtime {
     /// await the evaluation result — surfacing whichever fails first as a typed
     /// error. An uncaught top-level throw / TLA rejection propagates through the
     /// event loop; a non-JS loop failure becomes [`RuntimeError::EventLoop`].
+    /// The canonical deno_core dance: kick off evaluation, pump the event
+    /// loop until the module resolves, then continue pumping for any
+    /// lingering server/async work. An uncaught top-level throw / TLA
+    /// rejection propagates through the event loop; a non-JS loop failure
+    /// becomes [`RuntimeError::EventLoop`].
     async fn evaluate_to_completion(
         &mut self,
         spec: &ModuleSpecifier,
         id: ModuleId,
     ) -> Result<(), RuntimeError> {
         let specifier = spec.as_str();
-        let eval = self.js_runtime.mod_evaluate(id);
+        let mut eval = Box::pin(self.js_runtime.mod_evaluate(id));
+        // Phase 1: pump until module evaluation finishes
+        loop {
+            tokio::select! {
+                result = &mut eval => {
+                    result.map_err(|err| error::classify_eval_error(specifier, err))?;
+                    break;
+                }
+                result = self.js_runtime.run_event_loop(PollEventLoopOptions::default()) => {
+                    result.map_err(|err| error::classify_eval_error(specifier, err))?;
+                }
+            }
+        }
+        // Phase 2: keep pumping for server/async handles
         self.js_runtime
             .run_event_loop(PollEventLoopOptions::default())
             .await
-            .map_err(|err| error::classify_eval_error(specifier, err))?;
-        eval.await
-            .map_err(|err| error::classify_eval_error(specifier, err))?;
-        Ok(())
+            .map_err(|err| error::classify_eval_error(specifier, err))
+    }
+}
+
+fn maybe_transpile_source(
+    specifier: deno_core::ModuleName,
+    source: deno_core::ModuleCodeString,
+) -> Result<
+    (
+        deno_core::ModuleCodeString,
+        Option<deno_core::SourceMapData>,
+    ),
+    deno_error::JsErrorBox,
+> {
+    use deno_ast::{MediaType, ModuleKind, ParseParams, SourceMapOption};
+
+    let specifier_str = specifier.as_str();
+    let should_transpile = specifier_str.starts_with("node:")
+        || specifier_str.starts_with("ext:")
+        || specifier_str.ends_with(".ts")
+        || specifier_str.ends_with(".mts")
+        || specifier_str.ends_with(".cts")
+        || specifier_str.ends_with(".tsx")
+        || specifier_str.ends_with(".jsx");
+
+    if should_transpile {
+        let parsed_specifier =
+            deno_core::ModuleSpecifier::parse(specifier_str).unwrap_or_else(|_| {
+                deno_core::ModuleSpecifier::parse(&format!("file:///{}", specifier_str)).unwrap()
+            });
+
+        let media_type = if specifier_str.ends_with(".tsx") {
+            MediaType::Tsx
+        } else if specifier_str.ends_with(".jsx") {
+            MediaType::Jsx
+        } else {
+            MediaType::TypeScript
+        };
+
+        let parsed = deno_ast::parse_module(ParseParams {
+            specifier: parsed_specifier,
+            text: source.as_str().into(),
+            media_type,
+            capture_tokens: false,
+            scope_analysis: false,
+            maybe_syntax: None,
+        })
+        .map_err(deno_error::JsErrorBox::from_err)?;
+
+        let transpiled = parsed
+            .transpile(
+                &deno_ast::TranspileOptions {
+                    imports_not_used_as_values: deno_ast::ImportsNotUsedAsValues::Remove,
+                    ..Default::default()
+                },
+                &deno_ast::TranspileModuleOptions {
+                    module_kind: Some(ModuleKind::Esm),
+                },
+                &deno_ast::EmitOptions {
+                    source_map: SourceMapOption::Separate,
+                    inline_sources: true,
+                    ..Default::default()
+                },
+            )
+            .map_err(deno_error::JsErrorBox::from_err)?
+            .into_source();
+
+        Ok((
+            transpiled.text.into(),
+            transpiled.source_map.map(|s| s.into_bytes().into()),
+        ))
+    } else {
+        Ok((source, None))
     }
 }

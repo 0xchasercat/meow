@@ -1,12 +1,13 @@
 //! Loader behavior tests. Exercise the real resolver + loader + runtime without any
 //! `node_modules` tree on disk.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use deno_core::url::Url;
 use deno_core::{
@@ -20,6 +21,7 @@ use meow_loader::{
 use meow_pkg::{
     Cache, CacheError, LockEntry, Lockfile, PackageName, RegistryProvenance, Version, VersionReq,
 };
+use meow_runtime::node::NpmPackageFolderResolver;
 use meow_runtime::{hermetic, node, print_sink_extension, PrintSink, Runtime, RuntimeOptions};
 
 fn unique_dir(tag: &str) -> std::path::PathBuf {
@@ -119,57 +121,184 @@ fn capture() -> (Rc<RefCell<String>>, deno_core::Extension) {
     }));
     (out, print_sink_extension(sink))
 }
-struct TestCjsResolver(Mutex<Resolver>);
+struct TestDenoNodeBridge {
+    resolver: Resolver,
+    store: meow_pkg::UnpackedStore,
+}
 
-impl node::CjsResolver for TestCjsResolver {
-    fn resolve_and_load_cjs(
+impl TestDenoNodeBridge {
+    fn new(resolver: Resolver, cache_root: &Path) -> Self {
+        let cache = cache_arc(cache_root);
+        Self {
+            resolver,
+            store: meow_pkg::UnpackedStore::new(cache_root.join("unpacked"), cache),
+        }
+    }
+
+    fn referrer_url(&self, referrer: &node::UrlOrPathRef) -> Url {
+        if let Ok(path) = referrer.path() {
+            if let Some(url) = self.unpacked_path_to_cache_url(path) {
+                return url;
+            }
+        }
+        referrer.url().expect("test bridge referrer URL").clone()
+    }
+
+    fn unpacked_path_to_cache_url(&self, path: &Path) -> Option<Url> {
+        let rel = path.strip_prefix(self.store.root()).ok()?;
+        let mut components = rel.components();
+        let package_host = components.next()?.as_os_str().to_str()?;
+        let package = meow_pkg::ContentHash::from_url_host(package_host).ok()?;
+        let member = components.as_path().to_string_lossy().replace('\\', "/");
+        if member.is_empty() {
+            return None;
+        }
+        Some(encode_cache_url(&package, &member))
+    }
+
+    fn module_kind(&self, specifier: &Url) -> Option<ModuleKind> {
+        let resolved = self
+            .resolver
+            .resolve_require(specifier.as_str(), specifier)
+            .ok()?;
+        Some(resolved.kind)
+    }
+}
+
+impl node::NpmPackageFolderResolver for TestDenoNodeBridge {
+    fn resolve_package_folder_from_package(
         &self,
         specifier: &str,
-        referrer: &str,
-    ) -> Result<node::CjsLoadedModule, String> {
-        let referrer_url =
-            Url::parse(referrer).map_err(|_| format!("invalid CommonJS referrer {referrer}"))?;
-        let resolver = self
-            .0
-            .lock()
-            .map_err(|_| "CommonJS resolver lock poisoned".to_owned())?;
-        let resolved = resolver
+        referrer: &node::UrlOrPathRef,
+    ) -> Result<PathBuf, node::PackageFolderResolveError> {
+        let referrer_url = self.referrer_url(referrer);
+        let resolved = self
+            .resolver
             .resolve_require(specifier, &referrer_url)
-            .map_err(|err| err.to_string())?;
-        if resolved.kind == meow_loader::ModuleKind::Esm {
-            return Err(format!("cannot require ES module {}", resolved.url));
+            .unwrap_or_else(|err| {
+                panic!(
+                    "test Deno Node bridge failed to resolve package {specifier:?} from {}: {err}",
+                    referrer.display()
+                )
+            });
+
+        let package_root = match resolved.locator {
+            ModuleLocator::Cached { package, .. } => {
+                let package_label = package.to_sri();
+                self.store.ensure(&package).unwrap_or_else(|err| {
+                    panic!("test Deno Node bridge failed to unpack package {package_label}: {err}")
+                })
+            }
+            ModuleLocator::LocalFile(ref path) => {
+                path.parent().unwrap_or(path.as_path()).to_path_buf()
+            }
+            ModuleLocator::Native { .. } => {
+                panic!(
+                    "test Deno Node bridge cannot expose native module {specifier:?} as a package"
+                )
+            }
+        };
+        Ok(package_root)
+    }
+
+    fn resolve_types_package_folder(
+        &self,
+        types_package_name: &str,
+        _maybe_package_version: Option<&node::Version>,
+        maybe_referrer: Option<&node::UrlOrPathRef>,
+    ) -> Option<PathBuf> {
+        let types_package_name = if types_package_name.starts_with("@types/") {
+            types_package_name.to_owned()
+        } else {
+            format!("@types/{types_package_name}")
+        };
+        let referrer = maybe_referrer
+            .and_then(|referrer| referrer.url().ok())
+            .unwrap_or_else(|| self.resolver.project_root());
+        let referrer = node::UrlOrPathRef::from_url(referrer);
+        self.resolve_package_folder_from_package(&types_package_name, &referrer)
+            .ok()
+    }
+}
+
+impl node::InNpmPackageChecker for TestDenoNodeBridge {
+    fn in_npm_package(&self, specifier: &Url) -> bool {
+        if specifier.scheme() == meow_loader::CACHE_SCHEME {
+            return true;
         }
-        let filename = resolver
-            .runtime_path_for(&resolved.locator)
-            .map_err(|err| err.to_string())?
-            .to_string_lossy()
-            .into_owned();
-        let dirname = PathBuf::from(&filename)
-            .parent()
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let kind = match resolved.kind {
-            meow_loader::ModuleKind::Json => "json",
-            meow_loader::ModuleKind::Cjs => "cjs",
-            meow_loader::ModuleKind::Esm => unreachable!("ESM was rejected above"),
+        let Ok(path) = specifier.to_file_path() else {
+            return false;
+        };
+        path.starts_with(self.store.root())
+    }
+}
+
+impl node::NodeRequireLoader for TestDenoNodeBridge {
+    fn ensure_read_permission<'a>(
+        &self,
+        _permissions: &mut node::PermissionsContainer,
+        path: Cow<'a, Path>,
+    ) -> Result<Cow<'a, Path>, node::JsErrorBox> {
+        Ok(path)
+    }
+
+    fn load_text_file_lossy(&self, path: &Path) -> Result<node::FastString, node::JsErrorBox> {
+        let source = std::fs::read(path).map_err(|err| {
+            node::JsErrorBox::generic(format!("failed reading {}: {err}", path.display()))
+        })?;
+        Ok(String::from_utf8_lossy(&source).into_owned().into())
+    }
+
+    fn is_maybe_cjs(&self, specifier: &Url) -> Result<bool, node::PackageJsonLoadError> {
+        if let Ok(path) = specifier.to_file_path() {
+            if let Some(cache_url) = self.unpacked_path_to_cache_url(&path) {
+                return Ok(matches!(
+                    self.module_kind(&cache_url),
+                    Some(ModuleKind::Cjs)
+                ));
+            }
+            match path.extension().and_then(|ext| ext.to_str()) {
+                None | Some("cjs") | Some("cts") => return Ok(true),
+                Some("json") | Some("mjs") | Some("mts") => return Ok(false),
+                _ => {}
+            }
         }
-        .to_owned();
-        Ok(node::CjsLoadedModule {
-            url: resolved.url.to_string(),
-            filename,
-            dirname,
-            source: resolved.source.as_ref().to_owned(),
-            kind,
-        })
+        Ok(matches!(self.module_kind(specifier), Some(ModuleKind::Cjs)))
+    }
+
+    fn is_maybe_cjs_from_require(
+        &self,
+        specifier: &Url,
+    ) -> Result<bool, node::PackageJsonLoadError> {
+        self.is_maybe_cjs(specifier)
+    }
+
+    fn resolve_package_folder_from_name(&self, package_name: &str) -> Option<PathBuf> {
+        let referrer = node::UrlOrPathRef::from_url(self.resolver.project_root());
+        self.resolve_package_folder_from_package(package_name, &referrer)
+            .ok()
     }
 }
 
 // === RT-007 ===
-fn node_extensions(resolver: Option<Resolver>) -> Vec<deno_core::Extension> {
-    let mut opts = node::NodeOptions::enabled(Vec::new(), PathBuf::from("."));
-    opts.cjs_resolver = resolver.map(|resolver| {
-        Arc::new(TestCjsResolver(Mutex::new(resolver))) as Arc<dyn node::CjsResolver>
-    });
+fn node_extensions_without_bridge(cwd: &Path) -> Vec<deno_core::Extension> {
+    node_extensions(cwd, None)
+}
+
+fn node_extensions_with_bridge(
+    cwd: &Path,
+    resolver: Resolver,
+    cache_root: &Path,
+) -> Vec<deno_core::Extension> {
+    node_extensions(cwd, Some(TestDenoNodeBridge::new(resolver, cache_root)))
+}
+
+fn node_extensions(cwd: &Path, bridge: Option<TestDenoNodeBridge>) -> Vec<deno_core::Extension> {
+    let mut opts = node::NodeOptions::enabled(Vec::new(), cwd.to_path_buf());
+    if let Some(bridge) = bridge {
+        let bridge: Rc<dyn node::DenoNodeBridge> = Rc::new(bridge);
+        opts.deno_node_services = Some(node::DenoNodeServicesBuilder::new(bridge).build());
+    }
     let mut exts = node::extensions(opts);
     exts.extend(hermetic::extensions(hermetic::HermeticConfig::default()));
     exts
@@ -198,13 +327,19 @@ fn load_code(loader: &MeowModuleLoader, spec: &ModuleSpecifier) -> Result<String
 async fn run_entry(
     loader: Rc<dyn ModuleLoader>,
     resolver: Resolver,
+    cache_root: Option<&Path>,
     entry: &Path,
     mut extensions: Vec<deno_core::Extension>,
 ) -> Result<(), meow_runtime::RuntimeError> {
     // === RT-007 ===
-    // Every CJS executor pre-injects the full `node:*` built-in set, so the
-    // `meow_node` ops must be registered before we evaluate the entry module.
-    extensions.extend(node_extensions(Some(resolver)));
+    // Deno's CommonJS executor owns `require()` and `node:*`; cached npm
+    // package paths are supplied only for tests that actually cross that seam.
+    let cwd = entry.parent().unwrap_or_else(|| Path::new("."));
+    extensions.push(meow_loader::cjs_resolve_extension(resolver.clone()));
+    extensions.extend(match cache_root {
+        Some(cache_root) => node_extensions_with_bridge(cwd, resolver, cache_root),
+        None => node_extensions_without_bridge(cwd),
+    });
     // === /RT-007 ===
     let mut rt = Runtime::new(RuntimeOptions {
         module_loader: loader,
@@ -268,10 +403,10 @@ async fn cached_dep_runs_end_to_end_with_no_node_modules() {
     let (out, sink_ext) = capture();
     let mut rt = Runtime::new(RuntimeOptions {
         module_loader: loader,
-        // === RT-007 === CJS executors pre-import the `node:*` set, so the
-        // meow_node ops have to be live before the entry module evaluates.
+        // === RT-007 === Pure ESM loading only needs Deno's Node built-ins
+        // registered; no package-folder bridge is involved here.
         extensions: {
-            let mut exts = node_extensions(Some(resolver.clone()));
+            let mut exts = node_extensions_without_bridge(&proj);
             exts.push(sink_ext);
             exts
         },
@@ -566,6 +701,71 @@ fn cached_package_missing_lockfile_entry_falls_back_to_node_builtin() {
 
     std::fs::remove_dir_all(&proj).ok();
 }
+#[tokio::test]
+async fn cached_package_uses_root_peer_dependency() {
+    let proj = unique_dir("peer-dep-fallback");
+    let cache_root = proj.join("cache");
+    let cache = Cache::with_root(&cache_root);
+
+    let react_hash = cache
+        .store(&archive(&[
+            (
+                "package.json",
+                br#"{"name":"react","version":"1.0.0","type":"commonjs","main":"./index.js"}"#,
+            ),
+            (
+                "index.js",
+                b"module.exports = { value: 'peer root react' };\n",
+            ),
+        ]))
+        .expect("store react peer provider");
+
+    let next_hash = cache
+        .store(&archive(&[
+            (
+                "package.json",
+                br#"{"name":"next","version":"1.0.0","type":"commonjs","main":"./index.js","peerDependencies":{"react":"1.0.0"}}"#,
+            ),
+            ("index.js", b"module.exports = require('react');\n"),
+        ]))
+        .expect("store next peer consumer");
+
+    let mut lockfile = Lockfile::new();
+    lockfile.upsert(lock_entry("react", "1.0.0", react_hash.clone(), &[]));
+    lockfile.upsert(lock_entry("next", "1.0.0", next_hash, &[]));
+
+    let entry = proj.join("main.cjs");
+    std::fs::write(
+        &entry,
+        "const react = require('next');\nconsole.log(react.value);\n",
+    )
+    .expect("write entry");
+
+    let resolver = resolver_with(
+        &cache_root,
+        lockfile,
+        root_deps(&[("next", "1.0.0"), ("react", "1.0.0")]),
+        &proj,
+    );
+    let loader: Rc<dyn ModuleLoader> = Rc::new(MeowModuleLoader::new(
+        resolver.clone(),
+        Rc::new(RefCell::new(GraphDb::new())),
+    ));
+    let (out, sink_ext) = capture();
+    run_entry(
+        loader,
+        resolver.clone(),
+        Some(&cache_root),
+        &entry,
+        vec![sink_ext],
+    )
+    .await
+    .expect("cached package resolves peer dependency from root");
+
+    assert_eq!(*out.borrow(), "peer root react\n");
+    assert!(!proj.join("node_modules").exists());
+    std::fs::remove_dir_all(&proj).ok();
+}
 
 #[test]
 fn ts_source_is_stripped_on_load() {
@@ -653,7 +853,7 @@ async fn first_party_js_commonjs_runs_end_to_end() {
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, resolver.clone(), &entry, vec![sink_ext])
+    run_entry(loader, resolver.clone(), None, &entry, vec![sink_ext])
         .await
         .expect("first-party CommonJS runs");
 
@@ -688,9 +888,15 @@ async fn esm_imports_cached_cjs_dependency() {
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, resolver.clone(), &entry, vec![sink_ext])
-        .await
-        .expect("cached CJS dependency imports");
+    run_entry(
+        loader,
+        resolver.clone(),
+        Some(&cache_root),
+        &entry,
+        vec![sink_ext],
+    )
+    .await
+    .expect("cached CJS dependency imports");
 
     assert_eq!(*out.borrow(), "cache-cjs\n");
     assert!(!proj.join("node_modules").exists());
@@ -706,11 +912,23 @@ async fn extensionless_cached_commonjs_bin_runs_via_native_cjs_runtime() {
         .store(&archive(&[
             (
                 "package.json",
-                br#"{"name":"next","version":"1.0.0","type":"commonjs","bin":{"next":"dist/bin/next"}}"#,
+                br#"{"name":"next","version":"1.0.0","type":"commonjs","main":"dist/server/root-main.js","bin":{"next":"dist/bin/next"}}"#,
             ),
             (
                 "dist/bin/next",
-                b"Object.defineProperty(exports, '__esModule', { value: true });\nexports.run = 'ok';\nconsole.log(exports.run);\n",
+                b"const hook = require('../server/require-hook');\nconsole.log(hook.value);\n",
+            ),
+            (
+                "dist/server/require-hook.js",
+                b"process.env.MEOW_TEST_NEXT = 'yes';\nconst os = require('os');\nconst target = require(require.resolve(__dirname + '/require-target'));\nconst packageRoot = __dirname.slice(0, __dirname.indexOf('/dist/server'));\nconst rootTarget = require(require.resolve(packageRoot));\nexports.value = typeof process + ':' + typeof process.env + ':' + process.env.MEOW_TEST_NEXT + ':' + String(typeof os.tmpdir() === 'string') + ':' + String(global === globalThis) + ':' + typeof performance.now + ':' + typeof TextEncoderStream + ':' + typeof atob + ':' + typeof setInterval + ':' + typeof Event + ':' + target.value + ':' + rootTarget.value;\n",
+            ),
+            (
+                "dist/server/require-target.js",
+                b"exports.value = 'hooked';\n",
+            ),
+            (
+                "dist/server/root-main.js",
+                b"exports.value = 'root';\n",
             ),
         ]))
         .expect("store dep blob");
@@ -730,9 +948,14 @@ async fn extensionless_cached_commonjs_bin_runs_via_native_cjs_runtime() {
     let (out, sink_ext) = capture();
     let mut rt = Runtime::new(RuntimeOptions {
         module_loader: loader,
-        // === RT-007 === see note on the entry above
+        // === RT-007 === cached CommonJS execution needs the Deno package bridge.
         extensions: {
-            let mut exts = node_extensions(Some(resolver.clone()));
+            let mut exts = vec![meow_loader::cjs_resolve_extension(resolver.clone())];
+            exts.extend(node_extensions_with_bridge(
+                &proj,
+                resolver.clone(),
+                &cache_root,
+            ));
             exts.push(sink_ext);
             exts
         },
@@ -753,7 +976,10 @@ async fn extensionless_cached_commonjs_bin_runs_via_native_cjs_runtime() {
         .await
         .expect("extensionless CJS bin runs");
 
-    assert_eq!(*out.borrow(), "ok\n");
+    assert_eq!(
+        *out.borrow(),
+        "object:object:yes:true:true:function:function:function:function:function:hooked:root\n"
+    );
     assert!(!proj.join("node_modules").exists());
     std::fs::remove_dir_all(&proj).ok();
 }
@@ -790,11 +1016,61 @@ async fn commonjs_require_uses_require_export_condition_for_cached_dep() {
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, resolver.clone(), &entry, vec![sink_ext])
-        .await
-        .expect("require branch runs");
+    run_entry(
+        loader,
+        resolver.clone(),
+        Some(&cache_root),
+        &entry,
+        vec![sink_ext],
+    )
+    .await
+    .expect("require branch runs");
 
     assert_eq!(*out.borrow(), "cjs\n");
+    std::fs::remove_dir_all(&proj).ok();
+}
+#[tokio::test]
+async fn commonjs_cached_package_self_reference_uses_legacy_resolution_when_exports_miss() {
+    let proj = unique_dir("self-reference-legacy-fallback");
+    let cache_root = proj.join("cache");
+    let cache = Cache::with_root(&cache_root);
+    let self_hash = cache
+        .store(&archive(&[
+            (
+                "package.json",
+                br#"{"name":"pkg","version":"1.0.0","type":"commonjs","exports":{"." : "./index.js"}}"#,
+            ),
+            ("index.js", b"module.exports = require('pkg/internal-or-subpath');\n"),
+            ("internal-or-subpath", b"module.exports = 'legacy';\n"),
+        ]))
+        .expect("store self package");
+
+    let mut lockfile = Lockfile::new();
+    lockfile.upsert(lock_entry("pkg", "1.0.0", self_hash, &[]));
+    let entry = proj.join("main.cjs");
+    std::fs::write(
+        &entry,
+        "const value = require('pkg');\nconsole.log(value);\n",
+    )
+    .expect("write entry");
+
+    let resolver = resolver_with(&cache_root, lockfile, root_deps(&[("pkg", "1.0.0")]), &proj);
+    let loader: Rc<dyn ModuleLoader> = Rc::new(MeowModuleLoader::new(
+        resolver.clone(),
+        Rc::new(RefCell::new(GraphDb::new())),
+    ));
+    let (out, sink_ext) = capture();
+    run_entry(
+        loader,
+        resolver.clone(),
+        Some(&cache_root),
+        &entry,
+        vec![sink_ext],
+    )
+    .await
+    .expect("self-ref require reaches legacy fallback");
+
+    assert_eq!(*out.borrow(), "legacy\n");
     std::fs::remove_dir_all(&proj).ok();
 }
 
@@ -819,7 +1095,7 @@ async fn esm_imports_cjs_default_named_and_reassignment() {
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, resolver.clone(), &entry, vec![sink_ext])
+    run_entry(loader, resolver.clone(), None, &entry, vec![sink_ext])
         .await
         .expect("ESM imports CJS");
 
@@ -853,7 +1129,7 @@ async fn circular_commonjs_sees_partial_exports_object() {
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, resolver.clone(), &entry, vec![sink_ext])
+    run_entry(loader, resolver.clone(), None, &entry, vec![sink_ext])
         .await
         .expect("cycle runs");
 
@@ -885,7 +1161,7 @@ async fn repeated_require_returns_the_same_object() {
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, resolver.clone(), &entry, vec![sink_ext])
+    run_entry(loader, resolver.clone(), None, &entry, vec![sink_ext])
         .await
         .expect("repeat require runs");
 
@@ -932,9 +1208,15 @@ async fn dirname_and_filename_use_real_local_and_unpacked_cached_paths() {
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, resolver.clone(), &entry, vec![sink_ext])
-        .await
-        .expect("path metadata runs");
+    run_entry(
+        loader,
+        resolver.clone(),
+        Some(&cache_root),
+        &entry,
+        vec![sink_ext],
+    )
+    .await
+    .expect("path metadata runs");
 
     let value: serde_json::Value = serde_json::from_str(out.borrow().trim()).expect("json");
     let cached_root = cache_root.join("unpacked").join(dep_hash.to_url_host());
@@ -972,7 +1254,7 @@ async fn dynamic_require_resolves_at_runtime() {
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, resolver.clone(), &entry, vec![sink_ext])
+    run_entry(loader, resolver.clone(), None, &entry, vec![sink_ext])
         .await
         .expect("dynamic require resolves through native CJS");
     assert_eq!(*out.borrow(), "42\n");
@@ -1000,7 +1282,7 @@ async fn unresolvable_static_require_falls_through_to_catchable_runtime_error() 
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, resolver.clone(), &entry, vec![sink_ext])
+    run_entry(loader, resolver.clone(), None, &entry, vec![sink_ext])
         .await
         .expect("optional require wrapped in try/catch must not abort build");
 
@@ -1029,7 +1311,7 @@ async fn erasable_typescript_commonjs_runs() {
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, resolver.clone(), &entry, vec![sink_ext])
+    run_entry(loader, resolver.clone(), None, &entry, vec![sink_ext])
         .await
         .expect("TS CommonJS runs");
 

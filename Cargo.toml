@@ -57,12 +57,6 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 rustls = "0.23"
 # === /PKG-002 ===
 # === /PKG-001 ===
-# === RT-007 ===
-# Node `crypto` compatibility: sync hash/HMAC algorithms commonly used by Node CLIs.
-sha1 = "0.10"
-hmac = "0.12"
-md5 = { package = "md-5", version = "0.10" }
-# === /RT-007 ===
 # === GRAPH-001 ===
 # The ONE parser (I-1, P15): Oxc, pinned together at one generation. The
 # umbrella `oxc` (DIST-001) is left declared-but-unused — sub-crates give per-feature
@@ -100,19 +94,37 @@ oxc_ast_visit = "0.134"
 # strict-web Stateless-Edge globals (CANON §8.1). Unmodified upstream Deno web
 # extension crates, co-versioned with the `deno_core 0.403` pin above (they release
 # in lockstep — these are the 0.403-matching set). Consumed ONLY by crates/runtime
-# (the sole V8 edge, I-10). deno_url + deno_console were merged into deno_web at
-# this generation, so URL/URLPattern/console live in deno_web. `deno_permissions`
+# (the sole V8 edge, I-10). URL/URLPattern/console live in deno_web at this
+# generation; deno_url/deno_console remain pinned as deprecated compatibility crates.
 # supplies the concrete `PermissionsContainer` deno_fetch reads from `OpState`;
 # `hyper-util` supplies the `Name` type for the capability-gated DNS resolver
 # (crates/runtime/src/web/perms.rs). No version literal diverges from deno_core.
 deno_webidl = "0.250.0"
 deno_web = "0.281.0"
+deno_url = "0.222.0"
+deno_console = "0.222.0"
 deno_crypto = "0.264.0"
 deno_fetch = "0.274.0"
 # deno_fetch's client JS (`22_http_client.js`) lazy-loads deno_net's TLS polyfill,
 # so the embedder must also register deno_net (co-versioned). Net ops are unused
 # (fetch has its own hyper client); it is wired only so the JS graph resolves.
 deno_net = "0.242.0"
+# === RT-007 ===
+# Deno-owned Node/CommonJS/N-API compatibility core for the P2.5 harvest.
+deno_node = "0.188.0"
+deno_node_crypto = "0.20.0"
+deno_napi = "0.181.0"
+deno_fs = "0.160.0"
+deno_io = "0.160.0"
+deno_os = "0.67.0"
+deno_process = "0.65.0"
+deno_telemetry = "0.72.0"
+node_resolver = "0.88.0"
+deno_package_json = { version = "0.52.0", default-features = false }
+deno_semver = "=0.10.0"
+# Concrete filesystem/sys object used to construct Deno's Node resolver services.
+sys_traits = { version = "0.1.28", features = ["real", "winapi", "libc"] }
+# === /RT-007 ===
 deno_permissions = "0.109.0"
 hyper-util = { version = "0.1", features = ["client-legacy"] }
 # === RT-005 ===

@@ -29,6 +29,8 @@ pub struct PackageJson {
     pub exports: Option<Exports>,
     #[serde(default)]
     pub imports: Option<BTreeMap<String, ExportsTarget>>,
+    #[serde(rename = "peerDependencies", default)]
+    pub peer_dependencies: BTreeMap<String, String>,
 }
 
 // === RUN-001 ===
@@ -144,6 +146,13 @@ impl PackageFs {
 
     pub fn read(&self, member: &str) -> Option<Arc<[u8]>> {
         self.members.get(member).cloned()
+    }
+
+    pub fn manifest_for_dir(&self, dir: &str) -> Option<&PackageJson> {
+        if dir.is_empty() {
+            return Some(&self.manifest);
+        }
+        self.nested_manifests.get(dir)
     }
 
     pub fn nearest_manifest(&self, member: &str) -> &PackageJson {
@@ -301,6 +310,20 @@ mod tests {
         assert_eq!(manifest.bin_entry("typescript"), None);
     }
     // === /RUN-001 ===
+    #[test]
+    fn parses_peer_dependencies() {
+        let manifest: PackageJson = serde_json::from_slice(
+            br#"{"peerDependencies":{"react":"^19.0.0","react-dom":"^19.0.0"}}"#,
+        )
+        .expect("manifest");
+        assert_eq!(manifest.peer_dependencies.len(), 2);
+        assert!(manifest.peer_dependencies.contains_key("react"));
+        assert_eq!(
+            manifest.peer_dependencies.get("react"),
+            Some(&"^19.0.0".to_string())
+        );
+    }
+
     #[test]
     fn rejects_non_archive_bytes() {
         let err = PackageFs::from_archive(b"not a gzip tarball").unwrap_err();

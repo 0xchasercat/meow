@@ -13,8 +13,8 @@
 //!   and verified tarballs are stored by content hash.
 //! - [`ResolutionGraph`] — the validated resolved tree consumed by runtime,
 //!   materialization, and editor tooling. [`UnpackedStore`] supplies stable real
-//!   paths for path-oriented consumers; project `node_modules` is written only by
-//!   the explicit materialize projection.
+//!   package directories; the standard `node_modules` projection is a strict
+//!   symlink tree into that global unpacked store.
 //!
 //! All hashes/specifiers are newtypes ([`ContentHash`], [`PackageName`],
 //! [`Version`], [`VersionReq`]) and every reachable failure is a typed
