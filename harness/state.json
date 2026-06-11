@@ -1,10 +1,10 @@
 {
   "version": 3,
-  "updated_at": "2026-06-08T12:15:00.000Z",
+  "updated_at": "2026-06-11T16:10:30Z",
   "mode": "incubating",
   "phase": {
-    "id": "P3",
-    "name": "Parse-Once Toolchain"
+    "id": "P2.5",
+    "name": "Drop-In Core"
   },
   "active_task": null,
   "in_flight_agents": [],
@@ -254,7 +254,7 @@
       "harness/PLAN.md",
       "harness/CANON.md"
     ],
-    "active": "P3 starts now: TOOL-001/002/003 and CHK-001/002 build parse-once lint/format/check/bundle against the shared graph; P2.5/DR-003 node semantics contract is still authoritative.",
-    "next_pull_hint": "Resume in P3: lint/fmt/bundle skeletons + delegated check first; keep ResolutionGraph as runtime truth and UnpackedStore node/N-API bridge unchanged."
+    "active": "P2.5 Drop-In Core (DR-003 Great Harvest): Node compatibility is delegated to upstream Deno crates (deno_node/napi/crypto/fetch/net/fs) wired via RT-007; the hand-written node polyfills and synthetic-CJS-wrapper layer were deleted. meow owns the PnP ResolutionGraph + UnpackedStore bridge and the default symlink-first node_modules install. P3 Parse-Once Toolchain (TOOL/CHK) resumes after the Drop-In Core spine.",
+    "next_pull_hint": "Finish the P2.5 Drop-In Core spine (Deno-owned Node semantics via RT-007; CFG-003 package.json-as-authority), then resume P3 Parse-Once Toolchain (lint/fmt/bundle). Keep ResolutionGraph as runtime truth and the UnpackedStore Node/N-API bridge unchanged."
   }
 }
