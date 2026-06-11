@@ -14,12 +14,12 @@
 
 This amendment supersedes the following, in whole or part:
 
-1. **`package.json` is King — supersedes ADR-8 (package.json half), §18 / §18.1, §14, Invariant 13.** `package.json` is the AUTHORITY for dependencies (`dependencies`/`devDependencies`/`peerDependencies`), workspaces, scripts, and project metadata. `meow` **reads** it; it never owns, generates, or clobbers it. `meow add` / `meow remove` mutate `package.json` (then update `meow.lock.jsonl` + the content-addressed cache) exactly like `npm`/`bun`. `meow install` on a stock project reads `package.json` and builds the PnP cache. `meow.config.ts` is now STRICTLY meow runtime behavior — Trust-Zone permissions, execution mode, install mode, toolchain config (lint/format/test) — and carries **no dependencies**. (The `tsconfig.json` *shadow* generation in ADR-8 still stands; only the package.json-authority inversion changes.)
+1. **`package.json` is King — supersedes ADR-8 (package.json half), §18 / §18.1, §14, Invariant 13.** `package.json` is the AUTHORITY for dependencies (`dependencies`/`devDependencies`/`peerDependencies`), workspaces, scripts, and project metadata. `meow` **reads** it; it never owns, generates, or clobbers it. `meow add` / `meow remove` mutate `package.json` (then update `meow.lock.jsonl` + the content-addressed cache) exactly like `npm`/`bun`. `meow install` on a stock project reads `package.json`, builds the cache, and writes the strict symlinked `node_modules` projection. `meow.config.ts` is now STRICTLY meow runtime behavior — Trust-Zone permissions, execution mode, install mode, toolchain config (lint/format/test) — and carries **no dependencies**. (The `tsconfig.json` *shadow* generation in ADR-8 still stands.)
 2. **`package.json` scripts run natively — supersedes §14, §18.** `meow run <script>` executes a `package.json` `"scripts"` entry; `meow <script>` is shorthand; `meow run <file>` still runs a file (a name that is both a script and a file resolves to the script, npm-style). `meow.tasks.ts` becomes an OPTIONAL typed-task layer, not a replacement for `package.json` scripts.
 3. **Ambient Node APIs are native — supersedes Principle 2, the §11 modes table.** `import fs from "fs"`, `import path from "path"`, `process`, `Buffer`, `node:*` specifiers, etc. work out of the box — Node built-ins are a native, always-available surface, NOT gated behind a `node-compat` flag. `strict-web` becomes an explicit OPT-IN mode (edge / portable / security-sensitive projects) that *withdraws* the Node surface; it is no longer the default. The default is drop-in Node compatibility.
 4. **First-party CommonJS runs — supersedes ADR-3, Principle 3, Invariant 5, §11.1, the "CommonJS authoring environment" non-goal.** A first-party `require()` / `.cjs` / `module.exports` file is no longer refused. The exact execution architecture is superseded by Amendment 003: CJS must execute with native Node semantics, not synthetic ESM translation. The "ban new CJS to heal the ecosystem" goal is dropped for zero-friction adoption; an optional lint rule MAY still *nudge* toward ESM, but it is advisory, never a hard refusal.
 
-**Explicitly UNCHANGED by Amendment 001:** ADR-1 (V8 only), ADR-2 (build on Oxc/Rolldown), **ADR-4 (PnP / no `node_modules` by default** — `package.json` *declares*, the content-addressed cache *stores*; no `node_modules` is written unless `--materialize`), ADR-5 (delegated typecheck), the `meow.lock.jsonl` lockfile, determinism, the single shared graph (I-1), and resolver-parity (I-5). The mandate changes *defaults and authority*, not the *engine, cache, or one-graph architecture*.
+**Explicitly UNCHANGED by Amendment 001:** ADR-1 (V8 only), ADR-2 (build on Oxc/Rolldown), ADR-5 (delegated typecheck), the `meow.lock.jsonl` lockfile, determinism, the single shared graph (I-1), and resolver-parity (I-5). ADR-4 was adjusted in this pivot: default install now materializes `node_modules` as symlink-backed, strict no-hoist layout; deprecated `--mode pnp` is the explicit in-memory mode.
 
 **Roadmap impact:** Phase-5 "Node Compatibility & Legacy" (native Node built-ins, CJS interop) is no longer deferred behind a strict-web core — it becomes foundational and moves earlier (see `PLAN.md` re-sequence). The drop-in path (`meow install` reads `package.json` → `meow run` a stock app) is now the headline acceptance criterion.
 
@@ -48,7 +48,7 @@ Authoritative architecture:
 2. **Deno owns Node built-ins, globals, CommonJS, and N-API.** `node:*`, bare built-ins, `process`, `Buffer`, the CJS loader, and `.node` addon loading come from upstream Deno crates. Existing `crates/runtime/src/js/node/*` hand polyfills are transitional debt, not the target.
 3. **Path-backed compatibility; no `meow-cache://` bridge.** Deno's Node resolver and N-API loader run against real files and therefore consume `UnpackedStore` package-folder paths selected by `ResolutionGraph`; `meow-cache://` stays internal identity only.
 4. **Projection ladder is explicit.** `.meow/deps/` is an editor/TS/LSP/legacy-tool shadow; it is not runtime truth and does not drive module execution.
-5. **`node_modules` is explicit materialization.** `--materialize` remains the compatibility escape hatch for tools that require exact Node-style traversal; it materializes the same resolved graph to disk, but runtime and internal tooling still resolve from `ResolutionGraph` + `UnpackedStore`.
+5. **`node_modules` is now default materialization.** `meow install` writes a symlink-backed, strict no-hoist `node_modules` by default; deprecated `--mode pnp` keeps the existing virtual resolution model only when explicitly requested; `--vendor` remains the full-copy escape hatch.
 6. **Multi-version rule.** Runtime stays exact per referrer through `ResolutionGraph`; editor projection is flat by package name (one root/default version exposed) and records collisions for unresolved multi-version cases.
 
 Roadmap consequence: P2.5 Drop-In Core becomes a staged Deno harvest: register Deno Node built-ins, implement the PnP→Deno package-folder bridge, hand CJS execution to Deno's require loader, wire `deno_napi` through extracted cache files, then delete manual shims.
@@ -123,7 +123,7 @@ The invariants every feature must respect.
 9. **Observability is built in, not an aftermarket plugin ecosystem.** Profiling and dependency analysis are CLI features (§17).
 10. **Monorepos are a first-class project shape** (§13), not an external-tool problem.
 11. **Configuration collapses, not multiplies.** `package.json` owns ecosystem data; one typed meow config owns runtime/tooling/policy (§18).
-12. **Boring escape hatches always exist.** `--materialize`, `strict-web`, and labelled `legacy` residuals ensure ambitious internals never become an adoption wall.
+12. **Boring escape hatches always exist.** `--mode pnp`, `--vendor`, `strict-web`, and labelled `legacy` residuals ensure ambitious internals never become an adoption wall.
 
 (Principles describe philosophy. The hard rules that require an explicit re-charter to change are listed separately as **Project Invariants**, §25.)
 
@@ -182,16 +182,15 @@ ADR-1 through ADR-4 are the founding choices. ADR-5 through ADR-9 forcibly resol
 - **Why it was abandoned:** Drop-in adoption requires first-party CJS, native CommonJS cycles, and dynamic `require`; DR-003 delegates that to Deno's loader instead of a meow-owned translator.
 - **Current consequence:** CJS state, cycles, `__dirname`/`__filename`, and `module.exports` are Deno-owned semantics over real `UnpackedStore` paths selected by `ResolutionGraph`; no synthetic wrapper metadata is target runtime state.
 
-### ADR-4 · Default package loading: **PnP-style virtual memory (no `node_modules` by default)**
+### ADR-4 · Default package loading: **Strict `node_modules` materialization (no-hoist pnpm-style) with explicit in-memory mode**
 
-- **Choice:** Default mode writes **no** `node_modules`. The module resolver intercepts lookups in-memory and points at the global content-addressed cache. FUSE/VFS is opt-in; `--materialize` writes real files when a legacy tool demands them.
-- **Why:** FUSE/VFS as a default is a cross-platform minefield (Windows, macOS kext deprecation, Docker volumes). In-memory interception avoids it entirely, gives zero-install startup, and lets `meow` enforce hermeticity, provenance, and capability policy at resolution time.
+- **Choice:** Default `meow install` writes a symlinked, no-hoist `node_modules` tree (default `Materialize` projection), so tools that expect filesystem traversal work immediately. Deprecated `--mode pnp` retains explicit in-memory package resolution for the virtual model; `--mode vfs` remains opt-in experimental.
+- **Why:** Filesystem-first `node_modules` is the practical default for adoption; strict no-hoist layout keeps resolution faithful while `ResolutionGraph` preserves correctness per referrer.
 - **Consequences:**
-  - (+) Zero-install, instant, disk shared across projects; no `node_modules` to corrupt or `rm -rf`.
-  - (+) The lockfile and package cache become core runtime infrastructure, not a side artifact.
-  - (−) Tools that `stat()` the real filesystem for packages break under PnP. **`--materialize` is a required escape hatch, not optional polish** — it ships in the *same phase* as PnP (§24.4).
-  - (−) The runtime and the language server **must share identical resolution logic**, or the editor and the runtime will disagree.
-  - (−) The resolver must implement the full Node resolution algorithm (conditions, `exports`/`imports` maps, self-references) faithfully or subtle bugs appear.
+  - (+) Compatible with legacy tooling, `stat()`-based ecosystems, and drop-in developer expectations.
+  - (+) `UnpackedStore` remains the authoritative backing and lockfile remains the control plane.
+  - (−) Runtime and LSP must keep `ResolutionGraph` parity across projection forms.
+  - (−) Resolver must still implement full Node algorithm behavior (conditions, `exports`/`imports` maps, self-references, etc.) exactly.
 
 ### ADR-5 · TypeScript diagnostics: **delegate to the reference compiler; never reimplement it**
 
@@ -440,16 +439,15 @@ Packages are stored globally by content hash; projects reference them through th
 
 | Mode | Default | Description | Best for |
 |------|:------:|-------------|----------|
-| **PnP (in-memory)** | ✅ | No `node_modules`; loader resolves directly from cache | Normal development |
+| **Materialized** | ✅ | Strict no-hoist `node_modules` tree; symlink-backed into the global unpacked store, `--copy` fallback when required | Normal development, CI, Docker, legacy tools |
+| **PnP (in-memory)** | | Deprecated explicit `--mode pnp`; no `node_modules`, loader resolves directly from cache | Strict/virtual experiments |
 | **VFS** | | Virtual folder backed by `meow` resolution (FUSE) | Local tools needing directory semantics |
-| **Materialized** | | Explicit `--materialize` escape hatch for tools requiring exact Node traversal; symlink-backed default, copy/hardlink fallback for hostile filesystems | CI, Docker, legacy tools |
 | **Vendor** | | Full local dependency copy (explicit projection) | Air-gapped deployments |
 
 ```sh
-meow install                 # PnP, writes lockfile, no node_modules
-meow install --vfs
-meow install --materialize   # required escape hatch — ships with PnP (§24.4)
-meow install --vendor
+meow install                 # writes lockfile + strict symlinked node_modules
+meow install --mode pnp      # deprecated virtual install, no node_modules
+meow install --vendor        # copy-based vendor/ projection
 ```
 
 The resolver must implement the full Node resolution algorithm faithfully (ADR-4), and the LSP must use the **same** resolver (ADR-4) — see the LSP package-exposure mechanism in §20.
@@ -646,7 +644,7 @@ meow run <entry|script>     # execute a file or a package.json script (script wi
 meow <script|file.ts>       # shorthand for run
 meow dev                   # watch-mode run
 
-meow install [--vfs|--materialize|--vendor]
+meow install [--mode pnp|--mode vfs|--vendor|--copy]
 meow add / remove <pkg>    # mutate dependencies + lockfile
 
 meow task <name>           # run an optional typed task from meow.tasks.ts
@@ -680,8 +678,8 @@ Principles: commands are short and predictable; diagnostics explain causes, not 
 - Surface `why-dep`, `why-large`, and capability warnings inside the IDE.
 
 ### 20.1 Exposing the virtual cache — Shadow `node_modules` Symlink Map (Q8, resolved)
-- `LSP-001` writes a hidden **`.meow/deps/`** folder as **OS-level symlinks** into the global `~/.meow/cache/unpacked`, with a matching shadow `paths` entry in `.meow/tsconfig.json` (ADR-8), so editors get normal filesystem traversal and definition jumps without a root `node_modules`.
-- This projection is flat by package name, so in multi-version graphs it exposes a single root/default entry and records collisions; runtime pathing remains exact per referrer through `ResolutionGraph`. `node_modules` stays unmaterialized by default; `--materialize` is the explicit traversal escape hatch, with symlinks as the default projection form and copy/hardlink only on hostile filesystems or explicit mode.
+- `LSP-001` writes a hidden **`.meow/deps/`** folder as **OS-level symlinks** into the global `~/.meow/cache/unpacked`, with a matching shadow `paths` entry in `.meow/tsconfig.json` (ADR-8), so editors get normal filesystem traversal and definition jumps independent of root `node_modules` churn.
+- This projection is flat by package name, so in multi-version graphs it exposes a single root/default entry and records collisions; runtime pathing remains exact per referrer through `ResolutionGraph`. Default `node_modules` is strict/no-hoist and symlink-backed into the same unpacked store; `--copy` and `--vendor` are the explicit copy-based forms.
 
 ---
 
@@ -698,11 +696,11 @@ Ordered by **dependency**, not by excitement. Each phase is shippable and demons
 - **Acceptance:** a small TS web server runs with no emitted JS; behavior is byte-for-byte deterministic across two machines on the same version + lockfile; the P1 CJS refusal was an MVP guard, not the current target.
 
 ### Phase 2 · Packages & Resolution
-- **Deliverables:** global content-addressed cache; deterministic lockfile (`meow.lock.jsonl`, §12.3); PnP in-memory loader **and `--materialize` together** (ADR-4, §24.4); npm registry resolution; integrity checks; `meow install`; `meow why-dep`.
-- **Acceptance:** a project installs and runs (pure-ESM) dependencies with no `node_modules`; the same lockfile reproduces the same graph; runtime and LSP resolve packages identically.
+- **Deliverables:** global content-addressed cache; deterministic lockfile (`meow.lock.jsonl`, §12.3); default symlink-backed strict `node_modules` materialization plus deprecated explicit `--mode pnp` virtual install; npm registry resolution; integrity checks; `meow install`; `meow why-dep`.
+- **Acceptance:** a project installs and runs dependencies through the strict no-hoist `node_modules` projection; the same lockfile reproduces the same graph; runtime and LSP resolve packages identically.
 
 ### Phase 2.5 · Drop-In Core (Deno Node Harvest)
-- **Deliverables:** `package.json` dependency/scripts/workspace authority; `meow run <script>` / `meow <script>` / `meow dev`; Deno-owned Node built-ins, CommonJS, and N-API; PnP→Deno bridge that feeds `UnpackedStore` real package folders selected by `ResolutionGraph`; `.meow/deps/` remains editor/TS/LSP shadow; `--materialize` remains the explicit `node_modules` escape hatch.
+- **Deliverables:** `package.json` dependency/scripts/workspace authority; `meow run <script>` / `meow <script>` / `meow dev`; Deno-owned Node built-ins, CommonJS, and N-API; PnP→Deno bridge that feeds `UnpackedStore` real package folders selected by `ResolutionGraph`; `.meow/deps/` remains editor/TS/LSP shadow; default install is strict symlinked `node_modules`, with `--vendor` as the copy-based deployment escape hatch.
 - **Acceptance:** `cd existing-project && meow install && meow run dev` runs a stock npm/Bun app with zero file edits, including Node built-ins, native CommonJS cycles/dynamic require, and N-API `.node` addons loaded from cache-backed unpacked paths.
 
 ### Phase 3 · Parse-Once Toolchain
@@ -733,19 +731,19 @@ Ordered by **dependency**, not by excitement. Each phase is shippable and demons
 
 The MVP (≈ Phase 1 + the cache/lockfile slice of Phase 2) is deliberately narrow.
 
-**In:** Rust CLI; V8 runtime; `meow run`; TS type stripping (erasable syntax); `strict-web` mode; minimal `fetch`/Web APIs; basic `defineMeow`; content-addressed cache; lockfile; PnP in-memory resolution; historical first-party CJS refusal until P2.5's Deno-owned native CJS cutover.
+**In:** Rust CLI; V8 runtime; `meow run`; TS type stripping (erasable syntax); `strict-web` mode; minimal `fetch`/Web APIs; basic `defineMeow`; content-addressed cache; lockfile; strict symlinked `node_modules` projection; historical first-party CJS refusal until P2.5's Deno-owned native CJS cutover.
 
 **Out:** full Node/npm compatibility; full formatter/linter/bundler/task-runner/test-runner; Wasm Component Model; Rust source imports; complete config replacement.
 
-**MVP succeeds if** developers can run a small TypeScript ESM service with deterministic dependency resolution and no local `node_modules`.
+**MVP succeeds if** developers can run a small TypeScript ESM service with deterministic dependency resolution through the strict materialized install layout.
 
 ---
 
 ## 23. First 90 Days
 
 - **Days 1–30:** Rust CLI skeleton; embed V8 and run a basic script; ESM entrypoint loading; TS stripping for a narrow subset; draft lockfile + `defineMeow` schemas; initially reject first-party CJS until the P2.5 Deno-owned CJS bridge.
-- **Days 31–60:** basic package cache; resolve dependencies from cache; `meow install`; PnP in-memory resolution; initial Web-standard globals; basic `meow:http`; start the LSP resolution prototype.
-- **Days 61–90:** run a small TS service with dependencies and no `node_modules`; deterministic lockfile verification; minimal `meow doctor`; early `meow why-dep`; workspace-graph discovery prototype; publish MVP architecture notes and documented compatibility limits.
+- **Days 31–60:** basic package cache; resolve dependencies from cache; `meow install`; strict symlinked `node_modules` projection; initial Web-standard globals; basic `meow:http`; start the LSP resolution prototype.
+- **Days 61–90:** run a small TS service with dependencies through default materialized install; deterministic lockfile verification; minimal `meow doctor`; early `meow why-dep`; workspace-graph discovery prototype; publish MVP architecture notes and documented compatibility limits.
 
 ---
 
@@ -759,7 +757,7 @@ Each entry is a place where the headline could mislead. Entries marked **Resolve
 
 - **24.3 — Per-package security. Partially resolved (ADR-6) → residual is prominent.** Tiered: process-level default (sound, coarse) → AST-rewrite Trust Zones (per-package, near-zero overhead) → membrane/isolate escalation (research). *Residual (the project's highest-risk security claim):* static rewriting is **not** sound against adversarial *dynamic* access (`globalThis["fe"+"tch"]`, `Function("return fetch")()`, dynamic `import()`, `eval`). Market tiers 1–2 as "defense-in-depth," **never** "mathematically blocked," until the tier-3 escalation ships and is adversarially tested.
 
-- **24.4 — PnP breaks filesystem-assuming tools.** Real cost, not theoretical (certain bundlers, native-addon toolchains, IDE plugins). *Mitigation:* `--materialize` ships **with** PnP (Phase 2), not after; provide `vendor` too; emit clear diagnostics when a tool needs real files; first-party LSP so the common path doesn't need materialization.
+- **24.4 — Filesystem-first install can drift from graph truth.** Real risk, not theoretical: strict `node_modules` must never reintroduce hoisting ambiguity or divergent resolver behavior. *Mitigation:* default materialization is pnpm-style/no-hoist and symlink-backed into `UnpackedStore`; `ResolutionGraph` remains the runtime truth; deprecated `--mode pnp` preserves the virtual path for strict/cache-only use; `--vendor` provides copy-based air-gapped deployment.
 
 - **24.5 — Config singularity. Resolved (ADR-8) → narrowed by Amendment 001.** `meow.config.ts` remains the typed source for meow runtime/tooling/policy; generated shadow `.meow/tsconfig.json` (root `extends` shim) still stands; `package.json` is no longer generated and is instead the human-edited authority for dependencies, scripts, workspaces, and metadata. *Residual:* `.meow/` shadows are build artifacts — CI must run `meow sync`/`meow install`, and staleness is a real failure mode `meow doctor` must catch.
 
