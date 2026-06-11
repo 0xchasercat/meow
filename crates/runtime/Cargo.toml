@@ -26,8 +26,8 @@ deno_error = { workspace = true }
 # === RT-004 ===
 # strict-web Stateless-Edge globals (CANON §8.1): unmodified upstream Deno web
 # extensions, co-versioned with deno_core 0.403 (pins owned by DIST-001). URL,
-# URLPattern and console live in deno_web at this generation; deno_url/deno_console
-# are kept as deprecated compatibility pins for Deno's Node dependency graph. The
+# URLPattern and console live in deno_web at this generation; the standalone
+# deno_url/deno_console crates were merged into deno_web and are no longer pinned. The
 # heavy `fetch` HTTP client (hyper/rustls + Request/Response/Headers/FormData) is
 # isolated behind the default-on `web-fetch` feature so the footprint contingency
 # (I-10) can drop it without losing the light globals.
@@ -42,8 +42,6 @@ deno_node = { workspace = true }
 deno_node_crypto = { workspace = true }
 deno_napi = { workspace = true }
 deno_fs = { workspace = true }
-deno_url = { workspace = true }
-deno_console = { workspace = true }
 deno_io = { workspace = true }
 deno_telemetry = { workspace = true }
 node_resolver = { workspace = true }

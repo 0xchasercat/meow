@@ -1183,12 +1183,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "deno_console"
-version = "0.222.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed7dede3d073a7d19e5e127756d80a1a8b570d8345e51192968da142ed290319"
-
-[[package]]
 name = "deno_core"
 version = "0.403.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1981,12 +1975,6 @@ dependencies = [
  "parking_lot",
  "tokio",
 ]
-
-[[package]]
-name = "deno_url"
-version = "0.222.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54c190c36940b8ba25043e2258775df3cd4af06f28c8a9efd28b50799efe2977"
 
 [[package]]
 name = "deno_web"
@@ -3950,7 +3938,6 @@ name = "meow-runtime"
 version = "0.0.0"
 dependencies = [
  "deno_ast",
- "deno_console",
  "deno_core",
  "deno_crypto",
  "deno_error",
@@ -3967,7 +3954,6 @@ dependencies = [
  "deno_process",
  "deno_semver",
  "deno_telemetry",
- "deno_url",
  "deno_web",
  "deno_webidl",
  "getrandom 0.3.4",

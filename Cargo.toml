@@ -92,14 +92,12 @@ oxc_ast_visit = "0.134"
 # extension crates, co-versioned with the `deno_core 0.403` pin above (they release
 # in lockstep — these are the 0.403-matching set). Consumed ONLY by crates/runtime
 # (the sole V8 edge, I-10). URL/URLPattern/console live in deno_web at this
-# generation; deno_url/deno_console remain pinned as deprecated compatibility crates.
+# generation; the standalone deno_url/deno_console crates are merged into deno_web (no longer pinned).
 # supplies the concrete `PermissionsContainer` deno_fetch reads from `OpState`;
 # `hyper-util` supplies the `Name` type for the capability-gated DNS resolver
 # (crates/runtime/src/web/perms.rs). No version literal diverges from deno_core.
 deno_webidl = "0.250.0"
 deno_web = "0.281.0"
-deno_url = "0.222.0"
-deno_console = "0.222.0"
 deno_crypto = "0.264.0"
 deno_fetch = "0.274.0"
 # deno_fetch's client JS (`22_http_client.js`) lazy-loads deno_net's TLS polyfill,
