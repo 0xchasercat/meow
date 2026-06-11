@@ -1,0 +1,6 @@
+# PERF-002: pin the stable channel currently in use (rustc/cargo 1.95.0 stable).
+# Pins the channel (never nightly/beta) for reproducible builds; clippy+rustfmt
+# are required by the harness gate.
+[toolchain]
+channel = "stable"
+components = ["clippy", "rustfmt"]

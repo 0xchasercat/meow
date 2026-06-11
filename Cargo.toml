@@ -139,3 +139,12 @@ rand_chacha = "0.9"
 rand_core = "0.9"
 getrandom = "0.3"
 # === /RT-006 ===
+
+[profile.release]
+# PERF-002: optimize the shipped binary. Fat LTO + a single codegen unit maximize
+# cross-crate inlining and dead-code elimination; strip drops symbols. Deliberately
+# NOT panic = "abort" — that changes unwind semantics (the runtime relies on
+# catch/unwind to turn user-JS faults into typed errors rather than aborting).
+lto = true
+codegen-units = 1
+strip = true
