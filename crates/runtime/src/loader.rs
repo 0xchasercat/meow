@@ -101,13 +101,6 @@ impl TrivialModuleLoader {
                     path.display()
                 )));
             }
-            Some("cjs") => {
-                return Err(ModuleLoaderError::generic(format!(
-                    "meow: first-party CommonJS is not supported — meow is ESM-only \
-                     (I-2 / ADR-3); rewrite {} as an ES module (.mjs/.js)",
-                    path.display()
-                )));
-            }
             Some("js" | "mjs") | None => {}
             Some(other) => {
                 return Err(ModuleLoaderError::generic(format!(
