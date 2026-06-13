@@ -218,3 +218,58 @@ prerender-manifest + routes-manifest present, server HTML/RSC chunks,
 "Compiled successfully". The page-data/static-generation phases still use
 jest-worker CHILD_PROCESS workers (not threads) which work via the ISSUE 5
 readLoop fix. Full drop-in would need op_create_worker implemented.
+
+## ISSUE 9 - no node_modules/.bin shims => compound scripts fail [GAP]
+
+### Symptom (taxonomy build)
+build script is `contentlayer build && next build`. meow ran it via `sh -c` and
+failed: `sh: contentlayer: command not found` (EXIT 127).
+
+### Root cause
+meow creates NO node_modules/.bin/* shims (verified: .bin empty for gocart AND
+taxonomy). Single-command scripts work because meow resolves the first token via
+resolve_package_bin (manifest `bin` field) -- that's why gocart's bare
+`next build` ran. But compound scripts (A && B, pipes, etc.) are handed to the
+shell (cli.rs ~2365 Command::new("sh")), and the shell has no node_modules/.bin
+on PATH, so bin names (contentlayer, etc.) don't resolve. npm/pnpm/yarn all
+create .bin shims AND prepend node_modules/.bin to the script PATH.
+
+### Fix direction (not implemented)
+(1) materialize: for each installed package with a `bin` field, create
+node_modules/.bin/<name> (executable shim/symlink to the bin file) including for
+nested .meow/<pkg>/node_modules/.bin. (2) run: prepend the project (and ancestor)
+node_modules/.bin to PATH for script execution (both the native and sh paths).
+This is a broad PM correctness win (any app whose scripts call installed bins or
+use && / pipes). taxonomy install itself works (1080 pkgs, 2.7GB).
+
+---
+
+# SUMMARY (this session)
+
+PHASE 1 (correctness):
+- gocart `meow run build`  => WORKS, reality-verified (real .next, BUILD_ID,
+  prerendered HTML, manifests, "Compiled successfully").
+- clerk  `meow run build`  => WORKS, reality-verified (BUILD_ID + manifests +
+  HTML/RSC), with NEXT_TURBOPACK_USE_WORKER=0 (routes around the worker_threads
+  gap; child_process workers used for page-data/static-gen work fine).
+- taxonomy install => WORKS (1080 pkgs); build blocked by ISSUE 9 (.bin shims).
+- gocart/clerk `meow run dev` => blocked by ISSUE 6 (next-server runaway memory;
+  architectural, materialize symlink layout). Heap limit raised to Node-like 4GB.
+
+Fixes landed (all committed on branch feat/node-compat-perf, tests green):
+  1 Deno error-class registration (systemic: async fs ops -> real ENOENT/EEXIST)
+  2 mkdir errno repair (defensive)
+  3 node:vm without a V8 snapshot (vendored deno_node ForSnapshot, [patch])
+  4 npm-exact semver (bare 1.2.4 = exact, not caret) + unit test
+  5 peerDependencies install with dedup (react-is; react stays singleton)
+  6 child_process readLoop: canceled IPC teardown treated as graceful
+  7 4GB V8 heap limit (Node-comparable)
+  8 CJS->ESM named exports from `0 && (module.exports={...})` hint + unit test
+
+Remaining compat tail (documented, with fix directions): ISSUE 6 (dev runaway),
+ISSUE 8 (worker_threads/op_create_worker), ISSUE 9 (.bin shims).
+
+PHASE 2 (perf): not started (Phase 1 build/dev tail still open). Baselines
+observed: install gocart ~11s / clerk ~29s / taxonomy ~ (1080 pkgs); release
+LTO link ~2m40s. Recommended next: V8 startup snapshot (also de-risks vm),
+install parallelism, module-resolution/fs hot-path profiling.
