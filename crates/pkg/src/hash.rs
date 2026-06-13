@@ -315,6 +315,54 @@ fn normalize_hyphen_arm(trimmed: &str) -> Option<String> {
     })
 }
 
+/// Normalize a bare npm version token to explicit comparators.
+///
+/// npm and Cargo disagree on bare versions: npm treats `1.2.3` as EXACT
+/// (`=1.2.3`), and `1.2` / `1` / `1.2.x` as partial ranges, whereas Cargo's
+/// `semver` treats a bare `1.2.3` as caret (`^1.2.3`). Without this, exact npm
+/// pins (e.g. sharp's `@img/sharp-libvips-* = "1.2.4"`) wrongly resolve to a
+/// newer minor. Operator-prefixed tokens (`^ ~ > < = |`) are left untouched.
+fn normalize_bare_version(token: &str) -> Option<String> {
+    let first = token.chars().next()?;
+    if matches!(first, '^' | '~' | '>' | '<' | '=' | '|') {
+        return None;
+    }
+    let t = token
+        .strip_prefix('v')
+        .or_else(|| token.strip_prefix('V'))
+        .unwrap_or(token);
+    if t.is_empty() || t == "*" || t == "x" || t == "X" {
+        return Some("*".to_owned());
+    }
+    let numeric = t.split(['-', '+']).next().unwrap_or(t);
+    let is_wild = |s: &str| s.is_empty() || s == "*" || s == "x" || s == "X";
+    let mut nums: Vec<u64> = Vec::new();
+    let mut had_wild = false;
+    for seg in numeric.split('.') {
+        if is_wild(seg) {
+            had_wild = true;
+            break;
+        }
+        match seg.parse::<u64>() {
+            Ok(n) => nums.push(n),
+            Err(_) => return None,
+        }
+    }
+    if had_wild || nums.len() < 3 {
+        if nums.is_empty() {
+            return Some("*".to_owned());
+        }
+        let lower = lower_partial_version(&nums);
+        let (upper, inclusive) = upper_partial_bound(&nums);
+        return Some(if inclusive {
+            format!(">={lower}, <={upper}")
+        } else {
+            format!(">={lower}, <{upper}")
+        });
+    }
+    Some(format!("={t}"))
+}
+
 fn normalize_version_req_arm(arm: &str) -> String {
     let trimmed = arm.trim();
     if trimmed.contains(',') {
@@ -340,7 +388,8 @@ fn normalize_version_req_arm(arm: &str) -> String {
                 i += 1;
             }
             _ => {
-                comparators.push(token.to_owned());
+                comparators
+                    .push(normalize_bare_version(token).unwrap_or_else(|| token.to_owned()));
                 i += 1;
             }
         }
@@ -536,5 +585,35 @@ mod tests {
             VersionReq::parse("definitely not a range").unwrap_err(),
             ParseVersionError::Req { .. }
         ));
+    }
+
+    #[test]
+    fn npm_bare_version_is_exact_not_caret() {
+        use semver::Version as SemVer;
+        let m = |req: &str, v: &str| {
+            VersionReq::parse(req)
+                .unwrap()
+                .disjunctions()
+                .unwrap()
+                .iter()
+                .any(|a| a.matches(&SemVer::parse(v).unwrap()))
+        };
+        // bare exact (npm) - must NOT behave like cargo caret
+        assert!(m("1.2.4", "1.2.4"));
+        assert!(!m("1.2.4", "1.3.0"));
+        assert!(!m("1.2.4", "1.2.5"));
+        // partial minor -> >=1.2.0 <1.3.0
+        assert!(m("1.2", "1.2.9"));
+        assert!(!m("1.2", "1.3.0"));
+        // partial major -> >=1.0.0 <2.0.0
+        assert!(m("1", "1.9.9"));
+        assert!(!m("1", "2.0.0"));
+        // wildcard patch
+        assert!(m("1.2.x", "1.2.7"));
+        assert!(!m("1.2.x", "1.3.0"));
+        // caret/tilde unchanged (npm == cargo)
+        assert!(m("^1.2.4", "1.3.0"));
+        assert!(!m("~1.2.4", "1.3.0"));
+        assert!(m("*", "9.9.9"));
     }
 }

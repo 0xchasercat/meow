@@ -249,6 +249,7 @@ impl<'a> Installer<'a> {
     {
         let mut metadata = BTreeMap::new();
         let mut queue = VecDeque::new();
+        let mut selected: BTreeMap<PackageName, BTreeSet<Version>> = BTreeMap::new();
         let host = HostPlatform::current();
 
         let direct_names = direct
@@ -266,6 +267,10 @@ impl<'a> Installer<'a> {
                 })
             })?;
             let version = select_version(&registry_name, &meta, spec.selection_spec())?;
+            selected
+                .entry(name.clone())
+                .or_default()
+                .insert(version.clone());
             queue.push_back(QueueNode {
                 name: name.clone(),
                 registry_name,
@@ -315,6 +320,20 @@ impl<'a> Installer<'a> {
                         let dep_registry_name = dep_spec.registry_package(dep);
                         package_name_is_next_swc_for_host(dep_registry_name, host)
                             .then(|| dep_registry_name.clone())
+                    },
+                ));
+                dep_names.extend(version_meta.peer_dependencies.iter().filter_map(
+                    |(dep, raw_req)| {
+                        if version_meta
+                            .peer_dependencies_meta
+                            .get(dep)
+                            .map(|m| m.optional)
+                            .unwrap_or(false)
+                        {
+                            return None;
+                        }
+                        let dep_spec = DepSpec::parse(raw_req);
+                        Some(dep_spec.registry_package(dep).clone())
                     },
                 ));
                 planned.push(PlannedNode {
@@ -379,6 +398,53 @@ impl<'a> Installer<'a> {
                     });
                 }
 
+                for (dep_name, dep_version) in &dependencies {
+                    selected
+                        .entry(dep_name.clone())
+                        .or_default()
+                        .insert(dep_version.clone());
+                }
+                for (peer, raw_req) in &node.version_meta.peer_dependencies {
+                    if node
+                        .version_meta
+                        .peer_dependencies_meta
+                        .get(peer)
+                        .map(|m| m.optional)
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    if dependencies.contains_key(peer) {
+                        continue;
+                    }
+                    let dep_spec = DepSpec::parse(raw_req);
+                    if let Some(existing) = selected
+                        .get(peer)
+                        .and_then(|set| max_selected_satisfying(set, &dep_spec))
+                    {
+                        dependencies.insert(peer.clone(), existing);
+                        continue;
+                    }
+                    let dep_registry_name = dep_spec.registry_package(peer).clone();
+                    let Some(dep_meta) = metadata.get(&dep_registry_name) else {
+                        continue;
+                    };
+                    let Ok(dep_version) =
+                        select_version(&dep_registry_name, dep_meta, dep_spec.selection_spec())
+                    else {
+                        continue;
+                    };
+                    dependencies.insert(peer.clone(), dep_version.clone());
+                    selected
+                        .entry(peer.clone())
+                        .or_default()
+                        .insert(dep_version.clone());
+                    queue.push_back(QueueNode {
+                        name: peer.clone(),
+                        registry_name: dep_registry_name,
+                        version: dep_version,
+                    });
+                }
                 jobs.push(ResolvedNode {
                     name: node.name.clone(),
                     version: node.version.clone(),
@@ -656,6 +722,30 @@ pub enum RootResolveError {
     NotInLockfile { name: String },
     #[error("unsupported requirement {req:?} for {name} (see InstallError::UnsupportedRange)")]
     UnsupportedRange { name: String, req: String },
+}
+
+/// Pick the highest already-selected version satisfying `spec` (peer dedupe).
+/// Returns None for non-range specs or when nothing in the set matches.
+fn max_selected_satisfying(versions: &BTreeSet<Version>, spec: &DepSpec) -> Option<Version> {
+    let req = match spec {
+        DepSpec::Range(req) => req,
+        _ => return None,
+    };
+    let arms = req.disjunctions().ok()?;
+    let mut best: Option<(semver::Version, Version)> = None;
+    for version in versions {
+        let Ok(candidate) = semver::Version::parse(version.as_str()) else {
+            continue;
+        };
+        if !arms.iter().any(|arm| arm.matches(&candidate)) {
+            continue;
+        }
+        match &best {
+            Some((b, _)) if candidate <= *b => {}
+            _ => best = Some((candidate, version.clone())),
+        }
+    }
+    best.map(|(_, version)| version)
 }
 
 fn select_version(

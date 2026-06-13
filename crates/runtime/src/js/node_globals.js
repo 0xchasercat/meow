@@ -313,6 +313,85 @@ if (globalThis.Deno) {
     wrapAsync("readLink", "readLink");
     wrapAsync("readFile", "readFile");
     wrapAsync("readTextFile", "readTextFile");
+    // === mkdir errno repair (meow Node-compat) ===
+    // deno's op error path collapses NotFound/AlreadyExists into a useless
+    // "invalid_argument" TypeError (and the sync op throws `undefined`).
+    // webpack's mkdirp branches on err.code (ENOENT => create the parent then
+    // retry; EEXIST => treat as already created), so reconstruct faithful
+    // errno semantics from the filesystem whenever the mkdir op fails.
+    const __mkdirDirname = (p) => {
+      let s = String(p).replace(/\/+$/, "");
+      const i = s.lastIndexOf("/");
+      if (i < 0) return ".";
+      if (i === 0) return "/";
+      return s.slice(0, i);
+    };
+    const __mkdirRecursive = (opts) =>
+      (opts && typeof opts === "object") ? !!opts.recursive
+        : (typeof opts === "boolean" ? opts : false);
+    const __statOrNull = (p) => { try { return denoNs.statSync(p); } catch (_) { return null; } };
+    const __isDirStat = (st) => st && ((typeof st.isDirectory === "function") ? st.isDirectory() : !!st.isDirectory);
+    const __mkdirErr = (code, path) => {
+      const tbl = { ENOENT: [-2, "no such file or directory"], EEXIST: [-17, "file already exists"], ENOTDIR: [-20, "not a directory"] };
+      const meta = tbl[code] || [-22, "invalid argument"];
+      let err;
+      try {
+        if (code === "ENOENT" && denoNs.errors && denoNs.errors.NotFound) err = new denoNs.errors.NotFound(`${code}: ${meta[1]}, mkdir '${path}'`);
+        else if (code === "EEXIST" && denoNs.errors && denoNs.errors.AlreadyExists) err = new denoNs.errors.AlreadyExists(`${code}: ${meta[1]}, mkdir '${path}'`);
+      } catch (_) { err = undefined; }
+      if (!err) err = new Error(`${code}: ${meta[1]}, mkdir '${path}'`);
+      try {
+        Object.defineProperty(err, "code", { value: code, writable: true, configurable: true, enumerable: true });
+        Object.defineProperty(err, "errno", { value: meta[0], writable: true, configurable: true, enumerable: true });
+        Object.defineProperty(err, "syscall", { value: "mkdir", writable: true, configurable: true, enumerable: true });
+        Object.defineProperty(err, "path", { value: String(path), writable: true, configurable: true, enumerable: true });
+      } catch (_) {}
+      return err;
+    };
+    const __mkdirLooksGarbage = (error) =>
+      error === undefined || error === null ||
+      (typeof error === "object" && error.code === undefined &&
+        (String(error.message ?? "") === "invalid_argument" || error.name === "TypeError"));
+    const __repairMkdir = (path, opts, error) => {
+      const recursive = __mkdirRecursive(opts);
+      const st = __statOrNull(path);
+      if (st) {
+        if (recursive && __isDirStat(st)) return { ok: true };
+        return { ok: false, error: __mkdirErr("EEXIST", path) };
+      }
+      if (!__statOrNull(__mkdirDirname(path))) return { ok: false, error: __mkdirErr("ENOENT", path) };
+      return { ok: false, error };
+    };
+    {
+      const __mSync = denoNs.mkdirSync;
+      if (typeof __mSync === "function") {
+        Object.defineProperty(denoNs, "mkdirSync", {
+          value: (...args) => {
+            try { return __mSync(...args); }
+            catch (error) {
+              if (!__mkdirLooksGarbage(error)) throw error;
+              const r = __repairMkdir(args[0], args[1], error);
+              if (r.ok) return undefined;
+              throw r.error;
+            }
+          }, writable: true, configurable: true,
+        });
+      }
+      const __mAsync = denoNs.mkdir;
+      if (typeof __mAsync === "function") {
+        Object.defineProperty(denoNs, "mkdir", {
+          value: async (...args) => {
+            try { return await __mAsync(...args); }
+            catch (error) {
+              if (!__mkdirLooksGarbage(error)) throw error;
+              const r = __repairMkdir(args[0], args[1], error);
+              if (r.ok) return undefined;
+              throw r.error;
+            }
+          }, writable: true, configurable: true,
+        });
+      }
+    }
 
     if (denoSignals.addSignalListener !== undefined) {
       denoNs.addSignalListener = denoSignals.addSignalListener;
@@ -1164,3 +1243,36 @@ for (const fsTarget of [nodeFsModule.default ?? nodeFsModule]) {
     }
   }
 }
+
+// === Deno error-class registration (meow Node-compat ROOT FIX) ===
+// deno_core pre-registers only the 6 JS-builtin error classes, so
+// to_v8_error() returns `undefined` for Deno's own classes (NotFound,
+// AlreadyExists, ...). Sync ops then throw `undefined`; async ops reject with
+// `undefined`, which makes deno_core's __opRejectHandler call
+// Error.captureStackTrace(undefined) and surface a misleading
+// "TypeError: invalid_argument". Registering the Deno.errors.* builders makes
+// both paths produce faithful errors -- deno_error attaches the errno `code`
+// (ENOENT/EEXIST/...) as an additional property -- which deno_node maps to the
+// right Node error. Deno.errors props are non-enumerable, so register by
+// explicit name (matching deno_error's std::io::Error get_class output).
+try {
+  const __D = globalThis.Deno;
+  const __reg = (typeof core !== "undefined" && core.registerErrorClass)
+    || (__D && __D.core && __D.core.registerErrorClass);
+  if (__D && __D.errors && typeof __reg === "function") {
+    const __classes = [
+      "NotFound", "PermissionDenied", "ConnectionRefused", "ConnectionReset",
+      "ConnectionAborted", "NotConnected", "AddrInUse", "AddrNotAvailable",
+      "BrokenPipe", "AlreadyExists", "InvalidData", "TimedOut", "Interrupted",
+      "WriteZero", "WouldBlock", "UnexpectedEof", "BadResource", "Http",
+      "Busy", "NotSupported", "FilesystemLoop", "IsADirectory",
+      "NetworkUnreachable", "NotADirectory", "NotCapable",
+    ];
+    for (const __name of __classes) {
+      const __ctor = __D.errors[__name];
+      if (typeof __ctor === "function") {
+        try { __reg(__name, __ctor); } catch (_) { /* already registered */ }
+      }
+    }
+  }
+} catch (_) { /* harness shims still cover common cases */ }

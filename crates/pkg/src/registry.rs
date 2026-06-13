@@ -41,6 +41,14 @@ pub struct PackageMetadata {
     pub versions: BTreeMap<Version, VersionMetadata>,
 }
 
+/// Per-entry `peerDependenciesMeta` flags (npm). An `optional` peer is not
+/// auto-installed when absent.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PeerDependencyMeta {
+    #[serde(default)]
+    pub optional: bool,
+}
+
 /// The manifest subset for one published version.
 #[derive(Debug, Clone, Deserialize)]
 pub struct VersionMetadata {
@@ -50,6 +58,14 @@ pub struct VersionMetadata {
     /// Optional dependencies, keyed by package name.
     #[serde(rename = "optionalDependencies", default)]
     pub optional_dependencies: BTreeMap<PackageName, String>,
+    /// Peer dependencies, keyed by package name. npm 7+ auto-installs missing,
+    /// non-optional peers; meow does the same so packages like recharts (which
+    /// peer-depend on react-is) resolve their imports.
+    #[serde(rename = "peerDependencies", default)]
+    pub peer_dependencies: BTreeMap<PackageName, String>,
+    /// `peerDependenciesMeta`: entries flagged optional are not auto-installed.
+    #[serde(rename = "peerDependenciesMeta", default)]
+    pub peer_dependencies_meta: BTreeMap<PackageName, PeerDependencyMeta>,
     /// Optional platform constraints from npm package metadata.
     #[serde(default, deserialize_with = "deserialize_platform_constraint_list")]
     pub os: Vec<String>,
@@ -280,6 +296,8 @@ impl FixtureRegistry {
             VersionMetadata {
                 dependencies: dep_map,
                 optional_dependencies: optional_dep_map,
+                peer_dependencies: BTreeMap::new(),
+                peer_dependencies_meta: BTreeMap::new(),
                 os,
                 cpu,
                 dist: DistInfo {
