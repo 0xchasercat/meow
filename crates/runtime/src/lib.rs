@@ -120,6 +120,10 @@ impl Runtime {
             extension_transpiler: Some(std::rc::Rc::new(|specifier, source| {
                 maybe_transpile_source(specifier, source)
             })),
+            create_params: Some(
+                deno_core::v8::CreateParams::default()
+                    .heap_limits(0, 4 * 1024 * 1024 * 1024_usize),
+            ),
             ..Default::default()
         })
         .map_err(|err| RuntimeError::Init(err.to_string()))?;

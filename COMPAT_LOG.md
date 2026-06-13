@@ -134,3 +134,40 @@ message containing "operation canceled" as graceful channel teardown.
 gocart `meow run build` completes: BUILD_ID written, prerender-manifest +
 routes-manifest present, prerendered HTML (index/admin/pricing/...), static
 chunks, "Compiled successfully". REAL production build. PHASE 1 BUILD = DONE.
+
+## ISSUE 6 - gocart `meow run dev` runaway memory in next-server (ARCH FORK, partial)
+
+### Symptom
+Dev (both --turbopack AND plain webpack) prints "Next.js ... / Starting..." then
+the forked next-server child grows memory unbounded and V8-OOMs ("Fatal
+ JavaScript out of memory") at the heap ceiling, never reaching "Ready"; curl
+:3000 -> HTTP 000. Same failure in both bundler modes => not turbopack-specific.
+
+### Findings
+- meow set NO V8 heap limit; V8 defaulted ~1.4GB (Node sizes to RAM). FIXED:
+  crates/runtime/src/lib.rs now sets create_params heap_limits(0, 4GB) so the
+  ceiling matches Node. This stopped the premature 1.4GB OOM but NOT the runaway.
+- With 4GB: next-server RSS climbs 485->787->1175->1372->1687 (t=6..31s) then
+  2606MB @50s, still "Starting...", still climbing -> heads to OOM ~4GB ~80s.
+- `sample` of the hung child: deep recursive stat/readdir/opendir/getdirentries
+  (a directory walk), plus napi-addon frames. Memory grows with the walk.
+- meow's symlink fs is CORRECT: lstat types symlinks, realpath resolves to the
+  global store (~/.meow/cache/unpacked/sha256-...); readdir has no `.`/`..`.
+- The walk's realpaths land OUTSIDE any node_modules dir (the global content-
+  addressed store), so webpack `snapshot.managedPaths` / watcher `**/node_modules/**`
+  ignore heuristics don't apply -> Next/webpack deeply scans/watches meow's store.
+
+### Root cause (architectural)
+meow materializes packages as symlinks to a GLOBAL store whose realpaths contain
+no `node_modules` segment (unlike pnpm's project-local node_modules/.pnpm/...).
+Next dev's persistent file scanning/watching follows these into the global store
+and fails to treat them as managed/ignored, traversing unboundedly -> OOM.
+(`next build` is unaffected: it does one-shot, bounded module tracing.)
+
+### Fix direction (not yet implemented - larger materialize.rs change)
+Make materialized package realpaths contain a `node_modules` segment, e.g. a
+pnpm-style project-local virtual store (node_modules/.meow/.../node_modules/<pkg>
+as real/hardlinked content) OR relocate the unpacked store under a path with a
+`node_modules` component, so webpack/watcher ignore heuristics skip it. Kept the
+heap-limit fix; this is logged as an architectural fork per instructions and
+other fronts (clerk, taxonomy builds, Phase 2 perf) proceeded.
