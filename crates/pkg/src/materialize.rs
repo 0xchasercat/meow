@@ -340,6 +340,7 @@ impl<'a> Materializer<'a> {
         let build_result = (|| -> Result<(), MaterializeError> {
             ensure_dir(&tmp_root)?;
             ensure_dir(&tmp_root.join(STORE_DIR))?;
+            let mut built: BTreeMap<(PackageName, Version), PathBuf> = BTreeMap::new();
 
             let link = effective_link(opts);
             let unpacked_store = if matches!(link, LinkStrategy::Symlink) {
@@ -421,14 +422,14 @@ impl<'a> Materializer<'a> {
                     LinkStrategy::Symlink => {
                         if needs_real_tree_for_native_walkers(&rel) {
                             bytes_written +=
-                                copy_edge_tree(&abs, key, &catalog, &tmp_root, &mut Vec::new())?;
+                                copy_edge_tree(&abs, key, &catalog, &tmp_root, &mut Vec::new(), &mut built)?;
                         } else {
                             create_symlink(target, &abs)?;
                         }
                     }
                     LinkStrategy::Copy => {
                         bytes_written +=
-                            copy_edge_tree(&abs, key, &catalog, &tmp_root, &mut Vec::new())?;
+                            copy_edge_tree(&abs, key, &catalog, &tmp_root, &mut Vec::new(), &mut built)?;
                     }
                     LinkStrategy::Auto => unreachable!("effective link policy resolves auto"),
                 }
@@ -644,7 +645,24 @@ fn copy_edge_tree(
     catalog: &BTreeMap<(PackageName, Version), PackageRecord>,
     root: &Path,
     stack: &mut Vec<(PackageName, Version)>,
+    built: &mut BTreeMap<(PackageName, Version), PathBuf>,
 ) -> Result<u64, MaterializeError> {
+    // Dedup the dependency DAG: materialize each (name, version) subtree as a real tree
+    // exactly once. Repeat occurrences become a relative symlink to the first copy.
+    // Without this, a shared/diamond dependency is re-copied once per path through the
+    // graph -> exponential work that never terminates on real npm trees (the install hang).
+    if let Some(canonical) = built.get(key) {
+        if canonical.as_path() == dest {
+            return Ok(0);
+        }
+        if let Some(parent) = dest.parent() {
+            ensure_dir(parent)?;
+        }
+        let from_dir = dest.parent().unwrap_or(root);
+        let rel_target = relative_path(from_dir, canonical);
+        create_symlink(&rel_target, dest)?;
+        return Ok(0);
+    }
     let Some(record) = catalog.get(key) else {
         return Err(MaterializeError::DanglingEdge {
             name: "<copy>".to_owned(),
@@ -655,6 +673,7 @@ fn copy_edge_tree(
     };
     let source = root.join(&record.store_path);
     let bytes = copy_dir_recursive(&source, dest)?;
+    built.insert(key.clone(), dest.to_path_buf());
     stack.push((record.name.clone(), record.version.clone()));
     let mut total = bytes;
     for (dep, version) in &record.dependencies {
@@ -663,7 +682,7 @@ fn copy_edge_tree(
             continue;
         }
         let child = dest.join("node_modules").join(package_rel_path(dep));
-        total += copy_edge_tree(&child, &dep_key, catalog, root, stack)?;
+        total += copy_edge_tree(&child, &dep_key, catalog, root, stack, built)?;
     }
     let _ = stack.pop();
     Ok(total)

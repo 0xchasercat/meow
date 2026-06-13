@@ -53,7 +53,6 @@ pub fn native_module_source(name: &str) -> Option<&'static str> {
     match name {
         "http" => Some(include_str!("js/meow/http.ts")),
         "ui" => Some(include_str!("js/meow/ui.ts")),
-        "internal/cjs" => Some(include_str!("js/meow/cjs.ts")),
         _ => None,
     }
 }

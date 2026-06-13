@@ -82,7 +82,7 @@ impl NodeOptions {
 
 pub fn extensions(opts: NodeOptions) -> Vec<Extension> {
     let NodeOptions {
-        mode: _,
+        mode,
         argv,
         cwd,
         env,
@@ -173,6 +173,9 @@ pub fn extensions(opts: NodeOptions) -> Vec<Extension> {
     exts.push(crate::web::meow_web::init());
     exts.push(node_bootstrap_state_extension(argv, cwd, env));
     exts.push(node_globals::init());
+    if matches!(mode, NodeMode::StrictWeb) {
+        exts.push(meow_strict_web_withdraw::init());
+    }
     exts.push(node_permissions_ext);
 
     exts
@@ -286,4 +289,15 @@ deno_core::extension!(
     node_globals,
     esm_entry_point = "ext:node_globals/node_globals.js",
     esm = [dir "src/js", "node_globals.js"],
+);
+
+// === RT-004 / RT-007 ===
+// StrictWeb host-access withdrawal: node:fs / node:process operations throw
+// ERR_STRICT_WEB_WITHDRAWN at use time and the ambient `process` global is
+// removed. Pushed ONLY in NodeMode::StrictWeb, after node_globals, so it tears
+// down the Node host surface the rest of the stack just wired up.
+deno_core::extension!(
+    meow_strict_web_withdraw,
+    esm_entry_point = "ext:meow_strict_web_withdraw/strict_web_withdraw.js",
+    esm = [dir "src/js", "strict_web_withdraw.js"],
 );

@@ -736,7 +736,7 @@ fn run_executes_a_cached_commonjs_package_bin_from_unpacked_store() {
         .store(&npm_tarball(&[
             (
                 "package.json",
-                "{\"name\":\"toolkit\",\"version\":\"1.0.0\",\"type\":\"commonjs\",\"exports\":{\".\":\"./index.js\"},\"bin\":{\"tool\":\"bin/tool\"}}",
+                "{\"name\":\"toolkit\",\"version\":\"1.0.0\",\"type\":\"commonjs\",\"exports\":{\".\":\"./index.js\",\"./dist/compiled/helper\":\"./dist/compiled/helper.js\"},\"bin\":{\"tool\":\"bin/tool\"}}",
             ),
             ("index.js", "module.exports = {};\n"),
             (

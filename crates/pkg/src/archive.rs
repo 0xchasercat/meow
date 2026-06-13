@@ -80,14 +80,22 @@ pub fn unpack_to(bytes: &[u8], dest: &Path) -> Result<UnpackStats, MaterializeEr
 }
 
 fn normalize_member(path: &Path) -> Result<Option<PathBuf>, MaterializeError> {
+    // npm tarballs wrap their files in a single top-level directory. It is usually
+    // "package/", but some packages use a different name (e.g. @types/node ships under
+    // "node vX.Y/"). Strip exactly one leading directory regardless of its name, the same
+    // way npm/pnpm/yarn do, instead of requiring the literal "package/" prefix (which
+    // silently skipped every entry -> empty unpack -> missing package.json).
     let mut components = path.components();
-    match components.next() {
-        Some(Component::Normal(first)) if first == "package" => {}
+    let mut first = components.next();
+    if matches!(first, Some(Component::CurDir)) {
+        first = components.next();
+    }
+    match first {
+        Some(Component::Normal(_)) => {}
         Some(Component::RootDir | Component::Prefix(_) | Component::ParentDir) => {
             return Err(MaterializeError::unsafe_member(path.display().to_string()));
         }
-        Some(_) => return Ok(None),
-        None => return Ok(None),
+        _ => return Ok(None),
     }
 
     let mut out = PathBuf::new();

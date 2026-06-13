@@ -1,9 +1,13 @@
-//! `meow-loader` — THE module loader: resolve → cache/disk read → graph lowering → V8.
+//! `meow-loader` — THE module loader: resolve -> cache/disk read -> graph lowering -> V8.
 //!
 //! Hosts the one [`Resolver`] the whole toolchain shares (I-1, I-5). The
 //! [`deno_core::ModuleLoader`] impl is a thin adapter: deno_core's sync `resolve`
 //! delegates to [`Resolver::locate`] (identity only), and `load` re-enters
 //! [`Resolver::resolve`] with the already-absolute URL to read the source.
+//!
+//! CommonJS execution is delegated to Deno's upstream `node:module` /
+//! `NodeRequireLoader`: a CJS module is served as a tiny `createRequire` ESM
+//! facade (see [`cjs_facade_source`]) instead of a hand-rolled synthetic wrapper.
 
 pub mod package;
 mod resolver;
@@ -42,6 +46,12 @@ struct CjsLoadedModule {
     kind: &'static str,
 }
 
+/// CommonJS resolution op seam.
+///
+/// CJS execution itself is owned by Deno's upstream `node:module` /
+/// `NodeRequireLoader` (the loader emits a `createRequire` ESM facade — see
+/// [`cjs_facade_source`]); this op is retained as the resolver-backed
+/// `require.resolve` seam the CLI/runtime wiring installs.
 pub fn cjs_resolve_extension(resolver: Resolver) -> Extension {
     let state = CjsResolveState { resolver };
     let mut ext = meow_cjs_resolver::init();
@@ -134,10 +144,6 @@ impl ModuleLoader for MeowModuleLoader {
         referrer: &str,
         _kind: ResolutionKind,
     ) -> Result<ModuleSpecifier, ModuleLoaderError> {
-        println!(
-            "MEOW RESOLVE: specifier={}, referrer={}",
-            specifier, referrer
-        );
         let referrer = parse_referrer(referrer, self.resolver.project_root());
         let (url, _locator) = self
             .resolver
@@ -152,7 +158,6 @@ impl ModuleLoader for MeowModuleLoader {
         maybe_referrer: Option<&ModuleLoadReferrer>,
         _options: ModuleLoadOptions,
     ) -> ModuleLoadResponse {
-        println!("MEOW LOAD: specifier={}", module_specifier);
         ModuleLoadResponse::Sync(self.load_sync(module_specifier, maybe_referrer))
     }
 }
@@ -180,37 +185,39 @@ impl MeowModuleLoader {
             ));
         }
 
+        // CommonJS: hand execution to Deno's upstream `node:module` /
+        // `NodeRequireLoader` via a `createRequire` ESM facade. Named exports are
+        // discovered from the Oxc AST (analyze_cjs), never regex-scraped.
         if resolved.kind == ModuleKind::Cjs {
-            return Ok(cjs_module_source(
+            let named_exports = self.cjs_named_exports(module_specifier, &resolved)?;
+            let require_path = self.cjs_require_path(&resolved)?;
+            return Ok(cjs_facade_source(
                 module_specifier,
-                resolved.source.as_ref(),
+                &require_path,
+                &named_exports,
             ));
         }
 
         let graph_path = graph_path_for(&resolved.url, module_specifier);
-        let mut db = self.graph.borrow_mut();
-        let fid = db.set_file(graph_path, resolved.source.clone());
-        let code = runtime_ir_code(&db, fid, module_specifier)?;
-        let analysis = {
+        let (code, analysis) = {
+            let mut db = self.graph.borrow_mut();
+            let fid = db.set_file(graph_path, resolved.source.clone());
+            let code = runtime_ir_code(&db, fid, module_specifier)?;
             let cst = db.cst(fid).ok_or_else(|| {
                 internal_loader_error(format!(
                     "module {module_specifier} was not interned in the graph"
                 ))
             })?;
-            meow_graph::analyze_cjs(cst)
+            (code, meow_graph::analyze_cjs(cst))
         };
+        // A `.js`/`.mjs` module whose syntax is CommonJS (e.g. a `type: module`
+        // package shipping a `.js` CJS file) also routes through the facade.
         if analysis.has_commonjs_syntax && !analysis.has_esm_syntax {
-            let filename = cjs_filename_for(&resolved.url, module_specifier);
-            let dirname = PathBuf::from(&filename)
-                .parent()
-                .map(|path| path.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            return Ok(cjs_inline_module_source(
+            let require_path = self.cjs_require_path(&resolved)?;
+            return Ok(cjs_facade_source(
                 module_specifier,
-                resolved.url.as_str(),
-                &filename,
-                &dirname,
-                &code,
+                &require_path,
+                &analysis.named_exports,
             ));
         }
         Ok(ModuleSource::new(
@@ -220,116 +227,72 @@ impl MeowModuleLoader {
             None,
         ))
     }
+
+    /// AST-derived CommonJS named exports for the ESM facade (replaces the old
+    /// regex export-scrape). Interns the source in the graph and runs
+    /// [`meow_graph::analyze_cjs`].
+    fn cjs_named_exports(
+        &self,
+        module_specifier: &ModuleSpecifier,
+        resolved: &ResolvedModule,
+    ) -> Result<Vec<String>, ModuleLoaderError> {
+        let graph_path = graph_path_for(&resolved.url, module_specifier);
+        let mut db = self.graph.borrow_mut();
+        let fid = db.set_file(graph_path, resolved.source.clone());
+        let cst = db.cst(fid).ok_or_else(|| {
+            internal_loader_error(format!(
+                "module {module_specifier} was not interned in the graph"
+            ))
+        })?;
+        Ok(meow_graph::analyze_cjs(cst).named_exports)
+    }
+
+    /// Absolute filesystem path Deno's `createRequire`/`require` loads the module
+    /// from. Prefers the projected `node_modules` view, falling back to the
+    /// content-addressed runtime path (unpacked store / local file).
+    fn cjs_require_path(
+        &self,
+        resolved: &ResolvedModule,
+    ) -> Result<String, ModuleLoaderError> {
+        let path = self
+            .resolver
+            .projected_path_for(&resolved.locator)
+            .map(Ok)
+            .unwrap_or_else(|| self.resolver.runtime_path_for(&resolved.locator))
+            .map_err(resolve_error)?;
+        Ok(path.to_string_lossy().into_owned())
+    }
 }
 
-fn cjs_module_source(module_specifier: &ModuleSpecifier, source: &str) -> ModuleSource {
-    let specifier = serde_json::to_string(module_specifier.as_str())
-        .expect("serializing module specifier as JS string");
-    let mut code = String::from(
-        "import { runCjsModule } from \"meow:internal/cjs\";\nconst __meowCjsExports = runCjsModule(",
-    );
-    code.push_str(&specifier);
-    code.push_str(");\nexport default __meowCjsExports;\nexport { __meowCjsExports as __meow_cjs_exports__ };\n");
-    for name in cjs_named_exports(source) {
+/// Build the ESM facade that delegates CommonJS execution to Deno's upstream
+/// `node:module`. `createRequire(path)(path)` loads and runs the module through
+/// `NodeRequireLoader`; Deno reads and compiles the file (not meow), so
+/// `require()`, `node:*` builtins and dynamic `import()` all use upstream
+/// semantics. Named exports are re-published so `import { x } from "./m.cjs"`
+/// keeps resolving.
+fn cjs_facade_source(
+    module_specifier: &ModuleSpecifier,
+    require_path: &str,
+    named_exports: &[String],
+) -> ModuleSource {
+    let path_js =
+        serde_json::to_string(require_path).expect("serializing require path as JS string");
+    let mut code =
+        String::from("import { createRequire as __meowCreateRequire } from \"node:module\";\n");
+    code.push_str("const __meowRequire = __meowCreateRequire(");
+    code.push_str(&path_js);
+    code.push_str(");\nconst __meowCjsExports = __meowRequire(");
+    code.push_str(&path_js);
+    code.push_str(");\nexport default __meowCjsExports;\n");
+    for name in named_exports {
+        let key = serde_json::to_string(name).expect("serializing export name as JS string");
         code.push_str("export const ");
-        code.push_str(&name);
-        code.push_str(" = __meowCjsExports.");
-        code.push_str(&name);
-        code.push_str(";\n");
+        code.push_str(name);
+        code.push_str(" = __meowCjsExports[");
+        code.push_str(&key);
+        code.push_str("];\n");
     }
     javascript_module(module_specifier, code)
-}
-
-fn cjs_named_exports(source: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    for line in source.lines() {
-        let trimmed = line.trim_start();
-        if let Some(rest) = trimmed
-            .strip_prefix("exports.")
-            .or_else(|| trimmed.strip_prefix("module.exports."))
-        {
-            let mut end = 0usize;
-            for ch in rest.chars() {
-                if ch == '_' || ch == '$' || ch.is_ascii_alphanumeric() {
-                    end += ch.len_utf8();
-                } else {
-                    break;
-                }
-            }
-            if end != 0 {
-                let name = &rest[..end];
-                if rest[end..].trim_start().starts_with('=')
-                    && !names.iter().any(|existing| existing == name)
-                {
-                    names.push(name.to_owned());
-                }
-            }
-        }
-
-        if line.contains("=>") {
-            let mut search = line;
-            let mut base = 0usize;
-            while let Some(open_rel) = search.find('{') {
-                let open = base + open_rel;
-                let after_open = open + 1;
-                if let Some(close_rel) = line[after_open..].find('}') {
-                    let close = after_open + close_rel;
-                    let segment = &line[after_open..close];
-                    for field in segment.split(',') {
-                        let Some((candidate, value)) = field.split_once(':') else {
-                            continue;
-                        };
-                        let candidate = candidate.trim();
-                        if !value.contains("=>") || !is_js_identifier(candidate) {
-                            continue;
-                        }
-                        if names.iter().any(|existing| existing == candidate) {
-                            continue;
-                        }
-                        names.push(candidate.to_owned());
-                    }
-                    if close + 1 >= line.len() {
-                        break;
-                    }
-                    base = close + 1;
-                    search = &line[base..];
-                } else {
-                    break;
-                }
-            }
-        }
-    }
-    names
-}
-
-fn is_js_identifier(candidate: &str) -> bool {
-    let mut chars = candidate.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !(first == '_' || first == '$' || first.is_ascii_alphabetic()) {
-        return false;
-    }
-    chars.all(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphanumeric())
-}
-
-fn cjs_inline_module_source(
-    module_specifier: &ModuleSpecifier,
-    url: &str,
-    filename: &str,
-    dirname: &str,
-    source: &str,
-) -> ModuleSource {
-    let url = serde_json::to_string(url).expect("serializing module URL as JS string");
-    let filename = serde_json::to_string(filename).expect("serializing filename as JS string");
-    let dirname = serde_json::to_string(dirname).expect("serializing dirname as JS string");
-    let source = serde_json::to_string(source).expect("serializing source as JS string");
-    javascript_module(
-        module_specifier,
-        format!(
-            "import {{ runCjsModuleText }} from \"meow:internal/cjs\";\nconst __meowCjsExports = runCjsModuleText({url}, {filename}, {dirname}, {source});\nexport default __meowCjsExports;\nexport {{ __meowCjsExports as __meow_cjs_exports__ }};\n",
-        ),
-    )
 }
 
 fn javascript_module(module_specifier: &ModuleSpecifier, code: String) -> ModuleSource {

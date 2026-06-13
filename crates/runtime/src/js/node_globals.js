@@ -9,6 +9,7 @@ import * as nodeNet from "node:net";
 import * as nodeHttp from "node:http";
 import * as nodeHttpIncoming from "node:_http_incoming";
 import * as nodeOs from "node:os";
+import * as nodeConstantsModule from "node:constants";
 const load = core.loadExtScript;
 const bootstrapInfo = typeof core.ops.op_meow_node_bootstrap_info === "function"
   ? core.ops.op_meow_node_bootstrap_info()
@@ -69,6 +70,24 @@ Object.defineProperty(globalThis, "process", {
   writable: true,
   configurable: true,
 });
+
+// === CLEAN-003 env overlay ===
+// CJS now runs through Deno's node:module (the synthetic cjs.ts bridge was
+// deleted). cjs.ts used to overlay meow's bootstrap env onto process.env; port
+// that here so meow's controlled env -- e.g. the lifecycle vars
+// npm_lifecycle_event / npm_lifecycle_script / INIT_CWD that `meow run <script>`
+// injects -- lands on process.env for BOTH ESM and CJS modules.
+if (bootstrapInfo.env && typeof bootstrapInfo.env === "object" && processValue && typeof processValue === "object") {
+  try {
+    const envTarget = processValue.env;
+    if (envTarget && typeof envTarget === "object") {
+      for (const key of Object.keys(bootstrapInfo.env)) {
+        try { envTarget[key] = String(bootstrapInfo.env[key]); } catch (_e) { /* read-only env entry */ }
+      }
+    }
+  } catch (_e) { /* process.env unavailable */ }
+}
+// === /CLEAN-003 env overlay ===
 
 def("Buffer", bufferModule.Buffer);
 def("performance", perfHooks.performance);
@@ -987,8 +1006,21 @@ if (
 }
 
 
+// meow is a Node replacement: the GLOBAL timer functions must return Node `Timeout`
+// objects (with .unref()/.ref()/.refresh()), not deno_web's numeric handles. The web
+// bootstrap already defined setTimeout/clearTimeout, so def() (a no-op when the global
+// already exists) would leave the numeric web timers in place -> `setTimeout(...).unref`
+// is undefined and webpack/Next.js crash ("unref is not a function") or hang. Force-install
+// the node:timers versions over any pre-existing web globals.
 for (const name of ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "setImmediate", "clearImmediate"]) {
-  def(name, nodeTimers[name], true);
+  if (nodeTimers[name] !== undefined) {
+    Object.defineProperty(globalThis, name, {
+      value: nodeTimers[name],
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    });
+  }
 }
 
 for (const name of [
@@ -1065,4 +1097,70 @@ try {
   def("performance", performanceModule.performance);
 } catch {
   // Optional web globals depend on the current Deno pin.
+}
+
+
+// === RT-007 compat shims (CLEAN-003) ===
+// CJS now executes through Deno's upstream node:module / NodeRequireLoader, so
+// require("fs") / require("constants") yield Deno's node:* builtins directly.
+// These two shims close the remaining Node-shape gaps the old synthetic wrapper
+// used to paper over.
+
+// 1) ENOENT guard for node:fs sync reads. Deno's node:fs readFileSync can signal
+//    a missing path by throwing `undefined`; the earlier wrap only normalizes
+//    object-shaped errors, so an `undefined` throw escaped raw. Re-wrap the sync
+//    read/stat surface so a missing file always surfaces a Node ENOENT error.
+for (const fsTarget of [nodeFsModule.default ?? nodeFsModule]) {
+  if (!fsTarget || typeof fsTarget !== "object") continue;
+  for (const name of ["statSync", "lstatSync", "readFileSync", "readTextFileSync"]) {
+    const fn = fsTarget[name];
+    if (typeof fn !== "function" || fn.__meowEnoentGuard === true) continue;
+    const guarded = function (...args) {
+      try {
+        return fn.apply(fsTarget, args);
+      } catch (error) {
+        if (error === undefined) {
+          throw makeNodeEnoentError(name, args[0]);
+        }
+        throw error;
+      }
+    };
+    guarded.__meowEnoentGuard = true;
+    try {
+      fsTarget[name] = guarded;
+    } catch {
+      // Leave non-writable members alone.
+    }
+  }
+}
+
+// 2) Nested groups on node:constants. Deno's node:constants is a flat merge of
+//    fs/os/crypto/zlib constants; Node also exposes `.fs` (and `.os`/`.crypto`)
+//    sub-objects. Re-publish at least the fs access/open group so
+//    `constants.fs.R_OK === constants.R_OK`.
+{
+  const constantsValue = nodeConstantsModule.default ?? nodeConstantsModule;
+  if (constantsValue && typeof constantsValue === "object" && constantsValue.fs === undefined) {
+    const fsConsts = (nodeFsModule.default ?? nodeFsModule)?.constants;
+    let group;
+    if (fsConsts && typeof fsConsts === "object") {
+      group = fsConsts;
+    } else {
+      group = {};
+      for (const k of [
+        "F_OK", "R_OK", "W_OK", "X_OK",
+        "O_RDONLY", "O_WRONLY", "O_RDWR", "O_CREAT", "O_EXCL",
+        "O_TRUNC", "O_APPEND", "O_DIRECTORY", "O_NOFOLLOW", "O_SYNC",
+      ]) {
+        if (typeof constantsValue[k] === "number") {
+          group[k] = constantsValue[k];
+        }
+      }
+    }
+    try {
+      constantsValue.fs = group;
+    } catch {
+      // Frozen builtin export; nothing else to do.
+    }
+  }
 }
