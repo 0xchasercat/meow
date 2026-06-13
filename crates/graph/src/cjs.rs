@@ -1,7 +1,8 @@
 use std::collections::BTreeSet;
 
 use oxc_ast::ast::{
-    Argument, AssignmentOperator, CallExpression, Expression, SimpleAssignmentTarget,
+    Argument, AssignmentOperator, CallExpression, Expression, ObjectPropertyKind,
+    SimpleAssignmentTarget,
 };
 use oxc_ast::ast_kind::AstKind;
 use oxc_ast_visit::Visit;
@@ -113,10 +114,23 @@ impl Analyzer {
         }
     }
 
+    fn push_object_literal_keys(&mut self, expr: &Expression<'_>) {
+        if let Expression::ObjectExpression(obj) = expr.without_parentheses() {
+            for prop in &obj.properties {
+                if let ObjectPropertyKind::ObjectProperty(p) = prop {
+                    if let Some(name) = p.key.static_name() {
+                        self.push_named_export(&name);
+                    }
+                }
+            }
+        }
+    }
+
     fn inspect_assignment(
         &mut self,
         operator: AssignmentOperator,
         left: &SimpleAssignmentTarget<'_>,
+        right: &Expression<'_>,
     ) {
         if operator != AssignmentOperator::Assign {
             return;
@@ -131,6 +145,10 @@ impl Analyzer {
                 let member = left.to_member_expression();
                 if member.is_specific_member_access("module", "exports") {
                     self.mark_commonjs();
+                    // `module.exports = { a, b }` -- including the swc/babel
+                    // `0 && (module.exports = {...})` reexport hint -- means the
+                    // object literal keys are the module's named exports.
+                    self.push_object_literal_keys(right);
                     return;
                 }
                 let Some(name) = member.static_property_name() else {
@@ -161,7 +179,7 @@ impl<'a> Visit<'a> for Analyzer {
             AstKind::CallExpression(call) => self.inspect_call(call),
             AstKind::AssignmentExpression(expr) => {
                 if let Some(left) = expr.left.as_simple_assignment_target() {
-                    self.inspect_assignment(expr.operator, left);
+                    self.inspect_assignment(expr.operator, left, &expr.right);
                 }
             }
             _ => {}
@@ -238,4 +256,20 @@ mod tests {
         assert!(analysis.has_commonjs_syntax);
         assert!(analysis.has_esm_syntax);
     }
+
+    #[test]
+    fn detects_module_exports_object_literal_reexport_hint() {
+        // swc/Next emit `0 && (module.exports = {...})` purely as a static hint
+        // for CJS named-export lexers; the object keys are the named exports.
+        // The Oxc Visit walker descends into the dead `0 &&` branch (no DCE), so
+        // this verifies the AssignmentExpression node is reached + keys read.
+        let analysis = analyze(
+            "0 && (module.exports = { nextBuild: null, saveCpuProfile: null });\n",
+            SourceType::cjs(),
+        );
+        assert!(analysis.named_exports.contains(&"nextBuild".to_string()));
+        assert!(analysis.named_exports.contains(&"saveCpuProfile".to_string()));
+        assert!(analysis.has_commonjs_syntax);
+    }
+
 }
