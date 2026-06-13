@@ -273,3 +273,31 @@ PHASE 2 (perf): not started (Phase 1 build/dev tail still open). Baselines
 observed: install gocart ~11s / clerk ~29s / taxonomy ~ (1080 pkgs); release
 LTO link ~2m40s. Recommended next: V8 startup snapshot (also de-risks vm),
 install parallelism, module-resolution/fs hot-path profiling.
+
+## ISSUE 10 - interactive (TTY) `meow run build` crashes at end: op_set_raw [FIXED]
+
+### Symptom
+In a REAL terminal (TTY), `meow run build` finishes compiling then crashes:
+`Uncaught TypeError: op_set_raw is not a function` at `Stdin.setRaw`
+(ext:deno_io/12_io.js:120) <- `stdin.setRawMode` (deno_node _process/streams.mjs)
+<- readline Interface.close `_setRawMode` (and ora's end-of-build spinner).
+EXIT=1, no BUILD_ID. NON-TTY runs (CI / piped / `> log`) are unaffected because
+`io.stdin.isTerminal()` is false, so setRawMode skips the op (this is why the
+automated nohup/redirected build runs passed and masked it).
+
+### Root cause
+meow's deno_io has no TTY raw-mode op wired (op_set_raw undefined; even global
+Deno.stdin is undefined). deno_node's process.stdin.setRawMode calls
+`io.stdin.setRaw(enable)` in the isTerminal branch -> op_set_raw -> throws.
+
+### Fix (vendor/deno_node _process/streams.mjs, disk-loaded -> no rebuild)
+Wrap `io.stdin.setRaw(enable)` in try/catch so raw mode degrades gracefully
+(like a non-supporting terminal) instead of throwing into consumers. Faithful to
+Node, which no-ops/degrades when a terminal can't enter raw mode. Covers ALL
+setRawMode callers (ora, readline).
+
+### Verified (PTY via `script -q /dev/null`)
+ORIGINAL: PTY build -> `op_set_raw is not a function`, EXIT=1, no BUILD_ID.
+FIXED:    PTY build -> ora spinner active (ANSI output), "Compiled successfully",
+EXIT=0, BUILD_ID written. Non-TTY path unchanged. => gocart `meow run build` now
+works INTERACTIVELY (as a developer runs it), not just under redirection.

@@ -366,7 +366,13 @@ export const initStdin = (warmup = false) => {
   stdin._isRawMode = false;
   stdin.setRawMode = (enable) => {
     if (io.stdin?.isTerminal()) {
-      io.stdin.setRaw(enable);
+      try {
+        io.stdin.setRaw(enable);
+      } catch {
+        // Raw mode unavailable in this runtime (e.g. the op_set_raw TTY op is
+        // not wired). Degrade gracefully like a non-supporting terminal instead
+        // of throwing into consumers such as ora's end-of-build spinner.
+      }
     }
     stdin._isRawMode = enable;
     return stdin;
