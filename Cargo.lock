@@ -1521,8 +1521,6 @@ dependencies = [
 [[package]]
 name = "deno_node"
 version = "0.188.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4be0f4ba5fe1dc4cd39d680f316c54d56b710897d4e8174c815aefecba231df"
 dependencies = [
  "base64 0.22.1",
  "boxed_error",
