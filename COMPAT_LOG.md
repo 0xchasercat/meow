@@ -171,3 +171,50 @@ as real/hardlinked content) OR relocate the unpacked store under a path with a
 `node_modules` component, so webpack/watcher ignore heuristics skip it. Kept the
 heap-limit fix; this is logged as an architectural fork per instructions and
 other fronts (clerk, taxonomy builds, Phase 2 perf) proceeded.
+
+## ISSUE 7 - import() of CJS exposes only `default` (no named exports) [FIXED]
+
+### Symptom (clerk / Next 16 build)
+`next/dist/bin/next` does `import('../cli/next-build.js').then(m=>m.nextBuild(...))`
+and crashed: `TypeError: mod.nextBuild is not a function`. `require()` of that
+file exposes nextBuild fine, but `import()` gave only {__esModule, default}.
+
+### Root cause
+meow's ESM facade for CJS gets named exports from meow's own Oxc analyzer
+(crates/graph/src/cjs.rs analyze_cjs). It detected `exports.x=`,
+`module.exports.x=`, `Object.defineProperty(exports,"x",..)` (Next 15 style) but
+NOT Next 16's swc output, which declares names via `_export(exports, {...})` and
+emits the canonical static hint `0 && (module.exports = { nextBuild: null, ... })`.
+Note: the analyzer is an Oxc Visit walker (no dead-code elimination), so it DOES
+visit the `0 &&` AssignmentExpression; the gap was that inspect_assignment never
+read the object-literal keys off the RHS.
+
+### Fix
+cjs.rs: inspect_assignment now extracts object-literal keys from
+`module.exports = { ... }` (push_object_literal_keys), covering the swc/babel
+`0 && (module.exports = {...})` reexport hint (same signal cjs-module-lexer uses).
+Unit test detects_module_exports_object_literal_reexport_hint added (cargo test
+-p meow-graph green: the test uses the exact `0 &&` form, proving the walker
+reaches it). Verified: clerk `meow run build` now resolves mod.nextBuild.
+
+## ISSUE 8 - worker_threads (op_create_worker) unimplemented [GAP + workaround]
+
+### Symptom (clerk / Next 16 build)
+`TypeError: op_create_worker is not a function` at deno_node worker_threads.ts
+(new NodeWorker), from jest-worker ExperimentalWorker -> turbopackBuildWithWorker.
+Next 16 turbopack build hardcodes enableWorkerThreads:true for its build worker.
+
+### Root cause
+meow provides the node:worker_threads JS surface (deno_node) but not the host
+`op_create_worker` op (deno_runtime's web-worker host: spawn a worker isolate +
+MessagePort). Implementing it is a large runtime feature (worker isolates,
+module loading in workers, message ports) - logged as a gap, not done here.
+
+### Workaround (verified)
+NEXT_TURBOPACK_USE_WORKER=0 makes Next run the turbopack build IN-PROCESS
+(build/index.js: turbopackBuild(useWorker=false)). With that, clerk
+`meow run build` COMPLETES + is reality-verified: BUILD_ID written,
+prerender-manifest + routes-manifest present, server HTML/RSC chunks,
+"Compiled successfully". The page-data/static-generation phases still use
+jest-worker CHILD_PROCESS workers (not threads) which work via the ISSUE 5
+readLoop fix. Full drop-in would need op_create_worker implemented.
