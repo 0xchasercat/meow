@@ -321,35 +321,30 @@ pub struct WhyDepArgs {
 }
 
 impl Command {
-    /// `(canonical verb as the user typed it, PLAN phase where the real impl lands)`.
-    /// Single source of truth for the stub message AND the per-command test table.
-    /// The exhaustive `match` makes adding a `Command` variant without a landing a
-    /// compile error, so the surface can never silently regress.
-    pub const fn landing(&self) -> (&'static str, &'static str) {
+    pub const fn landing(&self) -> &'static str {
         match self {
-            Command::Run(_) => ("run", "P1"),
-            Command::Dev(_) => ("dev", "P1"),
-            Command::Install(_) => ("install", "P2"),
-            Command::Add(_) => ("add", "P2"),
-            Command::Remove(_) => ("remove", "P2"),
-            Command::Task(_) => ("task", "P4"),
-            Command::Test(_) => ("test", "P6"),
-            Command::Check(_) => ("check", "P3"),
-            Command::Lint(_) => ("lint", "P3"),
-            Command::Fmt(_) => ("fmt", "P3"),
-            Command::Bundle(_) => ("bundle", "P3"),
-            Command::WhySlow(_) => ("why-slow", "P6"),
-            Command::WhyLarge(_) => ("why-large", "P6"),
-            Command::WhyDep(_) => ("why-dep", "P2"),
-            Command::Trace(_) => ("trace", "P6"),
-            Command::Profile(_) => ("profile", "P6"),
-            Command::Doctor => ("doctor", "P6"),
-            Command::Sync => ("sync", "P1"),
-            Command::Types(_) => ("types", "P1"),
+            Command::Run(_)
+            | Command::Dev(_)
+            | Command::Install(_)
+            | Command::Types(_)
+            | Command::Sync
+            | Command::WhyDep(_)
+            | Command::Fmt(_)
+            | Command::Lint(_)
+            | Command::Bundle(_) => "",
+            Command::Add(_) => "add",
+            Command::Remove(_) => "remove",
+            Command::Task(_) => "task",
+            Command::Test(_) => "test",
+            Command::Check(_) => "check",
+            Command::WhySlow(_) => "why-slow",
+            Command::WhyLarge(_) => "why-large",
+            Command::Trace(_) => "trace",
+            Command::Profile(_) => "profile",
+            Command::Doctor => "doctor",
         }
     }
 }
-
 impl Cli {
     pub fn run(self) -> ExitCode {
         match self.command {
@@ -373,16 +368,12 @@ impl Cli {
             // === /TOOL-003 ===
             // === RT-001 ===
             Command::Run(args) => cmd_run(&args),
-            // HONEST stub (CRAFT — "the action must DO the work"): no fake success path.
-            // Structured, single-line, machine-greppable; stderr only; non-zero exit.
             // === OBS-001 ===
             Command::WhyDep(args) => cmd_why_dep(&args),
             // === /OBS-001 ===
             other => {
-                let (verb, phase) = other.landing();
-                hiss(&format!(
-                    "meow: not yet implemented — `{verb}` lands in PLAN {phase}"
-                ));
+                let verb = other.landing();
+                hiss(&format!("meow: `{verb}` is not yet implemented"));
                 ExitCode::from(EXIT_UNIMPLEMENTED)
             }
         }
@@ -1037,7 +1028,7 @@ enum InstallSuccess {
 fn cmd_install(args: &InstallArgs) -> ExitCode {
     if matches!(args.mode, InstallMode::Vfs) {
         hiss(&format!(
-            "meow install: `--mode {}` lands in PKG-004 (P2)",
+            "meow install: `--mode {}` is not yet implemented",
             install_mode_name(&args.mode)
         ));
         return ExitCode::from(EXIT_UNIMPLEMENTED);
@@ -1958,12 +1949,7 @@ fn prepare_direct_file_run(
     }
     let abs = resolve_local_entry(cwd, target, true)?
         .ok_or_else(|| RunCommandError::Message(format!("cannot find {target}")))?;
-    native_file_request(
-        find_project_root(cwd),
-        cwd.to_path_buf(),
-        abs,
-        argv,
-    )
+    native_file_request(find_project_root(cwd), cwd.to_path_buf(), abs, argv)
 }
 
 fn cache_spec_for_target(

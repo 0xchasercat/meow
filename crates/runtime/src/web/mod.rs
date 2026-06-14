@@ -23,7 +23,6 @@ use std::sync::Arc;
 
 use deno_core::Extension;
 
-#[cfg(feature = "web-fetch")]
 pub mod perms;
 
 /// The curated strict-web ambient global declarations (CANON §8.1), embedded in
@@ -32,21 +31,10 @@ pub mod perms;
 /// Curated from the upstream WHATWG/Deno `.d.ts`, scoped to exactly the committed
 /// set; the shadow tsconfig pins `lib: ["esnext"]` so no DOM leaks in.
 ///
-/// FEATURE-CORRECT: the `fetch` group (`fetch`/`Headers`/`Request`/`Response`/
-/// `FormData`) lives in `strict-web.fetch.d.ts` and is appended ONLY under the
-/// default-on `web-fetch` feature — the same feature that wires `deno_fetch`. A
-/// `--no-default-features` build omits the extension AND these types together, so
-/// the typed surface never promises a global that would throw `ReferenceError`
-/// (I-9/I-11). The CLI links this crate with its real features, so the bytes it
-/// threads into `meow_config`'s shadow-gen already track the build.
-#[cfg(feature = "web-fetch")]
 pub const STRICT_WEB_DTS: &str = concat!(
     include_str!("lib/strict-web.base.d.ts"),
     include_str!("lib/strict-web.fetch.d.ts"),
 );
-/// See the `web-fetch` variant above. No-fetch build: base globals only.
-#[cfg(not(feature = "web-fetch"))]
-pub const STRICT_WEB_DTS: &str = include_str!("lib/strict-web.base.d.ts");
 
 /// The `fetch` network capability handle, seeded into `OpState` for the
 /// `op_meow_fetch_check` gate. It reuses RT-002's [`CapabilityCheck`] seam (and its
@@ -70,16 +58,11 @@ deno_core::extension!(
     esm_entry_point = "ext:meow_web/bootstrap.js",
     esm = [dir "src/web/js", "bootstrap.js"],
 );
-
-// The `fetch` capability gate op. Registered only with `web-fetch` (it borrows the
-// fetch-only `NetCaps` seed); the committed `fetch` wrapper in `bootstrap.js` calls
-// it before the request op runs.
-#[cfg(feature = "web-fetch")]
 deno_core::extension!(meow_web_fetch, ops = [perms::op_meow_fetch_check],);
 
-/// Build the ordered Stateless-Edge extension list (CANON §8.1) to append to
-/// RT-001's `RuntimeOptions.extensions`. Order: `deno_webidl` → `deno_web` →
-/// `deno_crypto` → (`deno_fetch` when `web-fetch`) → `meow_web` (the global-wiring
+/// Build the ordered Stateless-Edge extension list to append to
+/// the runtime. Order: `deno_webidl` → `deno_web` →
+/// `deno_crypto` → `deno_fetch` → `meow_web` (the global-wiring
 /// bootstrap, last, so every polyfill is registered before it runs).
 pub fn extensions(opts: WebOptions) -> Vec<Extension> {
     let WebOptions { caps, user_agent } = opts;
@@ -92,13 +75,9 @@ pub fn extensions(opts: WebOptions) -> Vec<Extension> {
             false, // enable_css_parser_features: off (DOMMatrix CSS parsing not in §8.1)
             deno_web::InMemoryBroadcastChannel::default(),
         ),
-        deno_crypto::deno_crypto::init(None), // seed=None at P1; RT-006 wires the hermetic seed
+        deno_crypto::deno_crypto::init(None),
     ];
-
-    #[cfg(feature = "web-fetch")]
     exts.extend(fetch_extensions(caps, user_agent));
-    #[cfg(not(feature = "web-fetch"))]
-    let _ = (caps, user_agent);
 
     exts.push(meow_web::init());
     exts
@@ -108,7 +87,6 @@ pub fn extensions(opts: WebOptions) -> Vec<Extension> {
 /// `OpState` seeds both consume: the concrete `PermissionsContainer` deno_fetch
 /// reads (set to `allow_all` — meow's gate is the single authority) and the
 /// [`NetCaps`] the gate checks (see [`perms`]).
-#[cfg(feature = "web-fetch")]
 fn fetch_extensions(caps: NetCaps, user_agent: String) -> Vec<Extension> {
     use deno_permissions::PermissionsContainer;
 
@@ -151,8 +129,6 @@ fn fetch_extensions(caps: NetCaps, user_agent: String) -> Vec<Extension> {
 /// provider deno_fetch expects). Needed because PKG-002's `ureq` HTTPS client adds
 /// the `ring` provider, leaving rustls with two providers and no auto-default. The
 /// `Once` makes it idempotent + thread-safe; an Err means a default is already set
-/// (fine — any installed default stops the panic). web-fetch-gated.
-#[cfg(feature = "web-fetch")]
 pub(crate) fn ensure_crypto_provider() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {

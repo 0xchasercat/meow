@@ -163,30 +163,28 @@ fn darwin_arm64_optional_dependencies_are_filtered_by_platform_support() {
         "next",
         "15.0.0",
         &[],
-        &[
-            ("@next/swc-darwin-arm64", "15.0.0"),
-            ("@next/swc-linux-x64-gnu", "15.0.0"),
-        ],
-        &[],
-        &[],
+        (
+            &[
+                ("@next/swc-darwin-arm64", "15.0.0"),
+                ("@next/swc-linux-x64-gnu", "15.0.0"),
+            ],
+            &[],
+            &[],
+        ),
         b"next".to_vec(),
     );
     registry.publish_with_optional_dependencies_and_platform(
         "@next/swc-darwin-arm64",
         "15.0.0",
         &[],
-        &[],
-        &["darwin"],
-        &["arm64"],
+        (&[], &["darwin"], &["arm64"]),
         b"swc-darwin-arm64".to_vec(),
     );
     registry.publish_with_optional_dependencies_and_platform(
         "@next/swc-linux-x64-gnu",
         "15.0.0",
         &[],
-        &[],
-        &["linux"],
-        &["x64"],
+        (&[], &["linux"], &["x64"]),
         b"swc-linux-x64-gnu".to_vec(),
     );
 

@@ -268,8 +268,9 @@ mod tests {
             SourceType::cjs(),
         );
         assert!(analysis.named_exports.contains(&"nextBuild".to_string()));
-        assert!(analysis.named_exports.contains(&"saveCpuProfile".to_string()));
+        assert!(analysis
+            .named_exports
+            .contains(&"saveCpuProfile".to_string()));
         assert!(analysis.has_commonjs_syntax);
     }
-
 }

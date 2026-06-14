@@ -250,10 +250,7 @@ impl MeowModuleLoader {
     /// Absolute filesystem path Deno's `createRequire`/`require` loads the module
     /// from. Prefers the projected `node_modules` view, falling back to the
     /// content-addressed runtime path (unpacked store / local file).
-    fn cjs_require_path(
-        &self,
-        resolved: &ResolvedModule,
-    ) -> Result<String, ModuleLoaderError> {
+    fn cjs_require_path(&self, resolved: &ResolvedModule) -> Result<String, ModuleLoaderError> {
         let path = self
             .resolver
             .projected_path_for(&resolved.locator)

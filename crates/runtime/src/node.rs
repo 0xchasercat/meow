@@ -100,7 +100,6 @@ pub fn extensions(opts: NodeOptions) -> Vec<Extension> {
         node_bridge::real_node_sys(),
     ));
     let perms_container = DenoPermissionsContainer::allow_all(parser);
-    #[cfg(feature = "web-fetch")]
     crate::web::ensure_crypto_provider();
 
     let blob_store = std::sync::Arc::new(deno_web::BlobStore::default());
@@ -257,10 +256,7 @@ fn node_bootstrap_state_extension(
     ext
 }
 
-deno_core::extension!(
-    meow_node_bootstrap,
-    ops = [op_meow_node_bootstrap_info],
-);
+deno_core::extension!(meow_node_bootstrap, ops = [op_meow_node_bootstrap_info],);
 
 fn child_pipe_from_env() -> Option<deno_node::ChildPipeFd> {
     let fd = std::env::var("NODE_CHANNEL_FD").ok()?.parse().ok()?;

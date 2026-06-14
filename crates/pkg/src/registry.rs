@@ -198,7 +198,6 @@ impl FixtureRegistry {
     pub fn new() -> FixtureRegistry {
         FixtureRegistry::default()
     }
-
     /// Publish one version with the correct sha512 integrity for `bytes`.
     pub fn publish(
         &mut self,
@@ -211,9 +210,7 @@ impl FixtureRegistry {
             name,
             version,
             deps,
-            &[],
-            &[],
-            &[],
+            (&[], &[], &[]),
             bytes,
         )
     }
@@ -231,9 +228,7 @@ impl FixtureRegistry {
             name,
             version,
             deps,
-            &[],
-            &[],
-            &[],
+            (&[], &[], &[]),
             bytes,
             integrity,
         )
@@ -245,21 +240,12 @@ impl FixtureRegistry {
         name: &str,
         version: &str,
         deps: &[(&str, &str)],
-        optional_deps: &[(&str, &str)],
-        os: &[&str],
-        cpu: &[&str],
+        metadata: (&[(&str, &str)], &[&str], &[&str]),
         bytes: Vec<u8>,
     ) -> &mut Self {
         let integrity = sha512_sri(&bytes);
         self.publish_with_optional_dependencies_and_platform_and_integrity(
-            name,
-            version,
-            deps,
-            optional_deps,
-            os,
-            cpu,
-            bytes,
-            &integrity,
+            name, version, deps, metadata, bytes, &integrity,
         )
     }
 
@@ -270,12 +256,11 @@ impl FixtureRegistry {
         name: &str,
         version: &str,
         deps: &[(&str, &str)],
-        optional_deps: &[(&str, &str)],
-        os: &[&str],
-        cpu: &[&str],
+        metadata: (&[(&str, &str)], &[&str], &[&str]),
         bytes: Vec<u8>,
         integrity: &str,
     ) -> &mut Self {
+        let (optional_deps, os, cpu) = metadata;
         let package = PackageName::new(name);
         let version = Version::parse(version).expect("fixture version must be valid semver");
         let dep_map = deps
@@ -355,11 +340,9 @@ impl RegistrySource for FixtureRegistry {
         })
     }
 }
-
 fn fixture_tarball_url(name: &str, version: &str) -> String {
     format!("fixture://{name}/{version}.tgz")
 }
-
 pub(crate) fn sha512_sri(bytes: &[u8]) -> String {
     let mut hasher = Sha512::new();
     hasher.update(bytes);

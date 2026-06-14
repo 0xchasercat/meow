@@ -189,35 +189,19 @@ fn strict_web_dts_tracks_web_fetch_feature() {
         "declare var Response",
         "declare var FormData",
     ];
-    if cfg!(feature = "web-fetch") {
-        for d in fetch_decls {
-            assert!(
-                dts.contains(d),
-                "default build must type the fetch group: {d}"
-            );
-        }
-    } else {
-        for d in fetch_decls {
-            assert!(
-                !dts.contains(d),
-                "no-fetch build must omit the fetch group: {d}"
-            );
-        }
+    for d in fetch_decls {
+        assert!(
+            dts.contains(d),
+            "default build must type the fetch group: {d}"
+        );
     }
 }
 
-// --- fetch: end-to-end + capability gate -----------------------------------
-
-#[cfg(feature = "web-fetch")]
 mod fetch {
     use super::*;
+    use meow_runtime::{CapDenied, CapRequest, CapabilityCheck};
     use parking_lot::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use meow_runtime::{CapDenied, CapRequest, CapabilityCheck};
-
-    // `Request`/`Response`/`Headers`/`FormData` are deno_fetch globals — present
-    // only with `web-fetch`.
     #[tokio::test]
     async fn web_response_headers_request() {
         let (out, mut rt) = web_runtime(allow_all());

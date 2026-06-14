@@ -79,10 +79,10 @@ impl TrivialModuleLoader {
             return self.load_file(specifier);
         }
 
-        // 3. Everything else is unresolved at P0 (no node_modules, no cache).
+        // 3. Everything else is unresolved (no node_modules, no cache).
         Err(ModuleLoaderError::generic(format!(
-            "meow: cannot resolve module {specifier} (the P0 loader only serves \
-             preloaded and file: modules; the real resolver lands in LOAD-001)"
+            "meow: cannot resolve module {specifier} (only preloaded and \
+             file: modules are supported)"
         )))
     }
 

@@ -271,8 +271,8 @@ fn append_diagnostics(
                 });
             } else {
                 for label in labels {
-                    let start = label.offset() as usize;
-                    let len = label.len() as usize;
+                    let start = label.offset();
+                    let len = label.len();
                     let end = start.saturating_add(len);
                     out.push(ToolDiagnostic {
                         path: path.to_path_buf(),
@@ -452,10 +452,8 @@ fn collect_targets(root: &Path, paths: &[PathBuf]) -> Result<Vec<PathBuf>, ToolE
             continue;
         }
 
-        if metadata.is_file() && is_target_file(&current) {
-            if seen.insert(current.clone()) {
-                files.push(current);
-            }
+        if metadata.is_file() && is_target_file(&current) && seen.insert(current.clone()) {
+            files.push(current);
         }
     }
 

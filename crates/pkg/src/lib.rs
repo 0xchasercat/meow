@@ -56,9 +56,9 @@ pub use unpacked::UnpackedStore;
 // === /LSP-001 ===
 // === /PKG-004 ===
 pub use lockfile::{CapabilityGrant, LockEntry, Lockfile, RegistryProvenance};
+pub use registry::FixtureRegistry;
 pub use registry::{
-    DepSpec, DistInfo, FixtureRegistry, PackageMetadata, RegistryError, RegistrySource,
-    VersionMetadata,
+    DepSpec, DistInfo, PackageMetadata, RegistryError, RegistrySource, VersionMetadata,
 };
 
 /// Sibling temp path for an atomic write: write `<path>.tmp`, then `rename` it

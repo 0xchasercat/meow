@@ -121,8 +121,7 @@ impl Runtime {
                 maybe_transpile_source(specifier, source)
             })),
             create_params: Some(
-                deno_core::v8::CreateParams::default()
-                    .heap_limits(0, 4 * 1024 * 1024 * 1024_usize),
+                deno_core::v8::CreateParams::default().heap_limits(0, 4 * 1024 * 1024 * 1024_usize),
             ),
             ..Default::default()
         })

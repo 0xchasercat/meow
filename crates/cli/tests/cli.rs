@@ -46,21 +46,18 @@ fn version_and_help_succeed() {
         .success()
         .stdout(predicate::str::contains("run"));
 }
-
-/// `(argv, verb, phase)` for every subcommand, with minimal valid args.
-const CASES: &[(&[&str], &str, &str)] = &[
-    (&["add", "p"], "add", "P2"),
-    (&["remove", "p"], "remove", "P2"),
-    (&["task", "t"], "task", "P4"),
-    (&["test"], "test", "P6"),
-    (&["check"], "check", "P3"),
-    (&["why-slow"], "why-slow", "P6"),
-    (&["why-large"], "why-large", "P6"),
-    (&["trace", "x.ts"], "trace", "P6"),
-    (&["profile", "x.ts"], "profile", "P6"),
-    (&["doctor"], "doctor", "P6"),
+const CASES: &[(&[&str], &str)] = &[
+    (&["add", "pkg"], "add"),
+    (&["remove", "pkg"], "remove"),
+    (&["task", "t"], "task"),
+    (&["test"], "test"),
+    (&["check"], "check"),
+    (&["why-slow"], "why-slow"),
+    (&["why-large"], "why-large"),
+    (&["trace", "x.ts"], "trace"),
+    (&["profile", "x.ts"], "profile"),
+    (&["doctor"], "doctor"),
 ];
-
 #[test]
 fn every_subcommand_stub_is_honest() {
     assert_eq!(
@@ -68,8 +65,8 @@ fn every_subcommand_stub_is_honest() {
         10,
         "10 stub subcommands (add/remove/task/test/check/why-slow/why-large/trace/profile/doctor); lint/fmt/bundle are real commands"
     );
-    for (argv, verb, phase) in CASES {
-        let expected = format!("meow: not yet implemented — `{verb}` lands in PLAN {phase}");
+    for (argv, verb) in CASES {
+        let expected = format!("meow: `{verb}` is not yet implemented");
         meow()
             .args(*argv)
             .assert()
@@ -210,7 +207,7 @@ fn install_vfs_mode_remains_an_honest_stub() {
         .assert()
         .code(3)
         .stdout(predicate::str::is_empty())
-        .stderr(predicate::str::contains("PKG-004"));
+        .stderr(predicate::str::contains("not yet implemented"));
 }
 
 #[test]

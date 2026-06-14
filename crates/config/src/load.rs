@@ -26,7 +26,7 @@ pub enum ConfigError {
     },
 
     #[error(
-        "meow.config.ts evaluation requires the runtime (RT-001), not yet available; \
+        "meow.config.ts evaluation is not yet supported; \
          provide meow.config.json for now"
     )]
     TsNotSupported,
@@ -61,7 +61,7 @@ pub enum ConfigError {
         source: serde_json::Error,
     },
 
-    #[error("unsupported dependency specifier {name}: {spec} — lands in a later slice")]
+    #[error("unsupported dependency specifier {name}: {spec}")]
     UnsupportedDependencySpecifier {
         name: String,
         spec: String,

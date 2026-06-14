@@ -12,7 +12,6 @@ pub mod envelope;
 pub mod facade;
 pub mod spinner;
 pub mod theme;
-pub mod waterfall;
 
 pub use diagnostic::SourceDiagnostic;
 pub use envelope::Tone;

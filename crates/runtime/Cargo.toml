@@ -34,8 +34,8 @@ deno_error = { workspace = true }
 deno_webidl = { workspace = true }
 deno_web = { workspace = true }
 deno_crypto = { workspace = true }
-deno_fetch = { workspace = true, optional = true }
-deno_net = { workspace = true, optional = true }
+deno_fetch = { workspace = true }
+deno_net = { workspace = true }
 deno_permissions = { workspace = true }
 # === RT-007 === Deno-owned Node/CommonJS/N-API bridge.
 deno_node = { workspace = true }
@@ -54,7 +54,7 @@ deno_ast = { version = "0.53.2", features = ["transpiling", "type_strip"] }
 # === /RT-007 ===
 # PKG-002's `meow install` HTTPS client (`reqwest`) and runtime TLS both use
 # `rustls`; installing the aws-lc-rs default in runtime avoids provider ambiguity.
-rustls = { workspace = true, optional = true }
+rustls = { workspace = true }
 # === RT-005 ===
 # `meow:http` reuses the same Hyper generation already in the tree: hyper itself,
 # the body adapters, and the existing hyper-util pin extended with server/tokio
@@ -93,12 +93,3 @@ meow-loader = { path = "../loader" }
 meow-pkg = { path = "../pkg" }
 # === /RT-005 ===
 
-# === RT-004 ===
-[features]
-default = ["web-fetch"]
-# `web-fetch` pulls deno_fetch (hyper/rustls/aws-lc) for the WHATWG `fetch`,
-# `Request`/`Response`/`Headers`/`FormData` globals and the capability-gated
-# network seam. Default-on; the footprint gate may turn it off (RT-004a) if the
-# HTTP client tree blows the I-10 budget, shipping the lighter globals alone.
-web-fetch = ["dep:deno_fetch", "dep:deno_net", "dep:rustls"]
-# === /RT-004 ===

@@ -388,8 +388,7 @@ fn normalize_version_req_arm(arm: &str) -> String {
                 i += 1;
             }
             _ => {
-                comparators
-                    .push(normalize_bare_version(token).unwrap_or_else(|| token.to_owned()));
+                comparators.push(normalize_bare_version(token).unwrap_or_else(|| token.to_owned()));
                 i += 1;
             }
         }

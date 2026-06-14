@@ -421,15 +421,27 @@ impl<'a> Materializer<'a> {
                 match link {
                     LinkStrategy::Symlink => {
                         if needs_real_tree_for_native_walkers(&rel) {
-                            bytes_written +=
-                                copy_edge_tree(&abs, key, &catalog, &tmp_root, &mut Vec::new(), &mut built)?;
+                            bytes_written += copy_edge_tree(
+                                &abs,
+                                key,
+                                &catalog,
+                                &tmp_root,
+                                &mut Vec::new(),
+                                &mut built,
+                            )?;
                         } else {
                             create_symlink(target, &abs)?;
                         }
                     }
                     LinkStrategy::Copy => {
-                        bytes_written +=
-                            copy_edge_tree(&abs, key, &catalog, &tmp_root, &mut Vec::new(), &mut built)?;
+                        bytes_written += copy_edge_tree(
+                            &abs,
+                            key,
+                            &catalog,
+                            &tmp_root,
+                            &mut Vec::new(),
+                            &mut built,
+                        )?;
                     }
                     LinkStrategy::Auto => unreachable!("effective link policy resolves auto"),
                 }
@@ -541,8 +553,6 @@ fn path_index(
     index
 }
 
-
-
 fn tree_is_current(
     plan: &MaterializePlan,
     opts: &MaterializeOptions,
@@ -615,8 +625,8 @@ fn tree_is_current(
                         if !meta.file_type().is_symlink() {
                             return Ok(false);
                         }
-                        let actual =
-                            fs::read_link(&abs).map_err(|source| MaterializeError::io(&abs, source))?;
+                        let actual = fs::read_link(&abs)
+                            .map_err(|source| MaterializeError::io(&abs, source))?;
                         if actual != *target {
                             return Ok(false);
                         }

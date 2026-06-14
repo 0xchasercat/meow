@@ -245,7 +245,10 @@ impl Resolver {
         };
         let (name, _version) = self.by_integrity.get(package)?;
         let root = self.project_root.to_file_path().ok()?;
-        let candidate = root.join("node_modules").join(name.to_string()).join(member);
+        let candidate = root
+            .join("node_modules")
+            .join(name.to_string())
+            .join(member);
         candidate.exists().then_some(candidate)
     }
     // === /LOAD-004 ===

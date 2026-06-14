@@ -7,6 +7,11 @@
 
 # transient sub-agent worktrees (GIT.md)
 .claude/worktrees/
+# internal docs (not for public release)
+harness/
+COMPAT_LOG.md
+/.claude/
+scripts/
 
 # node + os noise
 node_modules/
