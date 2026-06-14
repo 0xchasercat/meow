@@ -28,9 +28,7 @@ deno_error = { workspace = true }
 # extensions, co-versioned with deno_core 0.403 (pins owned by DIST-001). URL,
 # URLPattern and console live in deno_web at this generation; the standalone
 # deno_url/deno_console crates were merged into deno_web and are no longer pinned. The
-# heavy `fetch` HTTP client (hyper/rustls + Request/Response/Headers/FormData) is
-# isolated behind the default-on `web-fetch` feature so the footprint contingency
-# (I-10) can drop it without losing the light globals.
+# heavy `fetch` HTTP client (hyper/rustls + Request/Response/Headers/FormData).
 deno_webidl = { workspace = true }
 deno_web = { workspace = true }
 deno_crypto = { workspace = true }
@@ -71,6 +69,8 @@ http-body-util = { workspace = true }
 rand_chacha = { workspace = true }
 rand_core = { workspace = true }
 getrandom = { workspace = true }
+# System memory detection for adaptive V8 heap default.
+libc = "0.2"
 # === /RT-006 ===
 
 [dev-dependencies]

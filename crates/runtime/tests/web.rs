@@ -38,9 +38,10 @@ fn web_runtime(caps: NetCaps) -> (Rc<RefCell<String>>, Runtime) {
     });
     exts.push(sink_ext);
     let rt = Runtime::new(RuntimeOptions {
-        module_loader: Rc::new(TrivialModuleLoader::new()),
-        extensions: exts,
-    })
+            module_loader: Rc::new(TrivialModuleLoader::new()),
+            extensions: exts,
+            max_heap_size: None,
+        })
     .expect("runtime initializes with web globals");
     (out, rt)
 }

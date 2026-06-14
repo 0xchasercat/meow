@@ -341,11 +341,12 @@ async fn run_entry(
         None => node_extensions_without_bridge(cwd),
     });
     // === /RT-007 ===
-    let mut rt = Runtime::new(RuntimeOptions {
+let mut rt = Runtime::new(RuntimeOptions {
         module_loader: loader,
         extensions,
+        max_heap_size: None,
     })
-    .expect("runtime initializes");
+            .expect("runtime initializes");
     let spec = ModuleSpecifier::from_file_path(entry).expect("entry → file URL");
     rt.run_main_module(&spec).await
 }
@@ -399,21 +400,17 @@ async fn cached_dep_runs_end_to_end_with_no_node_modules() {
     let resolver = resolver_with(&cache_root, lockfile, root_deps(&[("dep", "1.0.0")]), &proj);
     let graph = Rc::new(RefCell::new(GraphDb::new()));
     let loader = Rc::new(MeowModuleLoader::new(resolver.clone(), graph));
-
     let (out, sink_ext) = capture();
     let mut rt = Runtime::new(RuntimeOptions {
         module_loader: loader,
-        // === RT-007 === Pure ESM loading only needs Deno's Node built-ins
-        // registered; no package-folder bridge is involved here.
         extensions: {
             let mut exts = node_extensions_without_bridge(&proj);
             exts.push(sink_ext);
             exts
         },
-        // === /RT-007 ===
+        max_heap_size: None,
     })
     .expect("runtime initializes");
-
     let spec = ModuleSpecifier::from_file_path(&entry).expect("entry → file URL");
     rt.run_main_module(&spec)
         .await
@@ -944,11 +941,10 @@ async fn extensionless_cached_commonjs_bin_runs_via_native_cjs_runtime() {
     let loader: Rc<dyn ModuleLoader> = Rc::new(MeowModuleLoader::new(
         resolver.clone(),
         Rc::new(RefCell::new(GraphDb::new())),
-    ));
+));
     let (out, sink_ext) = capture();
     let mut rt = Runtime::new(RuntimeOptions {
         module_loader: loader,
-        // === RT-007 === cached CommonJS execution needs the Deno package bridge.
         extensions: {
             let mut exts = vec![meow_loader::cjs_resolve_extension(resolver.clone())];
             exts.extend(node_extensions_with_bridge(
@@ -959,7 +955,7 @@ async fn extensionless_cached_commonjs_bin_runs_via_native_cjs_runtime() {
             exts.push(sink_ext);
             exts
         },
-        // === /RT-007 ===
+        max_heap_size: None,
     })
     .expect("runtime initializes");
     let spec = encode_cache_url(&dep_hash, "dist/bin/next");

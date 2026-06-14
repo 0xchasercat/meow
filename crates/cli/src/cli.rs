@@ -182,11 +182,15 @@ pub struct RunArgs {
     /// Use OS entropy for `Math.random` + `crypto.getRandomValues` (the run is no longer reproducible).
     #[arg(long)]
     pub allow_random: bool,
-    /// Expose host env vars: bare `--allow-env` grants ALL (widest), `--allow-env=HOME,PATH` scopes
+/// Expose host env vars: bare `--allow-env` grants ALL (widest), `--allow-env=HOME,PATH` scopes
     /// to the named vars; ungranted vars stay invisible. Absent = no host env (deterministic).
     #[arg(long, value_name = "NAMES", num_args = 0..=1, require_equals = true, default_missing_value = "")]
     pub allow_env: Option<String>,
     // === /RT-006 ===
+    /// Set the V8 heap limit in MiB (overrides the adaptive default).
+    /// Equivalent to Node's `--max-old-space-size`.
+    #[arg(long, value_name = "MiB")]
+    pub max_old_space_size: Option<usize>,
 }
 
 // === RUN-001 ===
@@ -203,6 +207,10 @@ pub struct RunScriptArgs {
     #[arg(long, value_name = "NAMES", num_args = 0..=1, require_equals = true, default_missing_value = "")]
     pub allow_env: Option<String>,
     // === /RT-006 ===
+    /// Set the V8 heap limit in MiB (overrides the adaptive default).
+    /// Equivalent to Node's `--max-old-space-size`.
+    #[arg(long, value_name = "MiB")]
+    pub max_old_space_size: Option<usize>,
 }
 // === /RUN-001 ===
 
@@ -1140,6 +1148,7 @@ fn cmd_install(args: &InstallArgs) -> ExitCode {
                 meow_pkg::resolve_roots(&direct_deps, &lockfile).map_err(|err| err.to_string())?;
             let graph = meow_pkg::ResolutionGraph::assemble(std::sync::Arc::new(lockfile), roots)
                 .map_err(|err| err.to_string())?;
+            spinner.set_label("materializing node_modules …".to_owned());
             let report = meow_pkg::Materializer::new(&cache, &graph, &root)
                 .materialize(&opts)
                 .map_err(|err| err.to_string())?;
@@ -1368,17 +1377,19 @@ struct RunFlagView<'a> {
     allow_clock: bool,
     allow_random: bool,
     allow_env: &'a Option<String>,
+    max_old_space_size: Option<usize>,
 }
-
 fn run_flags(args: &RunArgs) -> RunFlagView<'_> {
     RunFlagView {
         argv: &args.argv,
         allow_clock: args.allow_clock,
         allow_random: args.allow_random,
         allow_env: &args.allow_env,
+        max_old_space_size: args
+            .max_old_space_size
+            .or_else(env_max_old_space_size),
     }
 }
-
 // === RUN-001 ===
 fn run_script_flags(args: &RunScriptArgs) -> RunFlagView<'_> {
     RunFlagView {
@@ -1386,6 +1397,9 @@ fn run_script_flags(args: &RunScriptArgs) -> RunFlagView<'_> {
         allow_clock: args.allow_clock,
         allow_random: args.allow_random,
         allow_env: &args.allow_env,
+        max_old_space_size: args
+            .max_old_space_size
+            .or_else(env_max_old_space_size),
     }
 }
 // === /RUN-001 ===
@@ -1914,10 +1928,11 @@ async fn run_native_request(
     ));
     // === /RT-007 ===
     // === /RT-006 ===
-
+let max_heap_size = flags.max_old_space_size.map(|mib| mib * 1024 * 1024);
     let mut runtime = meow_runtime::Runtime::new(meow_runtime::RuntimeOptions {
         module_loader: loader,
         extensions,
+        max_heap_size,
     })
     .map_err(|err| RunCommandError::Message(err.to_string()))?;
 
@@ -2410,6 +2425,20 @@ fn find_project_root(start: &std::path::Path) -> PathBuf {
         }
     }
 }
+/// Parse `--max-old-space-size=<N>` from `NODE_OPTIONS` (value in MiB).
+/// Returns `None` if the env var is unset or the flag is absent/malformed.
+fn env_max_old_space_size() -> Option<usize> {
+    let node_options = std::env::var("NODE_OPTIONS").ok()?;
+    for token in node_options.split_whitespace() {
+        if let Some(rest) = token.strip_prefix("--max-old-space-size=") {
+            if let Ok(mib) = rest.parse::<usize>() {
+                return Some(mib);
+            }
+        }
+    }
+    None
+}
+// === LOAD-001 ===
 
 /// Read `meow.lock.jsonl` from the project root when present. A missing lockfile is
 /// the empty execution contract (local-only run); a malformed lockfile is an honest

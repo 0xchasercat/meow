@@ -27,9 +27,10 @@ fn capture() -> (Rc<RefCell<String>>, deno_core::Extension) {
 }
 
 fn runtime_with(extensions: Vec<deno_core::Extension>) -> Runtime {
-    Runtime::new(RuntimeOptions {
+Runtime::new(RuntimeOptions {
         module_loader: Rc::new(TrivialModuleLoader::new()),
         extensions,
+        max_heap_size: None,
     })
     .expect("runtime initializes")
 }

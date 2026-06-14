@@ -453,6 +453,7 @@ fn bad_usage_is_distinct() {
 }
 
 #[test]
+#[ignore = "footprint.sh removed in public release cleanup"]
 fn footprint_probe_runs_and_is_under_budget() {
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
     let out = StdCommand::new("sh")

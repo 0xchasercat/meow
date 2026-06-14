@@ -166,9 +166,10 @@ fn spawn_runtime(source: &str, policy: Policy) -> RuntimeThread {
                 extensions.push(io_capability_extension(Rc::new(NetListenDeny { shared })));
             }
 
-            let mut runtime = Runtime::new(RuntimeOptions {
+let mut runtime = Runtime::new(RuntimeOptions {
                 module_loader: loader,
                 extensions,
+                max_heap_size: None,
             })
             .map_err(|err| err.to_string())?;
             runtime

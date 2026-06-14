@@ -87,12 +87,63 @@ pub struct Runtime {
 /// registration seam (A4).
 pub struct RuntimeOptions {
     /// Resolves + fetches modules. At P0 this is [`TrivialModuleLoader`];
-    /// LOAD-001 replaces it with the real shared resolver. Required (no implicit
-    /// default → no ambient fs authority).
+    /// the real resolver replaces it with the shared resolver. Required (no
+    /// implicit default → no ambient fs authority).
     pub module_loader: std::rc::Rc<dyn deno_core::ModuleLoader>,
     /// Subsystem-contributed ops/extensions. This crate's own `meow_runtime`
     /// extension is always prepended internally; callers never pass it.
     pub extensions: Vec<deno_core::Extension>,
+    /// V8 heap limit in bytes. When `None`, the default is 4 GiB or 75% of
+    /// available system memory, whichever is larger. Set via
+    /// `--max-old-space-size=<MiB>` on `meow run` / `meow dev`.
+    pub max_heap_size: Option<usize>,
+}
+/// Default V8 heap size: 4 GiB or 75% of available system memory,
+/// like Next.js dev while staying reasonable for small scripts.
+fn default_heap_size() -> usize {
+    let four_gib = 4 * 1024 * 1024 * 1024_usize;
+    system_memory()
+        .map(|total| (total * 75) / 100)
+        .unwrap_or(four_gib)
+        .max(four_gib)
+}
+/// Returns total system memory in bytes, or `None` if unavailable.
+#[cfg(target_os = "macos")]
+fn system_memory() -> Option<usize> {
+    use std::ffi::CString;
+    let Ok(name) = CString::new("hw.memsize") else {
+        return None;
+    };
+    let mut size: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    let ret = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            &mut size as *mut _ as *mut _,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret == 0 {
+        Some(size as usize)
+    } else {
+        None
+    }
+}
+#[cfg(target_os = "linux")]
+fn system_memory() -> Option<usize> {
+    let info = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if info > 0 && page_size > 0 {
+        Some((info as usize) * (page_size as usize))
+    } else {
+        None
+    }
+}
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn system_memory() -> Option<usize> {
+    None
 }
 
 impl Runtime {
@@ -113,7 +164,9 @@ impl Runtime {
         let mut extensions = Vec::with_capacity(options.extensions.len() + 1);
         extensions.push(ext::meow_runtime::init());
         extensions.extend(options.extensions);
-
+        let heap_limit = options
+            .max_heap_size
+            .unwrap_or_else(default_heap_size);
         let js_runtime = JsRuntime::try_new(DenoRuntimeOptions {
             module_loader: Some(options.module_loader),
             extensions,
@@ -121,27 +174,24 @@ impl Runtime {
                 maybe_transpile_source(specifier, source)
             })),
             create_params: Some(
-                deno_core::v8::CreateParams::default().heap_limits(0, 4 * 1024 * 1024 * 1024_usize),
+                deno_core::v8::CreateParams::default().heap_limits(0, heap_limit),
             ),
             ..Default::default()
         })
         .map_err(|err| RuntimeError::Init(err.to_string()))?;
-
         Ok(Runtime { js_runtime })
     }
-
     /// Non-module script eval; returns the completion value. For bootstrap
     /// snippets and tests. `name` is the synthetic source name in stack traces.
     pub fn execute_script(
         &mut self,
         name: &'static str,
         src: impl Into<ModuleCodeString>,
-    ) -> Result<v8::Global<v8::Value>, RuntimeError> {
+) -> Result<v8::Global<v8::Value>, RuntimeError> {
         self.js_runtime
             .execute_script(name, src.into())
             .map_err(|err| error::uncaught_from_js(name, &err))
     }
-
     /// Loads `spec` as the main ESM module via the configured loader, evaluates
     /// it, and drives the event loop to completion — resolving top-level await
     /// and draining the microtask + macrotask queues. Uncaught exceptions become
@@ -192,10 +242,6 @@ impl Runtime {
         crate::node::take_process_exit_code(&self.js_runtime)
     }
 
-    /// The canonical deno_core dance: kick off evaluation, drive the loop, then
-    /// await the evaluation result — surfacing whichever fails first as a typed
-    /// error. An uncaught top-level throw / TLA rejection propagates through the
-    /// event loop; a non-JS loop failure becomes [`RuntimeError::EventLoop`].
     /// The canonical deno_core dance: kick off evaluation, pump the event
     /// loop until the module resolves, then continue pumping for any
     /// lingering server/async work. An uncaught top-level throw / TLA

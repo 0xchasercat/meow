@@ -298,9 +298,10 @@ fn node_runtime(
     extensions.extend(hermetic::extensions(hermetic_cfg));
     extensions.push(sink);
 
-    let runtime = Runtime::new(RuntimeOptions {
+let runtime = Runtime::new(RuntimeOptions {
         module_loader: loader,
         extensions,
+        max_heap_size: None,
     })
     .expect("runtime initializes");
     (out, runtime)
