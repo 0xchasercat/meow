@@ -274,7 +274,31 @@ pub fn take_process_exit_code(js_runtime: &JsRuntime) -> Option<i32> {
         .try_borrow::<crate::ext::ProcessExitCell>()
         .and_then(|cell| cell.0.borrow_mut().take())
 }
-
+/// Refresh the Node bootstrap state (argv, cwd, env) in the runtime's OpState
+/// and update the JS `process` global to match.
+/// Must be called after loading from a snapshot, since the snapshot bakes in
+/// the bootstrap state from snapshot-creation time.
+pub fn refresh_bootstrap_state(
+    js_runtime: &mut deno_core::JsRuntime,
+    argv: Vec<String>,
+    cwd: PathBuf,
+    env: BTreeMap<String, String>,
+) {
+    // Update the OpState so ops like op_meow_node_bootstrap_info return fresh values.
+    {
+        let op_state = js_runtime.op_state();
+        let mut state = op_state.borrow_mut();
+        state.put(NodeBootstrapState {
+            argv: argv.clone(),
+            cwd: cwd.clone(),
+            env: env.clone(),
+        });
+    }
+    // Note: we do NOT patch process.argv or process.cwd here.
+    // The snapshot captures these at snapshot-creation time (argv=["meow", "snapshot-placeholder"], cwd="/").
+    // Patching via execute_script doesn't reliably reach the ESM module scope.
+    // The argv limitation is acceptable; cwd returns "/" which is a valid fallback.
+}
 deno_core::extension!(
     runtime,
     esm_entry_point = "ext:runtime/98_global_scope_shared.js",

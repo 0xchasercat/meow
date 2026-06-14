@@ -69,6 +69,7 @@ pub use deno_core::ModuleSpecifier;
 pub use error::{JsExceptionReport, RuntimeError};
 pub use ext::http::ops::HttpError;
 pub use ext::{http_extension, print_sink_extension, ui_extension, PrintSink};
+pub use ext::meow_runtime;
 pub use loader::TrivialModuleLoader;
 // === RT-002 ===
 pub use io::{
@@ -97,6 +98,23 @@ pub struct RuntimeOptions {
     /// available system memory, whichever is larger. Set via
     /// `--max-old-space-size=<MiB>` on `meow run` / `meow dev`.
     pub max_heap_size: Option<usize>,
+    /// Optional pre-built V8 startup snapshot. When present, the runtime
+    /// initializes from this blob instead of running all extension JS sources
+    /// from scratch. Produces dramatically faster startup.
+    ///
+    /// The blob is produced by the `meow-snapshot` tool (or a `--create-snapshot`
+    /// build path) and embedded at compile time. The `residual_lazy_*` lists
+    /// cover any lazy-loaded JS/ESM modules that were NOT reached during
+    /// snapshot creation and therefore need fresh source at runtime.
+    pub startup_snapshot: Option<&'static [u8]>,
+    /// Residual `lazy_loaded_js` sources not captured in the snapshot.
+    /// Each entry is `(specifier, source_code)`. Only consulted when
+    /// `startup_snapshot` is `Some`.
+    pub residual_lazy_js_sources: &'static [(&'static str, &'static str)],
+    /// Residual `lazy_loaded_esm` sources not captured in the snapshot.
+    /// Each entry is `(specifier, source_code)`. Only consulted when
+    /// `startup_snapshot` is `Some`.
+    pub residual_lazy_esm_sources: &'static [(&'static str, &'static str)],
 }
 /// Default V8 heap size: 4 GiB or 75% of available system memory,
 /// like Next.js dev while staying reasonable for small scripts.
@@ -176,6 +194,9 @@ impl Runtime {
             create_params: Some(
                 deno_core::v8::CreateParams::default().heap_limits(0, heap_limit),
             ),
+            startup_snapshot: options.startup_snapshot,
+            residual_lazy_js_sources: options.residual_lazy_js_sources,
+            residual_lazy_esm_sources: options.residual_lazy_esm_sources,
             ..Default::default()
         })
         .map_err(|err| RuntimeError::Init(err.to_string()))?;
@@ -241,6 +262,17 @@ impl Runtime {
     pub fn take_process_exit_code(&mut self) -> Option<i32> {
         crate::node::take_process_exit_code(&self.js_runtime)
     }
+    /// Refresh the Node bootstrap state after loading from a snapshot.
+    /// The snapshot bakes in placeholder argv/cwd/env; this updates them
+    /// to the real values for this invocation.
+    pub fn refresh_node_bootstrap(
+        &mut self,
+        argv: Vec<String>,
+        cwd: std::path::PathBuf,
+        env: std::collections::BTreeMap<String, String>,
+    ) {
+        crate::node::refresh_bootstrap_state(&mut self.js_runtime, argv, cwd, env);
+    }
 
     /// The canonical deno_core dance: kick off evaluation, pump the event
     /// loop until the module resolves, then continue pumping for any
@@ -274,7 +306,7 @@ impl Runtime {
     }
 }
 
-fn maybe_transpile_source(
+pub fn maybe_transpile_source(
     specifier: deno_core::ModuleName,
     source: deno_core::ModuleCodeString,
 ) -> Result<

@@ -41,6 +41,9 @@ Runtime::new(RuntimeOptions {
         module_loader: Rc::new(TrivialModuleLoader::new()),
         extensions,
         max_heap_size: None,
+        startup_snapshot: None,
+        residual_lazy_js_sources: &[],
+        residual_lazy_esm_sources: &[],
     })
     .expect("runtime initializes")
 }

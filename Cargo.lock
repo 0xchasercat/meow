@@ -1064,6 +1064,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "dashmap"
+version = "5.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "978747c1d849a7d2ee5e8adc0159961c48fb7e5db2f06af6723b80123bb53856"
+dependencies = [
+ "cfg-if",
+ "hashbrown 0.14.5",
+ "lock_api",
+ "once_cell",
+ "parking_lot_core",
+]
+
+[[package]]
 name = "data-encoding"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1445,6 +1458,9 @@ name = "deno_maybe_sync"
 version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "35888cf73df1b1abc87e46ed74bcbcbb274b555b2f4e9ab677b3f5e45a1eabe3"
+dependencies = [
+ "dashmap",
+]
 
 [[package]]
 name = "deno_media_type"
@@ -3958,6 +3974,22 @@ dependencies = [
  "sys_traits",
  "thiserror 2.0.18",
  "tokio",
+]
+
+[[package]]
+name = "meow-snapshot"
+version = "0.0.0"
+dependencies = [
+ "deno_core",
+ "deno_crypto",
+ "deno_fetch",
+ "deno_net",
+ "deno_node",
+ "deno_web",
+ "deno_webidl",
+ "meow-loader",
+ "meow-pkg",
+ "meow-runtime",
 ]
 
 [[package]]

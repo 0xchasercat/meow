@@ -182,7 +182,7 @@ pub struct RunArgs {
     /// Use OS entropy for `Math.random` + `crypto.getRandomValues` (the run is no longer reproducible).
     #[arg(long)]
     pub allow_random: bool,
-/// Expose host env vars: bare `--allow-env` grants ALL (widest), `--allow-env=HOME,PATH` scopes
+    /// Expose host env vars: bare `--allow-env` grants ALL (widest), `--allow-env=HOME,PATH` scopes
     /// to the named vars; ungranted vars stay invisible. Absent = no host env (deterministic).
     #[arg(long, value_name = "NAMES", num_args = 0..=1, require_equals = true, default_missing_value = "")]
     pub allow_env: Option<String>,
@@ -191,6 +191,9 @@ pub struct RunArgs {
     /// Equivalent to Node's `--max-old-space-size`.
     #[arg(long, value_name = "MiB")]
     pub max_old_space_size: Option<usize>,
+    /// Disable the V8 startup snapshot (slower init, useful for debugging).
+    #[arg(long, hide = true)]
+    pub no_snapshot: bool,
 }
 
 // === RUN-001 ===
@@ -211,9 +214,11 @@ pub struct RunScriptArgs {
     /// Equivalent to Node's `--max-old-space-size`.
     #[arg(long, value_name = "MiB")]
     pub max_old_space_size: Option<usize>,
+    /// Disable the V8 startup snapshot (slower init, useful for debugging).
+    #[arg(long, hide = true)]
+    pub no_snapshot: bool,
 }
 // === /RUN-001 ===
-
 #[derive(Debug, Args)]
 pub struct InstallArgs {
     /// Install projection mode (CANON §18; PKG owns the final flag surface).
@@ -1378,6 +1383,7 @@ struct RunFlagView<'a> {
     allow_random: bool,
     allow_env: &'a Option<String>,
     max_old_space_size: Option<usize>,
+    no_snapshot: bool,
 }
 fn run_flags(args: &RunArgs) -> RunFlagView<'_> {
     RunFlagView {
@@ -1388,6 +1394,7 @@ fn run_flags(args: &RunArgs) -> RunFlagView<'_> {
         max_old_space_size: args
             .max_old_space_size
             .or_else(env_max_old_space_size),
+        no_snapshot: args.no_snapshot,
     }
 }
 // === RUN-001 ===
@@ -1400,6 +1407,7 @@ fn run_script_flags(args: &RunScriptArgs) -> RunFlagView<'_> {
         max_old_space_size: args
             .max_old_space_size
             .or_else(env_max_old_space_size),
+        no_snapshot: args.no_snapshot,
     }
 }
 // === /RUN-001 ===
@@ -1920,7 +1928,7 @@ async fn run_native_request(
             mode: ctx.node_mode,
             argv: node_argv,
             cwd: request.process_cwd.clone(),
-            env,
+            env: env.clone(),
             deno_node_services: Some(deno_node_services),
             caps: Some(caps),
             user_agent: Some(format!("meow/{}", env!("CARGO_PKG_VERSION"))),
@@ -1928,14 +1936,34 @@ async fn run_native_request(
     ));
     // === /RT-007 ===
     // === /RT-006 ===
-let max_heap_size = flags.max_old_space_size.map(|mib| mib * 1024 * 1024);
+    let max_heap_size = flags.max_old_space_size.map(|mib| mib * 1024 * 1024);
+    let startup_snapshot = if flags.no_snapshot || crate::SNAPSHOT_BLOB.is_empty() {
+        None
+    } else {
+        Some(crate::SNAPSHOT_BLOB)
+    };
     let mut runtime = meow_runtime::Runtime::new(meow_runtime::RuntimeOptions {
         module_loader: loader,
         extensions,
         max_heap_size,
+        startup_snapshot,
+        residual_lazy_js_sources: &[],
+        residual_lazy_esm_sources: &[],
     })
     .map_err(|err| RunCommandError::Message(err.to_string()))?;
-
+    // Refresh Node bootstrap state if we loaded from a snapshot.
+    // The snapshot bakes in placeholder argv/cwd/env from snapshot-creation time.
+    if startup_snapshot.is_some() {
+        let mut node_argv = Vec::with_capacity(request.argv.len() + 2);
+        node_argv.push("meow".to_string());
+        node_argv.push(request.argv1.clone());
+        node_argv.extend(request.argv.iter().cloned());
+        runtime.refresh_node_bootstrap(
+            node_argv,
+            request.process_cwd.clone(),
+            env.clone(),
+        );
+    }
     match runtime.run_main_module(&request.spec).await {
         Ok(()) => Ok(match runtime.take_process_exit_code() {
             Some(code) => ExitCode::from(code.rem_euclid(256) as u8),

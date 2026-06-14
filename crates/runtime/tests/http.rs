@@ -170,6 +170,9 @@ let mut runtime = Runtime::new(RuntimeOptions {
                 module_loader: loader,
                 extensions,
                 max_heap_size: None,
+                startup_snapshot: None,
+                residual_lazy_js_sources: &[],
+                residual_lazy_esm_sources: &[],
             })
             .map_err(|err| err.to_string())?;
             runtime

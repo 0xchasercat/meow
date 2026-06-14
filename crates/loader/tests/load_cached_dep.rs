@@ -344,9 +344,12 @@ async fn run_entry(
 let mut rt = Runtime::new(RuntimeOptions {
         module_loader: loader,
         extensions,
-        max_heap_size: None,
+max_heap_size: None,
+        startup_snapshot: None,
+        residual_lazy_js_sources: &[],
+        residual_lazy_esm_sources: &[],
     })
-            .expect("runtime initializes");
+    .expect("runtime initializes");
     let spec = ModuleSpecifier::from_file_path(entry).expect("entry → file URL");
     rt.run_main_module(&spec).await
 }
@@ -408,7 +411,10 @@ async fn cached_dep_runs_end_to_end_with_no_node_modules() {
             exts.push(sink_ext);
             exts
         },
-        max_heap_size: None,
+max_heap_size: None,
+        startup_snapshot: None,
+        residual_lazy_js_sources: &[],
+        residual_lazy_esm_sources: &[],
     })
     .expect("runtime initializes");
     let spec = ModuleSpecifier::from_file_path(&entry).expect("entry → file URL");
@@ -955,7 +961,10 @@ async fn extensionless_cached_commonjs_bin_runs_via_native_cjs_runtime() {
             exts.push(sink_ext);
             exts
         },
-        max_heap_size: None,
+max_heap_size: None,
+        startup_snapshot: None,
+        residual_lazy_js_sources: &[],
+        residual_lazy_esm_sources: &[],
     })
     .expect("runtime initializes");
     let spec = encode_cache_url(&dep_hash, "dist/bin/next");
