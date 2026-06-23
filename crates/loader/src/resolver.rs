@@ -9,7 +9,6 @@
 //! No `node_modules` is ever created or consulted (I-5). Cached dependencies resolve
 //! from lockfile entries into members of content-addressed package archives.
 
-use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -19,8 +18,7 @@ use meow_pkg::{Cache, CacheError, ContentHash, Lockfile, PackageName, UnpackedSt
 use meow_runtime::native::NativeModuleSource;
 use node_resolver::IsBuiltInNodeModuleChecker;
 
-use crate::package::{Exports, ExportsTarget, PackageFs, PackageJson};
-use crate::url as virtual_url;
+use crate::package::{Exports, ExportsTarget, PackageJson};
 
 // === LOAD-004 ===
 /// Active import-context conditions, applied in a FIXED meow priority order.
@@ -103,8 +101,6 @@ pub enum ResolveError {
     },
     #[error("module source is not valid UTF-8: {url}")]
     NotUtf8 { url: Url },
-    #[error("malformed virtual cache URL: {0}")]
-    InvalidVirtualUrl(Url),
     #[error("{subpath:?} is not exported by {package:?} (check its package.json \"exports\")")]
     SubpathNotExported { package: String, subpath: String },
     #[error("{subpath:?} is explicitly blocked (null) by {package:?}'s exports/imports")]
@@ -145,7 +141,6 @@ pub struct Resolver {
     lockfile: Arc<Lockfile>,
     root_deps: BTreeMap<PackageName, Version>,
     by_integrity: HashMap<ContentHash, (PackageName, Version)>,
-    packages: RefCell<HashMap<ContentHash, Arc<PackageFs>>>,
     project_root: Url,
     // === RT-005 ===
     native: Arc<dyn NativeModuleSource>,
@@ -176,7 +171,6 @@ impl Resolver {
             lockfile,
             root_deps,
             by_integrity,
-            packages: RefCell::new(HashMap::new()),
             project_root,
             native,
         }
@@ -250,6 +244,53 @@ impl Resolver {
             .join(name.to_string())
             .join(member);
         candidate.exists().then_some(candidate)
+    }
+
+    /// The on-disk unpacked-store directory for a cached package, forcing an
+    /// on-demand unpack. This is the canonical real root every cached member
+    /// path and `file://` URL is built from.
+    fn cached_root(&self, package: &ContentHash) -> Result<PathBuf, ResolveError> {
+        let store = UnpackedStore::new(self.cache.root().join("unpacked"), self.cache.clone());
+        store.ensure(package).map_err(|err| match err {
+            meow_pkg::MaterializeError::CacheBlob { source, .. } => ResolveError::Cache(source),
+            meow_pkg::MaterializeError::Cache { source, .. } => ResolveError::Cache(source),
+            meow_pkg::MaterializeError::InvalidArchive { reason, .. } => ResolveError::InvalidArchive {
+                package: self.package_label(package),
+                reason,
+            },
+            other => ResolveError::UnpackedPath {
+                package: self.package_label(package),
+                reason: other.to_string(),
+            },
+        })
+    }
+
+    /// The single canonical `file://` identity for a resolved module. Cached
+    /// members map to their REAL absolute path in the unpacked store (never the
+    /// old `meow-cache://` virtual scheme), so ESM `locate`/`resolve`, the CJS
+    /// require path, and owner referrers all agree on one URL per member.
+    pub fn cached_url(&self, locator: &ModuleLocator) -> Result<Url, ResolveError> {
+        let path = self.runtime_path_for(locator)?;
+        Url::from_file_path(&path).map_err(|()| ResolveError::SpecifierNotFound {
+            specifier: path.display().to_string(),
+            referrer: self.project_root.clone(),
+        })
+    }
+
+    /// If `path` lives inside the unpacked store, recover its `(package, member)`
+    /// so a real `file://` path re-enters cached resolution as a [`ModuleLocator::Cached`]
+    /// and its owning package is recognized (transitive deps included).
+    fn cached_locator_for_path(&self, path: &Path) -> Option<(ContentHash, String)> {
+        let unpacked_root = self.cache.root().join("unpacked");
+        let rel = strip_store_prefix(path, &unpacked_root)?;
+        let mut components = rel.components();
+        let host = components.next()?.as_os_str().to_str()?;
+        let package = ContentHash::from_url_host(host).ok()?;
+        if self.by_integrity.get(&package).is_none() {
+            return None;
+        }
+        let member = components.as_path().to_string_lossy().replace('\\', "/");
+        Some((package, member))
     }
     // === /LOAD-004 ===
     // === RT-005 ===
@@ -418,15 +459,9 @@ impl Resolver {
                     source,
                 })?
             }
-            ModuleLocator::Cached { package, member } => {
-                let fs = self.package_fs(package)?;
-                let bytes = fs
-                    .read(member)
-                    .ok_or_else(|| ResolveError::SpecifierNotFound {
-                        specifier: url.to_string(),
-                        referrer: referrer.clone(),
-                    })?;
-                bytes.as_ref().to_vec()
+            ModuleLocator::Cached { .. } => {
+                let path = self.runtime_path_for(&locator)?;
+                std::fs::read(&path).map_err(|source| ResolveError::Io { path, source })?
             }
             // === RT-005 ===
             ModuleLocator::Native { name } => {
@@ -493,8 +528,8 @@ export default proxy;
         match locator {
             ModuleLocator::LocalFile(path) => local_file_kind(path),
             ModuleLocator::Cached { package, member } => {
-                let fs = self.package_fs(package)?;
-                Ok(cached_file_kind(member, &fs))
+                let root = self.cached_root(package)?;
+                Ok(cached_file_kind(&root, member))
             }
             ModuleLocator::Native { .. } => Ok(ModuleKind::Esm),
         }
@@ -515,11 +550,7 @@ export default proxy;
                         specifier: url.to_string(),
                         referrer: self.project_root.clone(),
                     })?;
-                Ok((url, ModuleLocator::LocalFile(path)))
-            }
-            virtual_url::SCHEME => {
-                let specifier = url.to_string();
-                self.finalize_cached_url(url, &specifier, &self.project_root)
+                Ok((url, self.file_locator(path)))
             }
             other => Err(ResolveError::UnsupportedScheme {
                 scheme: other.to_owned(),
@@ -542,7 +573,6 @@ export default proxy;
                 },
             )),
             "file" => self.finalize_local_url(joined, specifier, referrer),
-            virtual_url::SCHEME => self.finalize_cached_url(joined, specifier, referrer),
             other => Err(ResolveError::UnsupportedScheme {
                 scheme: other.to_owned(),
                 url: joined,
@@ -566,27 +596,24 @@ export default proxy;
             specifier: specifier.to_owned(),
             referrer: referrer.clone(),
         })?;
-        self.local_target(path)
+        let url = Url::from_file_path(&path).map_err(|()| ResolveError::SpecifierNotFound {
+            specifier: specifier.to_owned(),
+            referrer: referrer.clone(),
+        })?;
+        Ok((url, self.file_locator(path)))
     }
 
-    fn finalize_cached_url(
-        &self,
-        joined: Url,
-        specifier: &str,
-        referrer: &Url,
-    ) -> Result<(Url, ModuleLocator), ResolveError> {
-        let (package, member) = virtual_url::decode(&joined)?;
-        let fs = self.package_fs(&package)?;
-        let member = finalize_cached_member(&fs, &member).ok_or_else(|| {
-            ResolveError::SpecifierNotFound {
-                specifier: specifier.to_owned(),
-                referrer: referrer.clone(),
+    /// Classify a real filesystem path into the right locator: a path inside the
+    /// unpacked store becomes [`ModuleLocator::Cached`] (so its owning package is
+    /// recognized for bare/`#imports` resolution), everything else is a
+    /// [`ModuleLocator::LocalFile`]. The URL stays the same `file://` path either way.
+    fn file_locator(&self, path: PathBuf) -> ModuleLocator {
+        match self.cached_locator_for_path(&path) {
+            Some((package, member)) if !member.is_empty() => {
+                ModuleLocator::Cached { package, member }
             }
-        })?;
-        Ok((
-            virtual_url::encode(&package, &member),
-            ModuleLocator::Cached { package, member },
-        ))
+            _ => ModuleLocator::LocalFile(path),
+        }
     }
 
     fn locate_package_import(
@@ -687,13 +714,7 @@ export default proxy;
             });
         };
         let package = entry.integrity.clone();
-        let fs = self.package_fs(&package)?;
-        let dep_owner = OwnerPackage::Cached {
-            package: package.clone(),
-            name: dep_name.clone(),
-            version,
-            fs,
-        };
+        let dep_owner = self.cached_owner(package.clone(), dep_name.clone(), version)?;
 
         let resolution =
             if let Some(exports) = dep_owner.manifest().and_then(|m| m.exports.as_ref()) {
@@ -724,23 +745,6 @@ export default proxy;
                 let manifest = self.project_manifest()?;
                 Ok(OwnerPackage::Root { root, manifest })
             }
-            virtual_url::SCHEME => {
-                let (package, _member) = virtual_url::decode(referrer)?;
-                let (name, version) =
-                    self.by_integrity.get(&package).cloned().ok_or_else(|| {
-                        ResolveError::SpecifierNotFound {
-                            specifier: referrer.to_string(),
-                            referrer: referrer.clone(),
-                        }
-                    })?;
-                let fs = self.package_fs(&package)?;
-                Ok(OwnerPackage::Cached {
-                    package,
-                    name,
-                    version,
-                    fs,
-                })
-            }
             other => Err(ResolveError::UnsupportedScheme {
                 scheme: other.to_owned(),
                 url: referrer.clone(),
@@ -755,33 +759,32 @@ export default proxy;
         let Ok(path) = referrer.to_file_path() else {
             return Ok(None);
         };
-        let Ok(canonical) = std::fs::canonicalize(&path) else {
-            return Ok(None);
-        };
-        let unpacked_root = self.cache.root().join("unpacked");
-        let Ok(relative) = canonical.strip_prefix(&unpacked_root) else {
-            return Ok(None);
-        };
-        let Some(host) = relative
-            .components()
-            .next()
-            .and_then(|component| component.as_os_str().to_str())
-        else {
-            return Ok(None);
-        };
-        let Ok(package) = ContentHash::from_url_host(host) else {
+        let Some((package, _member)) = self.cached_locator_for_path(&path) else {
             return Ok(None);
         };
         let Some((name, version)) = self.by_integrity.get(&package).cloned() else {
             return Ok(None);
         };
-        let fs = self.package_fs(&package)?;
-        Ok(Some(OwnerPackage::Cached {
+        Ok(Some(self.cached_owner(package, name, version)?))
+    }
+
+    /// Build a cached [`OwnerPackage`] from disk: unpack the package and read its
+    /// top-level `package.json`. Replaces the old in-memory `PackageFs` owner.
+    fn cached_owner(
+        &self,
+        package: ContentHash,
+        name: PackageName,
+        version: Version,
+    ) -> Result<OwnerPackage, ResolveError> {
+        let root = self.cached_root(&package)?;
+        let manifest = read_cached_manifest(&root, &root)?.unwrap_or_default();
+        Ok(OwnerPackage::Cached {
             package,
             name,
             version,
-            fs,
-        }))
+            root,
+            manifest,
+        })
     }
 
     fn project_root_path(&self) -> Option<PathBuf> {
@@ -810,17 +813,16 @@ export default proxy;
         let explicit = match owner {
             OwnerPackage::Root { .. } => self.root_deps.get(dep_name).cloned(),
             OwnerPackage::Cached {
-                name, version, fs, ..
+                name,
+                version,
+                manifest,
+                ..
             } => {
                 let dependencies = self.lockfile.get(name, version)?;
                 if let Some(version) = dependencies.dependencies.get(dep_name) {
                     return Some(version.clone());
                 }
-                if fs
-                    .manifest()
-                    .peer_dependencies
-                    .contains_key(dep_name.as_str())
-                {
+                if manifest.peer_dependencies.contains_key(dep_name.as_str()) {
                     return self.root_deps.get(dep_name).cloned();
                 }
                 None
@@ -843,45 +845,17 @@ export default proxy;
         }
     }
 
-    fn package_fs(&self, integrity: &ContentHash) -> Result<Arc<PackageFs>, ResolveError> {
-        if let Some(existing) = self.packages.borrow().get(integrity) {
-            return Ok(existing.clone());
-        }
-        let bytes = self.cache.read(integrity)?;
-        let fs = PackageFs::from_archive(&bytes)
-            .map_err(|err| self.relabel_package_error(integrity, err))?;
-        let fs = Arc::new(fs);
-        self.packages
-            .borrow_mut()
-            .insert(integrity.clone(), fs.clone());
-        Ok(fs)
-    }
-
-    fn relabel_package_error(&self, integrity: &ContentHash, err: ResolveError) -> ResolveError {
-        let label = self.package_label(integrity);
-        match err {
-            ResolveError::InvalidManifest { reason, .. } => ResolveError::InvalidManifest {
-                package: label,
-                reason,
-            },
-            ResolveError::InvalidArchive { reason, .. } => ResolveError::InvalidArchive {
-                package: label,
-                reason,
-            },
-            other => other,
-        }
-    }
-
     fn target_resolution_to_locator(
         &self,
         resolution: TargetResolution,
     ) -> Result<(Url, ModuleLocator), ResolveError> {
         match resolution {
             TargetResolution::LocalFile(path) => self.local_target(path),
-            TargetResolution::Cached { package, member } => Ok((
-                virtual_url::encode(&package, &member),
-                ModuleLocator::Cached { package, member },
-            )),
+            TargetResolution::Cached { package, member } => {
+                let locator = ModuleLocator::Cached { package, member };
+                let url = self.cached_url(&locator)?;
+                Ok((url, locator))
+            }
         }
     }
 
@@ -1009,8 +983,8 @@ export default proxy;
                         }
                         Ok(TargetResolution::LocalFile(path))
                     }
-                    OwnerPackage::Cached { package, fs, .. } => {
-                        if !fs.contains(&member) {
+                    OwnerPackage::Cached { package, root, .. } => {
+                        if !root.join(&member).is_file() {
                             return Err(ResolveError::SpecifierNotFound {
                                 specifier: member,
                                 referrer: owner.referrer_url(&self.project_root),
@@ -1052,7 +1026,7 @@ export default proxy;
         owner: &OwnerPackage,
         subpath: Option<&str>,
     ) -> Result<TargetResolution, ResolveError> {
-        let OwnerPackage::Cached { package, fs, .. } = owner else {
+        let OwnerPackage::Cached { package, root, .. } = owner else {
             return Err(ResolveError::SubpathNotExported {
                 package: owner.label(),
                 subpath: subpath_for_exports(subpath),
@@ -1066,7 +1040,7 @@ export default proxy;
                     referrer: owner.referrer_url(&self.project_root),
                 }
             })?;
-            let member = finalize_cached_member(fs, &member).ok_or_else(|| {
+            let member = finalize_cached_member(root, &member).ok_or_else(|| {
                 ResolveError::SpecifierNotFound {
                     specifier: subpath.to_owned(),
                     referrer: owner.referrer_url(&self.project_root),
@@ -1082,7 +1056,7 @@ export default proxy;
             .manifest()
             .and_then(|manifest| manifest.main.as_deref())
             .and_then(normalize_legacy_member)
-            .and_then(|member| finalize_cached_member(fs, &member))
+            .and_then(|member| finalize_cached_member(root, &member))
         {
             return Ok(TargetResolution::Cached {
                 package: package.clone(),
@@ -1091,7 +1065,7 @@ export default proxy;
         }
 
         let member =
-            cached_directory_index(fs, "").ok_or_else(|| ResolveError::SpecifierNotFound {
+            cached_directory_index(root, "").ok_or_else(|| ResolveError::SpecifierNotFound {
                 specifier: owner.label(),
                 referrer: owner.referrer_url(&self.project_root),
             })?;
@@ -1111,7 +1085,8 @@ enum OwnerPackage {
         package: ContentHash,
         name: PackageName,
         version: Version,
-        fs: Arc<PackageFs>,
+        root: PathBuf,
+        manifest: PackageJson,
     },
 }
 
@@ -1138,7 +1113,7 @@ impl OwnerPackage {
     fn manifest(&self) -> Option<&PackageJson> {
         match self {
             OwnerPackage::Root { manifest, .. } => manifest.as_ref(),
-            OwnerPackage::Cached { fs, .. } => Some(fs.manifest()),
+            OwnerPackage::Cached { manifest, .. } => Some(manifest),
         }
     }
 
@@ -1147,7 +1122,9 @@ impl OwnerPackage {
             OwnerPackage::Root { root, .. } => Url::from_file_path(root.join("package.json"))
                 .ok()
                 .unwrap_or_else(|| project_root.clone()),
-            OwnerPackage::Cached { package, .. } => virtual_url::encode(package, "package.json"),
+            OwnerPackage::Cached { root, .. } => Url::from_file_path(root.join("package.json"))
+                .ok()
+                .unwrap_or_else(|| project_root.clone()),
         }
     }
 }
@@ -1285,6 +1262,26 @@ fn normalize_member_path(package: &str, target: &str, raw: &str) -> Result<Strin
     Ok(member)
 }
 
+/// Return the path of `path` relative to the unpacked-store `root`, tolerating the
+/// macOS `/var` -> `/private/var` symlink divergence: try a direct prefix match
+/// first (our minted URLs are un-canonicalized store paths), then fall back to
+/// canonicalizing both sides so a referrer Deno may have canonicalized still maps
+/// back to its package.
+fn strip_store_prefix(path: &Path, root: &Path) -> Option<PathBuf> {
+    if let Ok(rel) = path.strip_prefix(root) {
+        return Some(rel.to_path_buf());
+    }
+    let canonical_path = std::fs::canonicalize(path).ok()?;
+    if let Ok(rel) = canonical_path.strip_prefix(root) {
+        return Some(rel.to_path_buf());
+    }
+    let canonical_root = std::fs::canonicalize(root).ok()?;
+    canonical_path
+        .strip_prefix(&canonical_root)
+        .ok()
+        .map(|rel| rel.to_path_buf())
+}
+
 fn finalize_local_path(path: &Path) -> Option<PathBuf> {
     if path.is_file() {
         return Some(path.to_path_buf());
@@ -1308,27 +1305,31 @@ fn local_directory_index(path: &Path) -> Option<PathBuf> {
     None
 }
 
-fn finalize_cached_member(fs: &PackageFs, member: &str) -> Option<String> {
+fn cached_member_is_file(root: &Path, member: &str) -> bool {
+    !member.is_empty() && root.join(member).is_file()
+}
+
+fn finalize_cached_member(root: &Path, member: &str) -> Option<String> {
     let member = member.trim_start_matches('/');
     if member.is_empty() {
-        return cached_package_entry(fs, "");
+        return cached_package_entry(root, "");
     }
-    if fs.contains(member) {
+    if cached_member_is_file(root, member) {
         return Some(member.to_owned());
     }
     for suffix in EXTENSIONS {
         let candidate = format!("{member}{suffix}");
-        if fs.contains(&candidate) {
+        if cached_member_is_file(root, &candidate) {
             return Some(candidate);
         }
     }
-    cached_package_entry(fs, member)
+    cached_package_entry(root, member)
 }
 
-fn cached_package_entry(fs: &PackageFs, member: &str) -> Option<String> {
-    if let Some(main) = fs
-        .manifest_for_dir(member)
-        .and_then(|manifest| manifest.main.as_deref())
+fn cached_package_entry(root: &Path, member: &str) -> Option<String> {
+    if let Some(main) = cached_manifest_for_dir(root, member)
+        .and_then(|manifest| manifest.main)
+        .as_deref()
         .and_then(normalize_legacy_member)
     {
         let candidate = if member.is_empty() {
@@ -1336,25 +1337,64 @@ fn cached_package_entry(fs: &PackageFs, member: &str) -> Option<String> {
         } else {
             format!("{member}/{main}")
         };
-        if let Some(found) = finalize_cached_member(fs, &candidate) {
+        if let Some(found) = finalize_cached_member(root, &candidate) {
             return Some(found);
         }
     }
-    cached_directory_index(fs, member)
+    cached_directory_index(root, member)
 }
 
-fn cached_directory_index(fs: &PackageFs, member: &str) -> Option<String> {
+fn cached_directory_index(root: &Path, member: &str) -> Option<String> {
     for index in INDEX_FILES {
         let candidate = if member.is_empty() {
             index.to_owned()
         } else {
             format!("{member}/{index}")
         };
-        if fs.contains(&candidate) {
+        if cached_member_is_file(root, &candidate) {
             return Some(candidate);
         }
     }
     None
+}
+
+/// Read the `package.json` directly under `dir` (relative to the unpacked package
+/// `root`), if present. Mirrors the old `PackageFs::manifest_for_dir` against disk.
+fn cached_manifest_for_dir(root: &Path, dir: &str) -> Option<PackageJson> {
+    let manifest_dir = if dir.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(dir)
+    };
+    read_cached_manifest(root, &manifest_dir).ok().flatten()
+}
+
+/// Walk up from a cached `member` to the nearest enclosing `package.json` inside the
+/// unpacked package `root`, returning its parsed manifest (the top-level one if none
+/// nested matches). Mirrors `PackageFs::nearest_manifest` against disk.
+fn nearest_cached_manifest(root: &Path, member: &str) -> PackageJson {
+    let mut current = member.rsplit_once('/').map(|(dir, _)| dir);
+    while let Some(dir) = current {
+        if let Ok(Some(manifest)) = read_cached_manifest(root, &root.join(dir)) {
+            return manifest;
+        }
+        current = dir.rsplit_once('/').map(|(parent, _)| parent);
+    }
+    read_cached_manifest(root, root).ok().flatten().unwrap_or_default()
+}
+
+fn read_cached_manifest(root: &Path, dir: &Path) -> Result<Option<PackageJson>, ResolveError> {
+    let path = dir.join("package.json");
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|err| {
+            ResolveError::InvalidManifest {
+                package: root.display().to_string(),
+                reason: err.to_string(),
+            }
+        }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(ResolveError::Io { path, source }),
+    }
 }
 
 fn append_path_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -1363,20 +1403,13 @@ fn append_path_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(text)
 }
 
-fn cached_file_kind(member: &str, fs: &PackageFs) -> ModuleKind {
+fn cached_file_kind(root: &Path, member: &str) -> ModuleKind {
     match Path::new(member).extension().and_then(|ext| ext.to_str()) {
         Some("mjs") => ModuleKind::Esm,
         Some("cjs") => ModuleKind::Cjs,
         Some("json") => ModuleKind::Json,
-        Some("js") => {
-            if fs.nearest_manifest(member).package_type.as_deref() == Some("module") {
-                ModuleKind::Esm
-            } else {
-                ModuleKind::Cjs
-            }
-        }
         _ => {
-            if fs.nearest_manifest(member).package_type.as_deref() == Some("module") {
+            if nearest_cached_manifest(root, member).package_type.as_deref() == Some("module") {
                 ModuleKind::Esm
             } else {
                 ModuleKind::Cjs
@@ -1590,12 +1623,19 @@ mod tests {
             meow_runtime::native::native_module_registry(),
         );
 
-        let fs = Arc::new(PackageFs::from_archive(&archive).expect("cached manifest"));
+        let cache = Arc::new(Cache::with_root(dir.join("cache")));
+        cache.store(&archive).expect("store cached blob");
+        let store = UnpackedStore::new(dir.join("cache").join("unpacked"), cache);
+        let root = store.ensure(&integrity).expect("unpack cached package");
+        let manifest = read_cached_manifest(&root, &root)
+            .expect("read manifest")
+            .unwrap_or_default();
         let dep_owner = OwnerPackage::Cached {
             package: integrity,
             name: next_name,
             version: next_version,
-            fs,
+            root,
+            manifest,
         };
 
         assert_eq!(

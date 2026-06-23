@@ -11,7 +11,6 @@
 
 pub mod package;
 mod resolver;
-mod url;
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -28,9 +27,6 @@ use meow_graph::GraphDb;
 use serde::Serialize;
 
 pub use crate::resolver::{ModuleKind, ModuleLocator, ResolveError, ResolvedModule, Resolver};
-pub use crate::url::{
-    decode as decode_cache_url, encode as encode_cache_url, SCHEME as CACHE_SCHEME,
-};
 
 #[derive(Clone)]
 struct CjsResolveState {
@@ -331,11 +327,6 @@ fn graph_path_for(url: &Url, module_specifier: &ModuleSpecifier) -> PathBuf {
     if let Ok(path) = url.to_file_path() {
         return path;
     }
-    if let Ok((package, member)) = decode_cache_url(url) {
-        return PathBuf::from("meow-cache")
-            .join(package.to_url_host())
-            .join(member);
-    }
     // === RT-005 ===
     if url.scheme() == "meow" {
         let native_member = url.path().trim_start_matches('/');
@@ -364,13 +355,6 @@ fn graph_path_for(url: &Url, module_specifier: &ModuleSpecifier) -> PathBuf {
 fn cjs_filename_for(url: &Url, module_specifier: &ModuleSpecifier) -> String {
     if let Ok(path) = url.to_file_path() {
         return path.to_string_lossy().into_owned();
-    }
-    if let Ok((package, member)) = decode_cache_url(url) {
-        return PathBuf::from("/meow-cache")
-            .join(package.to_url_host())
-            .join(member)
-            .to_string_lossy()
-            .into_owned();
     }
     graph_path_for(url, module_specifier)
         .to_string_lossy()

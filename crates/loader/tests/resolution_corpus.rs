@@ -12,7 +12,7 @@ use deno_core::{
 };
 use meow_graph::GraphDb;
 use meow_loader::{
-    encode_cache_url, MeowModuleLoader, ModuleKind, ModuleLocator, ResolveError, Resolver,
+    MeowModuleLoader, ModuleKind, ModuleLocator, ResolveError, Resolver,
 };
 use meow_pkg::{Cache, LockEntry, Lockfile, PackageName, RegistryProvenance, Version, VersionReq};
 
@@ -76,6 +76,17 @@ fn archive(files: &[(&str, &[u8])]) -> Vec<u8> {
         .expect("finish tar")
         .finish()
         .expect("finish gzip")
+}
+
+/// Canonical `file://` URL for a cached member after the meow-cache:// scheme
+/// removal: the REAL unpacked-store path `<cache>/unpacked/<algo>-<hex>/<member>`.
+fn cache_url(proj: &std::path::Path, hash: &meow_pkg::ContentHash, member: &str) -> Url {
+    let path = proj
+        .join("cache")
+        .join("unpacked")
+        .join(hash.to_url_host())
+        .join(member);
+    Url::from_file_path(path).expect("cached member file URL")
 }
 
 fn resolver_with(
@@ -149,7 +160,7 @@ fn conditional_exports_choose_import_and_require_only_errors() {
     let referrer = Url::from_file_path(proj.join("main.ts")).expect("referrer URL");
 
     let (url, locator) = resolver.locate("dep", &referrer).expect("dep resolves");
-    assert_eq!(url, encode_cache_url(&dep_hash, "esm/index.js"));
+    assert_eq!(url, cache_url(&proj, &dep_hash, "esm/index.js"));
     assert!(matches!(
         locator,
         ModuleLocator::Cached { package, member } if package == dep_hash && member == "esm/index.js"
@@ -204,14 +215,14 @@ fn subpath_patterns_exact_wins_and_invalid_targets_are_typed() {
     let (exact_url, _) = resolver
         .locate("pattern/feat/special", &referrer)
         .expect("exact subpath resolves");
-    assert_eq!(exact_url, encode_cache_url(&pattern_hash, "src/special.js"));
+    assert_eq!(exact_url, cache_url(&proj, &pattern_hash, "src/special.js"));
 
     let (pattern_url, _) = resolver
         .locate("pattern/feat/a", &referrer)
         .expect("pattern subpath resolves");
     assert_eq!(
         pattern_url,
-        encode_cache_url(&pattern_hash, "src/features/a.js")
+        cache_url(&proj, &pattern_hash, "src/features/a.js")
     );
 
     let err = resolver
@@ -242,17 +253,17 @@ fn self_reference_imports_and_encapsulation_follow_package_maps() {
     let mut lockfile = Lockfile::new();
     lockfile.upsert(lock_entry("selfpkg", "1.0.0", hash.clone(), &[]));
     let resolver = resolver_with(&proj, cache, lockfile, root_deps(&[("selfpkg", "1.0.0")]));
-    let referrer = encode_cache_url(&hash, "index.js");
+    let referrer = cache_url(&proj, &hash, "index.js");
 
     let (self_url, _) = resolver
         .locate("selfpkg/util", &referrer)
         .expect("self-reference resolves");
-    assert_eq!(self_url, encode_cache_url(&hash, "src/util.js"));
+    assert_eq!(self_url, cache_url(&proj, &hash, "src/util.js"));
 
     let (imports_url, _) = resolver
         .locate("#internal", &referrer)
         .expect("imports map resolves");
-    assert_eq!(imports_url, encode_cache_url(&hash, "src/internal.js"));
+    assert_eq!(imports_url, cache_url(&proj, &hash, "src/internal.js"));
 
     let missing_import = resolver
         .locate("#missing", &referrer)
@@ -334,12 +345,12 @@ fn nested_dependencies_and_multi_version_follow_owner_lock_entries() {
         root_deps(&[("a", "1.0.0"), ("c", "1.0.0")]),
     );
 
-    let a_referrer = encode_cache_url(&a_hash, "index.js");
-    let c_referrer = encode_cache_url(&c_hash, "index.js");
+    let a_referrer = cache_url(&proj, &a_hash, "index.js");
+    let c_referrer = cache_url(&proj, &c_hash, "index.js");
     let (from_a, _) = resolver.locate("b", &a_referrer).expect("a resolves b@1");
     let (from_c, _) = resolver.locate("b", &c_referrer).expect("c resolves b@2");
-    assert_eq!(from_a, encode_cache_url(&b1_hash, "index.js"));
-    assert_eq!(from_c, encode_cache_url(&b2_hash, "index.js"));
+    assert_eq!(from_a, cache_url(&proj, &b1_hash, "index.js"));
+    assert_eq!(from_c, cache_url(&proj, &b2_hash, "index.js"));
 
     std::fs::remove_dir_all(&proj).ok();
 }
@@ -404,17 +415,17 @@ fn legacy_main_extensionless_json_and_cjs_boundary_work_end_to_end() {
     let (legacy_url, _) = resolver
         .locate("legacy", &referrer)
         .expect("legacy main resolves");
-    assert_eq!(legacy_url, encode_cache_url(&legacy_hash, "lib/index.js"));
+    assert_eq!(legacy_url, cache_url(&proj, &legacy_hash, "lib/index.js"));
 
     let (ext_sub_url, _) = resolver
         .locate("ext/sub", &referrer)
         .expect("ext sub resolves");
-    assert_eq!(ext_sub_url, encode_cache_url(&ext_hash, "sub.js"));
+    assert_eq!(ext_sub_url, cache_url(&proj, &ext_hash, "sub.js"));
 
     let (ext_dir_url, _) = resolver
         .locate("ext/dir", &referrer)
         .expect("ext dir resolves");
-    assert_eq!(ext_dir_url, encode_cache_url(&ext_hash, "dir/index.js"));
+    assert_eq!(ext_dir_url, cache_url(&proj, &ext_hash, "dir/index.js"));
 
     let json_spec = resolver
         .locate("jsonpkg", &referrer)

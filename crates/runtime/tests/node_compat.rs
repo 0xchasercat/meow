@@ -91,26 +91,9 @@ impl RuntimeNodeBridge {
         &self,
         referrer: &node::UrlOrPathRef,
     ) -> Result<node::Url, node::PackageFolderResolveError> {
-        if let Ok(path) = referrer.path() {
-            if let Some(url) = self.unpacked_path_to_cache_url(path) {
-                return Ok(url);
-            }
-        }
         referrer.url().cloned().map_err(|err| {
             Self::package_folder_error(PackageFolderResolveErrorKind::PathToUrl(err))
         })
-    }
-
-    fn unpacked_path_to_cache_url(&self, path: &Path) -> Option<node::Url> {
-        let rel = path.strip_prefix(self.store.root()).ok()?;
-        let mut components = rel.components();
-        let package_host = components.next()?.as_os_str().to_str()?;
-        let package = meow_pkg::ContentHash::from_url_host(package_host).ok()?;
-        let member = components.as_path().to_string_lossy().replace('\\', "/");
-        if member.is_empty() {
-            return None;
-        }
-        Some(meow_loader::encode_cache_url(&package, &member))
     }
 
     fn module_kind(&self, specifier: &node::Url) -> Option<meow_loader::ModuleKind> {
@@ -174,9 +157,6 @@ impl node::NpmPackageFolderResolver for RuntimeNodeBridge {
 
 impl node::InNpmPackageChecker for RuntimeNodeBridge {
     fn in_npm_package(&self, specifier: &node::Url) -> bool {
-        if specifier.scheme() == meow_loader::CACHE_SCHEME {
-            return true;
-        }
         let Ok(path) = specifier.to_file_path() else {
             return false;
         };
@@ -204,9 +184,9 @@ impl node::NodeRequireLoader for RuntimeNodeBridge {
 
     fn is_maybe_cjs(&self, specifier: &node::Url) -> Result<bool, node::PackageJsonLoadError> {
         if let Ok(path) = specifier.to_file_path() {
-            if let Some(cache_url) = self.unpacked_path_to_cache_url(&path) {
+            if path.starts_with(self.store.root()) {
                 return Ok(matches!(
-                    self.module_kind(&cache_url),
+                    self.module_kind(specifier),
                     Some(meow_loader::ModuleKind::Cjs)
                 ));
             }

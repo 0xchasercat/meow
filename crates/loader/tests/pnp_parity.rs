@@ -11,7 +11,7 @@ use deno_core::{
     RequestedModuleType,
 };
 use meow_graph::GraphDb;
-use meow_loader::{encode_cache_url, MeowModuleLoader, ModuleLocator, Resolver};
+use meow_loader::{MeowModuleLoader, ModuleLocator, Resolver};
 use meow_pkg::{
     Cache, ContentHash, LockEntry, Lockfile, PackageName, RegistryProvenance, ResolutionGraph,
     Version, VersionReq,
@@ -112,6 +112,15 @@ fn capture() -> (Rc<RefCell<String>>, deno_core::Extension) {
     (out, print_sink_extension(sink))
 }
 
+fn cache_url(project: &Path, hash: &ContentHash, member: &str) -> Url {
+    let path = project
+        .join("cache")
+        .join("unpacked")
+        .join(hash.to_url_host())
+        .join(member);
+    Url::from_file_path(path).expect("cached member file URL")
+}
+
 fn locator_key(locator: &ModuleLocator) -> String {
     match locator {
         ModuleLocator::LocalFile(path) => format!("file:{}", path.display()),
@@ -193,14 +202,14 @@ async fn resolution_graph_runs_without_node_modules_and_preserves_multi_version_
         dir_url(&project),
         meow_runtime::native::native_module_registry(),
     );
-    let a_referrer = encode_cache_url(&a_hash, "index.js");
-    let c_referrer = encode_cache_url(&c_hash, "index.js");
+    let a_referrer = cache_url(&project, &a_hash, "index.js");
+    let c_referrer = cache_url(&project, &c_hash, "index.js");
     let (from_a, _) = resolver.locate("b", &a_referrer).expect("a resolves b@1");
     let (from_c, _) = resolver.locate("b", &c_referrer).expect("c resolves b@2");
-    assert_eq!(from_a, encode_cache_url(&b1_hash, "index.js"));
-    assert_eq!(from_c, encode_cache_url(&b2_hash, "index.js"));
-    assert_eq!(from_a.scheme(), "meow-cache");
-    assert_eq!(from_c.scheme(), "meow-cache");
+    assert_eq!(from_a, cache_url(&project, &b1_hash, "index.js"));
+    assert_eq!(from_c, cache_url(&project, &b2_hash, "index.js"));
+    assert_eq!(from_a.scheme(), "file");
+    assert_eq!(from_c.scheme(), "file");
     assert!(!from_a.as_str().contains("node_modules"));
     assert!(!from_c.as_str().contains("node_modules"));
 
@@ -340,28 +349,28 @@ fn from_resolution_matches_locator_results_for_runtime_and_lsp_corpus() {
             "bare root dep",
             "a",
             project_referrer.clone(),
-            encode_cache_url(&a_hash, "index.js"),
+            cache_url(&project, &a_hash, "index.js"),
             format!("cache:{}:index.js", a_hash.to_sri()),
         ),
         (
             "subpath export",
             "tool/feature",
             project_referrer,
-            encode_cache_url(&tool_hash, "src/feature.js"),
+            cache_url(&project, &tool_hash, "src/feature.js"),
             format!("cache:{}:src/feature.js", tool_hash.to_sri()),
         ),
         (
             "nested b from a",
             "b",
-            encode_cache_url(&a_hash, "index.js"),
-            encode_cache_url(&b1_hash, "index.js"),
+            cache_url(&project, &a_hash, "index.js"),
+            cache_url(&project, &b1_hash, "index.js"),
             format!("cache:{}:index.js", b1_hash.to_sri()),
         ),
         (
             "nested b from c",
             "b",
-            encode_cache_url(&c_hash, "index.js"),
-            encode_cache_url(&b2_hash, "index.js"),
+            cache_url(&project, &c_hash, "index.js"),
+            cache_url(&project, &b2_hash, "index.js"),
             format!("cache:{}:index.js", b2_hash.to_sri()),
         ),
     ];

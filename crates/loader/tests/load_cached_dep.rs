@@ -16,7 +16,7 @@ use deno_core::{
 };
 use meow_graph::GraphDb;
 use meow_loader::{
-    encode_cache_url, MeowModuleLoader, ModuleKind, ModuleLocator, ResolveError, Resolver,
+    MeowModuleLoader, ModuleKind, ModuleLocator, ResolveError, Resolver,
 };
 use meow_pkg::{
     Cache, CacheError, LockEntry, Lockfile, PackageName, RegistryProvenance, Version, VersionReq,
@@ -96,6 +96,16 @@ fn archive(files: &[(&str, &[u8])]) -> Vec<u8> {
         .expect("finish gzip")
 }
 
+/// Canonical `file://` URL for a cached member: the REAL unpacked-store path
+/// `<cache>/unpacked/<algo>-<hex>/<member>` (the meow-cache:// scheme is gone).
+fn cache_url(cache_root: &Path, hash: &meow_pkg::ContentHash, member: &str) -> Url {
+    let path = cache_root
+        .join("unpacked")
+        .join(hash.to_url_host())
+        .join(member);
+    Url::from_file_path(path).expect("cached member file URL")
+}
+
 fn resolver_with(
     cache_root: &Path,
     lockfile: Lockfile,
@@ -136,24 +146,7 @@ impl TestDenoNodeBridge {
     }
 
     fn referrer_url(&self, referrer: &node::UrlOrPathRef) -> Url {
-        if let Ok(path) = referrer.path() {
-            if let Some(url) = self.unpacked_path_to_cache_url(path) {
-                return url;
-            }
-        }
         referrer.url().expect("test bridge referrer URL").clone()
-    }
-
-    fn unpacked_path_to_cache_url(&self, path: &Path) -> Option<Url> {
-        let rel = path.strip_prefix(self.store.root()).ok()?;
-        let mut components = rel.components();
-        let package_host = components.next()?.as_os_str().to_str()?;
-        let package = meow_pkg::ContentHash::from_url_host(package_host).ok()?;
-        let member = components.as_path().to_string_lossy().replace('\\', "/");
-        if member.is_empty() {
-            return None;
-        }
-        Some(encode_cache_url(&package, &member))
     }
 
     fn module_kind(&self, specifier: &Url) -> Option<ModuleKind> {
@@ -223,9 +216,6 @@ impl node::NpmPackageFolderResolver for TestDenoNodeBridge {
 
 impl node::InNpmPackageChecker for TestDenoNodeBridge {
     fn in_npm_package(&self, specifier: &Url) -> bool {
-        if specifier.scheme() == meow_loader::CACHE_SCHEME {
-            return true;
-        }
         let Ok(path) = specifier.to_file_path() else {
             return false;
         };
@@ -251,11 +241,8 @@ impl node::NodeRequireLoader for TestDenoNodeBridge {
 
     fn is_maybe_cjs(&self, specifier: &Url) -> Result<bool, node::PackageJsonLoadError> {
         if let Ok(path) = specifier.to_file_path() {
-            if let Some(cache_url) = self.unpacked_path_to_cache_url(&path) {
-                return Ok(matches!(
-                    self.module_kind(&cache_url),
-                    Some(ModuleKind::Cjs)
-                ));
+            if path.starts_with(self.store.root()) {
+                return Ok(matches!(self.module_kind(specifier), Some(ModuleKind::Cjs)));
             }
             match path.extension().and_then(|ext| ext.to_str()) {
                 None | Some("cjs") | Some("cts") => return Ok(true),
@@ -460,7 +447,7 @@ fn one_resolver_handles_relative_and_bare() {
     let (bare_url, bare_loc) = resolver.locate("dep", &referrer).expect("bare resolves");
     assert_eq!(
         bare_url,
-        meow_loader::encode_cache_url(&dep_hash, "index.js")
+        cache_url(&cache_root, &dep_hash, "index.js")
     );
     match bare_loc {
         ModuleLocator::Cached { package, member } => {
@@ -652,7 +639,7 @@ fn cached_package_dependency_dns_entry_prefers_builtin() {
         root_deps(&[("next", "1.0.0")]),
         &proj,
     );
-    let referrer = encode_cache_url(&next_hash, "dist/bin/next");
+    let referrer = cache_url(&cache_root, &next_hash, "dist/bin/next");
 
     let (url, locator) = resolver
         .locate("dns", &referrer)
@@ -691,7 +678,7 @@ fn cached_package_missing_lockfile_entry_falls_back_to_node_builtin() {
         root_deps(&[("next", "1.0.0")]),
         &proj,
     );
-    let referrer = encode_cache_url(&next_hash, "dist/bin/next");
+    let referrer = cache_url(&cache_root, &next_hash, "dist/bin/next");
 
     let (url, locator) = resolver
         .locate("dns", &referrer)
@@ -967,7 +954,7 @@ max_heap_size: None,
         residual_lazy_esm_sources: &[],
     })
     .expect("runtime initializes");
-    let spec = encode_cache_url(&dep_hash, "dist/bin/next");
+    let spec = cache_url(&cache_root, &dep_hash, "dist/bin/next");
     let ext_resolved = resolver
         .resolve(spec.as_str(), &spec)
         .expect("extensionless cache member resolves");

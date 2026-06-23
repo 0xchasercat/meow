@@ -82,7 +82,6 @@ fn should_inject_run(arg: &str) -> bool {
         return false;
     }
     arg.starts_with("file://")
-        || arg.starts_with("meow-cache://")
         || arg.starts_with("./")
         || arg.starts_with("../")
         || arg.starts_with('/')
@@ -1697,27 +1696,11 @@ impl RuntimeNodeBridge {
     }
 
     fn referrer_url(&self, referrer: &UrlOrPathRef) -> Result<Url, PackageFolderResolveError> {
-        if let Ok(path) = referrer.path() {
-            if let Some(url) = self.unpacked_path_to_cache_url(path) {
-                return Ok(url);
-            }
-        }
         referrer.url().cloned().map_err(|err| {
             Self::package_folder_error(PackageFolderResolveErrorKind::PathToUrl(err))
         })
     }
 
-    fn unpacked_path_to_cache_url(&self, path: &Path) -> Option<Url> {
-        let rel = path.strip_prefix(self.store.root()).ok()?;
-        let mut components = rel.components();
-        let package_host = components.next()?.as_os_str().to_str()?;
-        let package = meow_pkg::ContentHash::from_url_host(package_host).ok()?;
-        let member = components.as_path().to_string_lossy().replace('\\', "/");
-        if member.is_empty() {
-            return None;
-        }
-        Some(meow_loader::encode_cache_url(&package, &member))
-    }
     fn module_kind(&self, specifier: &Url) -> Option<meow_loader::ModuleKind> {
         let resolved = self
             .resolver
@@ -1779,9 +1762,6 @@ impl NpmPackageFolderResolver for RuntimeNodeBridge {
 
 impl InNpmPackageChecker for RuntimeNodeBridge {
     fn in_npm_package(&self, specifier: &Url) -> bool {
-        if specifier.scheme() == meow_loader::CACHE_SCHEME {
-            return true;
-        }
         let Ok(path) = specifier.to_file_path() else {
             return false;
         };
@@ -1809,9 +1789,9 @@ impl NodeRequireLoader for RuntimeNodeBridge {
 
     fn is_maybe_cjs(&self, specifier: &Url) -> Result<bool, PackageJsonLoadError> {
         if let Ok(path) = specifier.to_file_path() {
-            if let Some(cache_url) = self.unpacked_path_to_cache_url(&path) {
+            if path.starts_with(self.store.root()) {
                 return Ok(matches!(
-                    self.module_kind(&cache_url),
+                    self.module_kind(specifier),
                     Some(meow_loader::ModuleKind::Cjs)
                 ));
             }
@@ -1981,41 +1961,9 @@ fn prepare_direct_file_run(
     target: &str,
     argv: &[String],
 ) -> Result<NativeRunRequest, RunCommandError> {
-    if let Some(spec) = cache_spec_for_target(target)? {
-        return Ok(NativeRunRequest {
-            project_dir: find_project_root(cwd),
-            process_cwd: cwd.to_path_buf(),
-            spec,
-            argv1: target.to_owned(),
-            argv: argv.to_vec(),
-        });
-    }
     let abs = resolve_local_entry(cwd, target, true)?
         .ok_or_else(|| RunCommandError::Message(format!("cannot find {target}")))?;
     native_file_request(find_project_root(cwd), cwd.to_path_buf(), abs, argv)
-}
-
-fn cache_spec_for_target(
-    raw: &str,
-) -> Result<Option<meow_runtime::ModuleSpecifier>, RunCommandError> {
-    if raw.starts_with("meow-cache://") {
-        return meow_runtime::ModuleSpecifier::parse(raw)
-            .map(Some)
-            .map_err(|_| RunCommandError::InvalidEntryPath(raw.to_owned()));
-    }
-    let normalized = raw.replace('\\', "/");
-    let trimmed = normalized
-        .strip_prefix("/meow-cache/")
-        .or_else(|| normalized.strip_prefix("meow-cache/"));
-    let Some(tail) = trimmed else {
-        return Ok(None);
-    };
-    let Some((host, member)) = tail.split_once('/') else {
-        return Err(RunCommandError::InvalidEntryPath(raw.to_owned()));
-    };
-    meow_runtime::ModuleSpecifier::parse(&format!("meow-cache://{host}/{member}"))
-        .map(Some)
-        .map_err(|_| RunCommandError::InvalidEntryPath(raw.to_owned()))
 }
 
 fn native_file_request(
@@ -2170,11 +2118,10 @@ fn resolve_package_bin(
                 target: member,
             });
         }
-        matches.push((
-            name.to_string(),
-            meow_loader::encode_cache_url(&entry.integrity, &member),
-            bin_path,
-        ));
+        let spec = Url::from_file_path(&bin_path).map_err(|()| {
+            RunCommandError::InvalidEntryPath(bin_path.display().to_string())
+        })?;
+        matches.push((name.to_string(), spec, bin_path));
     }
 
     match matches.len() {
@@ -2600,7 +2547,7 @@ mod tests {
     fn normalize_argv_injects_run_for_entry_path() {
         let argv = normalize_argv(vec![
             OsString::from("meow"),
-            OsString::from("/meow-cache/pkg/dist/server/start-server.js"),
+            OsString::from("/Users/me/.meow/cache/unpacked/sha512-abc/dist/server/start-server.js"),
             OsString::from("--flag"),
         ]);
         assert_eq!(
@@ -2608,7 +2555,7 @@ mod tests {
             vec![
                 OsString::from("meow"),
                 OsString::from("run"),
-                OsString::from("/meow-cache/pkg/dist/server/start-server.js"),
+                OsString::from("/Users/me/.meow/cache/unpacked/sha512-abc/dist/server/start-server.js"),
                 OsString::from("--flag"),
             ]
         );
@@ -2621,14 +2568,14 @@ mod tests {
             OsString::from("run"),
             OsString::from("-A"),
             OsString::from("--unstable-bare-node-builtins"),
-            OsString::from("/meow-cache/pkg/dist/server/start-server.js"),
+            OsString::from("/Users/me/.meow/cache/unpacked/sha512-abc/dist/server/start-server.js"),
         ]);
         assert_eq!(
             argv,
             vec![
                 OsString::from("meow"),
                 OsString::from("run"),
-                OsString::from("/meow-cache/pkg/dist/server/start-server.js"),
+                OsString::from("/Users/me/.meow/cache/unpacked/sha512-abc/dist/server/start-server.js"),
             ]
         );
     }
