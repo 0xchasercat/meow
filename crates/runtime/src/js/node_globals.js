@@ -6,7 +6,6 @@ import * as nodeTimers from "node:timers";
 import * as nodeStreamWeb from "node:stream/web";
 import * as nodeFsModule from "node:fs";
 import * as nodeNet from "node:net";
-import * as nodeHttp from "node:http";
 import * as nodeHttpIncoming from "node:_http_incoming";
 import * as nodeOs from "node:os";
 import * as nodeConstantsModule from "node:constants";
