@@ -15,6 +15,10 @@ use std::io::{self, Write};
 use std::rc::Rc;
 
 use deno_core::{op2, OpState};
+
+use crate::fs_events::{
+    op_meow_fs_events_close, op_meow_fs_events_open, op_meow_fs_events_poll,
+};
 pub mod http;
 pub mod ui;
 
@@ -125,7 +129,10 @@ deno_core::extension!(
         op_meow_host_platform,
         op_meow_host_arch,
         op_meow_record_process_exit,
-        op_http_serve_address_override
+        op_http_serve_address_override,
+        op_meow_fs_events_open,
+        op_meow_fs_events_poll,
+        op_meow_fs_events_close
     ],
     esm_entry_point = "ext:meow_runtime/bootstrap.js",
     esm = [dir "src/js", "bootstrap.js"],

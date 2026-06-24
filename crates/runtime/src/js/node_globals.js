@@ -448,96 +448,47 @@ if (globalThis.Deno) {
     });
   }
   if (typeof denoNs.watchFs !== "function") {
-    denoNs.watchFs = (paths, _options = {}) => {
+    // Real OS file watching via the host notify-backed ops. Push-based: returns
+    // immediately and change events arrive on a channel. Replaces the old
+    // synchronous recursive-snapshot poller that blocked wp.watch() on large
+    // trees (e.g. Next.js watching the project root incl. node_modules).
+    denoNs.watchFs = (paths, options = {}) => {
       const roots = (Array.isArray(paths) ? paths : [paths]).map(String);
-      const queue = [];
-      const waiters = [];
+      const recursive = options.recursive !== false;
+      const rid = core.ops.op_meow_fs_events_open(recursive, roots);
       let closed = false;
-
-      const wake = (item) => {
-        const waiter = waiters.shift();
-        if (waiter) {
-          waiter({ done: false, value: item });
-        } else {
-          queue.push(item);
-        }
-      };
-      const finish = () => {
-        closed = true;
-        while (waiters.length) {
-          waiters.shift()({ done: true, value: undefined });
-        }
-      };
-      const snapshotOne = (path, out) => {
-        let stat;
-        try {
-          stat = denoNs.statSync(path);
-        } catch {
-          return;
-        }
-        const key = String(path);
-        out.set(key, `${Number(stat.mtime?.getTime?.() ?? 0)}:${Number(stat.size ?? 0)}:${stat.isDirectory ? "d" : "f"}`);
-        if (stat.isDirectory !== true || typeof denoNs.readDirSync !== "function") {
-          return;
-        }
-        try {
-          for (const entry of denoNs.readDirSync(path)) {
-            snapshotOne(`${key}/${entry.name}`, out);
-          }
-        } catch {
-          // Directory disappeared or cannot be read; the parent change is enough.
-        }
-      };
-      const takeSnapshot = () => {
-        const out = new Map();
-        for (const root of roots) {
-          snapshotOne(root, out);
-        }
-        return out;
-      };
-
-      let previous = takeSnapshot();
-      const timer = (nodeTimers.setInterval ?? setInterval)(() => {
-        if (closed) {
-          return;
-        }
-        const next = takeSnapshot();
-        for (const [path, sig] of next) {
-          const old = previous.get(path);
-          if (old === undefined) {
-            wake({ kind: "create", paths: [path] });
-          } else if (old !== sig) {
-            wake({ kind: "modify", paths: [path] });
+      const close = () => {
+        if (!closed) {
+          closed = true;
+          try {
+            core.ops.op_meow_fs_events_close(rid);
+          } catch {
+            // Resource already gone.
           }
         }
-        for (const path of previous.keys()) {
-          if (!next.has(path)) {
-            wake({ kind: "remove", paths: [path] });
-          }
-        }
-        previous = next;
-      }, 500);
-
+      };
       return {
-        close() {
-          if (!closed) {
-            (nodeTimers.clearInterval ?? clearInterval)(timer);
-            finish();
-          }
-        },
+        rid,
+        close,
         ref() {},
         unref() {},
         [Symbol.asyncIterator]() {
           return this;
         },
-        next() {
-          if (queue.length) {
-            return Promise.resolve({ done: false, value: queue.shift() });
-          }
+        async next() {
           if (closed) {
-            return Promise.resolve({ done: true, value: undefined });
+            return { done: true, value: undefined };
           }
-          return new Promise((resolve) => waiters.push(resolve));
+          const value = await core.ops.op_meow_fs_events_poll(rid);
+          if (value == null) {
+            closed = true;
+            return { done: true, value: undefined };
+          }
+          return { done: false, value };
+        },
+        async return(value) {
+          close();
+          return { done: true, value };
         },
       };
     };
@@ -744,44 +695,7 @@ for (const target of [nodeFsModule.default]) {
 }
 
 
-for (const target of [nodeFsModule.default]) {
-  if (
-    !target ||
-    typeof target.watch !== "function" ||
-    target.watch.__meowWatchKickPatch === true
-  ) continue;
-  const originalWatch = target.watch.bind(target);
-  target.watch = (path, options, listener) => {
-    let callback = listener;
-    if (typeof options === "function") {
-      callback = options;
-      options = undefined;
-    }
-    const watcher = originalWatch(path, options ?? {}, callback);
-    const name = String(path).split(/[\\/]/).pop() || "";
-    const timer = (nodeTimers.setTimeout ?? setTimeout)(() => {
-      try {
-        if (typeof callback === "function") {
-          callback("change", name);
-        }
-        if (typeof watcher?.emit === "function") {
-          watcher.emit("change", "change", name);
-        }
-      } catch {
-        // Watch priming is best-effort; real watcher errors still surface normally.
-      }
-    }, 0);
-    if (watcher && typeof watcher.close === "function") {
-      const originalClose = watcher.close.bind(watcher);
-      watcher.close = () => {
-        (nodeTimers.clearTimeout ?? clearTimeout)(timer);
-        return originalClose();
-      };
-    }
-    return watcher;
-  };
-  target.watch.__meowWatchKickPatch = true;
-}
+// __meowWatchKickPatch removed: real fs events now flow via Deno.watchFs (op_meow_fs_events_*).
 
 if (
   processValue?.env?.NODE_CHANNEL_FD !== undefined &&

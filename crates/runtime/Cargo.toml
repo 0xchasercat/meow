@@ -18,6 +18,10 @@ meow-ui = { path = "../ui" }
 # Async host I/O (ADR-9): tokio/mio is the committed portable layer. Consumed by
 # the `io` ops (tokio::fs / tokio::net) + driven on the current-thread runtime.
 tokio = { workspace = true }
+# Real OS file watching backing Deno.watchFs / node fs.watch: the event-driven
+# notify crate replaces the recursive-snapshot polling shim that blocked
+# watchpack (next dev) on large trees.
+notify = "6"
 # Typed op errors that surface as JS exceptions (not panics): deno_core's op2
 # requires the error type to impl `deno_error::JsErrorClass`; deno_core does not
 # re-export it, so it is a direct dep pinned to the exact version deno_core uses.

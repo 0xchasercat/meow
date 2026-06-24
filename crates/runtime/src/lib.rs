@@ -20,6 +20,7 @@
 
 mod error;
 mod ext;
+mod fs_events;
 mod loader;
 pub mod native;
 pub mod typegen;
