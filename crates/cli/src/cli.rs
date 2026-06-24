@@ -1917,18 +1917,28 @@ async fn run_native_request(
     // === /RT-007 ===
     // === /RT-006 ===
     let max_heap_size = flags.max_old_space_size.map(|mib| mib * 1024 * 1024);
-    let startup_snapshot = if flags.no_snapshot || crate::SNAPSHOT_BLOB.is_empty() {
+    let startup_snapshot = if flags.no_snapshot {
         None
     } else {
         Some(crate::SNAPSHOT_BLOB)
     };
+    // Residual lazy sources re-feed deno_core the lazy_loaded_esm/js modules a
+    // snapshot does not bake into the V8 heap. They apply ONLY when loading from
+    // the snapshot; in eager mode the extensions register their own lazy sources,
+    // so feeding residuals too would double-insert.
+    let (residual_lazy_js, residual_lazy_esm): (&[(&str, &str)], &[(&str, &str)]) =
+        if startup_snapshot.is_some() {
+            (crate::RESIDUAL_LAZY_JS, crate::RESIDUAL_LAZY_ESM)
+        } else {
+            (&[], &[])
+        };
     let mut runtime = meow_runtime::Runtime::new(meow_runtime::RuntimeOptions {
         module_loader: loader,
         extensions,
         max_heap_size,
         startup_snapshot,
-        residual_lazy_js_sources: &[],
-        residual_lazy_esm_sources: &[],
+        residual_lazy_js_sources: residual_lazy_js,
+        residual_lazy_esm_sources: residual_lazy_esm,
     })
     .map_err(|err| RunCommandError::Message(err.to_string()))?;
     // Refresh Node bootstrap state if we loaded from a snapshot.

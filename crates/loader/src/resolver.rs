@@ -464,41 +464,15 @@ impl Resolver {
                 std::fs::read(&path).map_err(|source| ResolveError::Io { path, source })?
             }
             // === RT-005 ===
-            ModuleLocator::Native { name } => {
-                if name.starts_with("node:") {
-                    match self.native.source(name) {
-                        Some(src) => src.as_bytes().to_vec(),
-                        None => {
-                            let module_name = name.strip_prefix("node:").unwrap_or(name);
-                            let script = format!(
-                                r#"const handler = {{
-  get(target, prop) {{
-    if (prop === "then") return undefined;
-    if (prop === "code") return "ERR_STRICT_WEB_WITHDRAWN";
-    const error = new Error("strict-web mode withdraws node:{} access");
-    error.code = "ERR_STRICT_WEB_WITHDRAWN";
-    throw error;
-  }}
-}};
-const proxy = new Proxy({{}}, handler);
-export default proxy;
-"#,
-                                module_name
-                            );
-                            script.into_bytes()
-                        }
-                    }
-                } else {
-                    self.native
-                        .source(name)
-                        .ok_or_else(|| ResolveError::UnknownNativeModule {
-                            name: name.clone(),
-                            available: self.native_available_list(name.starts_with("node:")),
-                        })?
-                        .as_bytes()
-                        .to_vec()
-                }
-            } // === /RT-005 ===
+            ModuleLocator::Native { name } => self
+                .native
+                .source(name)
+                .ok_or_else(|| ResolveError::UnknownNativeModule {
+                    name: name.clone(),
+                    available: self.native_available_list(name.starts_with("node:")),
+                })?
+                .as_bytes()
+                .to_vec(), // === /RT-005 ===
         };
         let is_napi = match &locator {
             ModuleLocator::LocalFile(path) => {
