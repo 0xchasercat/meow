@@ -283,21 +283,28 @@ pub fn refresh_bootstrap_state(
     argv: Vec<String>,
     cwd: PathBuf,
     env: BTreeMap<String, String>,
-) {
-    // Update the OpState so ops like op_meow_node_bootstrap_info return fresh values.
+) -> Result<(), crate::RuntimeError> {
+    // Seed the real per-invocation bootstrap state so op_meow_node_bootstrap_info
+    // returns fresh values, then run the genuine Node process bootstrap against it.
     {
         let op_state = js_runtime.op_state();
         let mut state = op_state.borrow_mut();
-        state.put(NodeBootstrapState {
-            argv: argv.clone(),
-            cwd: cwd.clone(),
-            env: env.clone(),
-        });
+        state.put(NodeBootstrapState { argv, cwd, env });
     }
-    // Note: we do NOT patch process.argv or process.cwd here.
-    // The snapshot captures these at snapshot-creation time (argv=["meow", "snapshot-placeholder"], cwd="/").
-    // Patching via execute_script doesn't reliably reach the ESM module scope.
-    // The argv limitation is acceptable; cwd returns "/" which is a valid fallback.
+    // The snapshot's module bodies ran at snapshot-build time with placeholder
+    // argv/cwd/env and only WARMED the Node bootstrap (warmup:true), leaving
+    // __bootstrapNodeProcess installed. Re-run it now with the real state: this sets
+    // process.argv/execPath/cwd, wires child IPC (process.send), and registers
+    // streamBaseState.
+    js_runtime
+        .execute_script(
+            "ext:meow_runtime/runtime_bootstrap.js",
+            "globalThis.__meowRuntimeBootstrap && globalThis.__meowRuntimeBootstrap();",
+        )
+        .map_err(|err| {
+            crate::RuntimeError::Init(format!("runtime node bootstrap failed: {err}"))
+        })?;
+    Ok(())
 }
 deno_core::extension!(
     runtime,

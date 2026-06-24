@@ -185,7 +185,7 @@ impl Runtime {
         let heap_limit = options
             .max_heap_size
             .unwrap_or_else(default_heap_size);
-        let mut js_runtime = JsRuntime::try_new(DenoRuntimeOptions {
+        let js_runtime = JsRuntime::try_new(DenoRuntimeOptions {
             module_loader: Some(options.module_loader),
             extensions,
             extension_transpiler: Some(std::rc::Rc::new(|specifier, source| {
@@ -201,37 +201,6 @@ impl Runtime {
         })
         .map_err(|err| RuntimeError::Init(err.to_string()))?;
 
-        // Snapshot hydration: the V8 heap is restored from the snapshot, but the
-        // runtime's `OpState` is fresh. State that deno_node seeds by calling an op
-        // from JS during the snapshot build (e.g. `StreamBaseState` via
-        // `op_stream_base_register_state`) is therefore missing at runtime, and the
-        // first stream op aborts ("StreamBaseState not present in GothamState"). Re-run
-        // those registrations against the (baked) module exports. Lazy IIFE polyfills
-        // reach ops through `__bootstrap.core`, which survives `removeImportedOps`.
-        if options.startup_snapshot.is_some() {
-            js_runtime
-                .execute_script(
-                    "ext:meow_runtime/snapshot_hydrate.js",
-                    r#"(function () {
-  const bs = globalThis.__bootstrap;
-  const core = (bs && bs.core) || (globalThis.Deno && globalThis.Deno.core);
-  if (!core || typeof core.loadExtScript !== "function") {
-    throw new Error("core.loadExtScript unavailable");
-  }
-  const reg = core.ops && core.ops.op_stream_base_register_state;
-  if (typeof reg !== "function") {
-    throw new Error("op_stream_base_register_state missing from core.ops");
-  }
-  const sw = core.loadExtScript("ext:deno_node/internal_binding/stream_wrap.ts");
-  if (!sw || !sw.streamBaseState) {
-    throw new Error("stream_wrap streamBaseState export missing");
-  }
-  reg(sw.streamBaseState);
-})();
-"#,
-                )
-                .map_err(|err| RuntimeError::Init(format!("snapshot hydration failed: {err}")))?;
-        }
         Ok(Runtime { js_runtime })
     }
     /// Non-module script eval; returns the completion value. For bootstrap
@@ -302,8 +271,8 @@ impl Runtime {
         argv: Vec<String>,
         cwd: std::path::PathBuf,
         env: std::collections::BTreeMap<String, String>,
-    ) {
-        crate::node::refresh_bootstrap_state(&mut self.js_runtime, argv, cwd, env);
+    ) -> Result<(), RuntimeError> {
+        crate::node::refresh_bootstrap_state(&mut self.js_runtime, argv, cwd, env)
     }
 
     /// The canonical deno_core dance: kick off evaluation, pump the event

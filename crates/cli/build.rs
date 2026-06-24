@@ -106,7 +106,10 @@ fn build_full_extension_set() -> Vec<deno_core::Extension> {
         mode: meow_runtime::node::NodeMode::Enabled,
         argv: vec!["meow".to_string(), "snapshot-placeholder".to_string()],
         cwd: PathBuf::from("/"),
-        env: BTreeMap::new(),
+        env: BTreeMap::from([(
+            "MEOW_SNAPSHOT_BUILD".to_string(),
+            "1".to_string(),
+        )]),
         deno_node_services: None,
         caps: None,
         user_agent: Some("meow/snapshot".to_string()),

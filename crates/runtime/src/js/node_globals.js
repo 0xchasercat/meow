@@ -56,6 +56,7 @@ function def(name, value, enumerable = false) {
 }
 
 const processValue = processModule?.default ?? processModule;
+let meowCwd = "";
 if (bootstrapInfo.env && typeof bootstrapInfo.env === "object") {
   Object.defineProperty(globalThis, "__MEOW_BOOTSTRAP_ENV__", {
     value: { ...bootstrapInfo.env },
@@ -186,10 +187,10 @@ if (globalThis.Deno) {
     }
 
     if (bootstrapInfo.cwd) {
-      let currentCwd = bootstrapInfo.cwd;
-      denoNs.cwd = () => currentCwd;
+      meowCwd = bootstrapInfo.cwd;
+      denoNs.cwd = () => meowCwd;
       denoNs.chdir = (nextCwd) => {
-        currentCwd = String(nextCwd);
+        meowCwd = String(nextCwd);
       };
     }
 
@@ -323,32 +324,51 @@ if (globalThis.Deno) {
   }
 
   if (denoNs.env === undefined) {
-    const envObject = Object.create(null);
-    const entries = typeof core.ops.op_hermetic_env_entries === "function"
-      ? core.ops.op_hermetic_env_entries()
-      : [];
-    if (Array.isArray(entries)) {
-      for (const entry of entries) {
-        if (Array.isArray(entry) && entry.length === 2) {
-          envObject[String(entry[0])] = String(entry[1]);
+    // Deno.env must reflect the LIVE per-invocation host env, not a value baked
+    // at snapshot-build time. Read the hermetic env ops at access time; keep a
+    // write-overlay so runtime set/delete behave like Node's in-process env
+    // (callers that need children to inherit pass env explicitly to spawn/fork).
+    const overlay = Object.create(null); // key -> value, or null = deleted
+    const liveGet = (key) =>
+      typeof core.ops.op_hermetic_env_get === "function"
+        ? core.ops.op_hermetic_env_get(String(key))
+        : undefined;
+    const liveEntries = () => {
+      const out = Object.create(null);
+      const entries = typeof core.ops.op_hermetic_env_entries === "function"
+        ? core.ops.op_hermetic_env_entries()
+        : [];
+      if (Array.isArray(entries)) {
+        for (const entry of entries) {
+          if (Array.isArray(entry) && entry.length === 2) {
+            out[String(entry[0])] = String(entry[1]);
+          }
         }
       }
-    }
+      return out;
+    };
     denoNs.env = {
       get(key) {
-        return envObject[String(key)];
+        const k = String(key);
+        if (k in overlay) return overlay[k] === null ? undefined : overlay[k];
+        return liveGet(k);
       },
       set(key, value) {
-        envObject[String(key)] = String(value);
+        overlay[String(key)] = String(value);
       },
       has(key) {
-        return Object.prototype.hasOwnProperty.call(envObject, String(key));
+        return this.get(key) !== undefined;
       },
       delete(key) {
-        delete envObject[String(key)];
+        overlay[String(key)] = null;
       },
       toObject() {
-        return { ...envObject };
+        const out = liveEntries();
+        for (const k of Object.keys(overlay)) {
+          if (overlay[k] === null) delete out[k];
+          else out[k] = overlay[k];
+        }
+        return out;
       },
     };
   }
@@ -571,15 +591,62 @@ if (globalThis.Deno) {
   }
 }
 
-if (typeof globalThis.nodeBootstrap === "function") {
+// Node process bootstrap. The genuine deno_node `nodeBootstrap` installs the real
+// process.argv / execPath / cwd, wires child IPC (process.send over NODE_CHANNEL_FD),
+// and registers streamBaseState. It must run with the REAL per-invocation state.
+//
+// Under a V8 snapshot this module body executes at snapshot-BUILD time, where the
+// bootstrap state is a placeholder (argv=["meow","snapshot-placeholder"], cwd="/").
+// There we only WARM the lazy Node module graph (warmup:true), which keeps
+// __bootstrapNodeProcess installed and leaves `initialized` false. The host then runs
+// the real bootstrap at runtime via __meowRuntimeBootstrap(), after seeding the real
+// state. In eager (no-snapshot) mode this body runs at runtime with real values, so we
+// run the real bootstrap directly here.
+function meowApplyDenoNamespace(info) {
+  const denoNs = globalThis.Deno;
+  if (denoNs) {
+    try {
+      denoNs.args = Array.isArray(info.args) ? [...info.args] : [];
+      if (info.mainModule) {
+        denoNs.mainModule = info.mainModule;
+      }
+    } catch {
+      // Frozen Deno namespace; process shims fall back to placeholder args.
+    }
+  }
+  if (info.cwd) {
+    meowCwd = info.cwd;
+    if (processValue && typeof processValue === "object") {
+      try {
+        // process.cwd captured deno_fs.cwd at module-load (baked stale under a
+        // snapshot); route it through Deno.cwd so it tracks meow's controlled cwd.
+        processValue.cwd = () => globalThis.Deno.cwd();
+      } catch {
+        // process.cwd not reassignable
+      }
+    }
+  }
+  if (info.env && typeof info.env === "object" && processValue && processValue.env) {
+    for (const key of Object.keys(info.env)) {
+      try {
+        processValue.env[key] = String(info.env[key]);
+      } catch {
+        // read-only env entry
+      }
+    }
+  }
+}
+
+function meowRunNodeBootstrap(info, warmup) {
+  if (typeof globalThis.nodeBootstrap !== "function") return;
   try {
     globalThis.nodeBootstrap({
       usesLocalNodeModulesDir: true,
-      argv0: bootstrapInfo.argv?.[0] ?? "meow",
+      argv0: info.argv?.[0] ?? "meow",
       runningOnMainThread: true,
       nodeDebug: "",
-      warmup: false,
-      moduleSpecifier: bootstrapInfo.mainModule ?? null,
+      warmup,
+      moduleSpecifier: info.mainModule ?? null,
     });
   } catch (error) {
     if (!String(error?.message ?? "").includes("already initialized")) {
@@ -587,14 +654,19 @@ if (typeof globalThis.nodeBootstrap === "function") {
     }
   }
 }
-if (typeof core.ops.op_stream_base_register_state === "function") {
-  try {
-    const { streamBaseState } = load("ext:deno_node/internal_binding/stream_wrap.ts");
-    core.ops.op_stream_base_register_state(streamBaseState);
-  } catch {
-    // If stream-wrap bootstrap is unavailable, keep the runtime alive; net sockets may still fail.
-  }
-}
+
+// Invoked by the host (meow-runtime refresh_bootstrap_state) at runtime when booting
+// from a snapshot: re-read the real bootstrap state and run the genuine Node bootstrap.
+globalThis.__meowRuntimeBootstrap = function () {
+  const info = typeof core.ops.op_meow_node_bootstrap_info === "function"
+    ? core.ops.op_meow_node_bootstrap_info()
+    : null;
+  if (!info) return;
+  meowApplyDenoNamespace(info);
+  meowRunNodeBootstrap(info, false);
+};
+
+  meowRunNodeBootstrap(bootstrapInfo, bootstrapInfo.env?.MEOW_SNAPSHOT_BUILD === "1");
 
 
 if (

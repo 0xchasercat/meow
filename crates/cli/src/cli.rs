@@ -1948,11 +1948,9 @@ async fn run_native_request(
         node_argv.push("meow".to_string());
         node_argv.push(request.argv1.clone());
         node_argv.extend(request.argv.iter().cloned());
-        runtime.refresh_node_bootstrap(
-            node_argv,
-            request.process_cwd.clone(),
-            env.clone(),
-        );
+        runtime
+            .refresh_node_bootstrap(node_argv, request.process_cwd.clone(), env.clone())
+            .map_err(|err| RunCommandError::Message(err.to_string()))?;
     }
     match runtime.run_main_module(&request.spec).await {
         Ok(()) => Ok(match runtime.take_process_exit_code() {
