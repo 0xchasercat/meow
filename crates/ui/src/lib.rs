@@ -1,20 +1,34 @@
-//! `meow-ui` — the structural-cuteness terminal engine.
+//! `meow-ui` — the capability-aware terminal UX engine for meow.
 //!
-//! The crate keeps vibe and engineering separate:
-//! - envelope headers/icons/colors make the CLI feel like meow;
-//! - bodies, snippets, and boxes remain technically precise;
-//! - every renderer is pure and testable;
-//! - the IO facade disables colors/animations for pipes/CI.
+//! Gorgeous on a modern terminal; clean and greppable in CI, pipes, and
+//! NO_COLOR. Renderers are pure (caps in, string out); the `Ui` facade is the
+//! one place that touches real streams and the animation gate.
 
-pub mod bento;
+pub mod banner;
+pub mod caps;
 pub mod diagnostic;
-pub mod envelope;
 pub mod facade;
+pub mod fmt;
+pub mod glyph;
+pub mod paint;
+pub mod palette;
+pub mod panel;
+pub mod progress;
 pub mod spinner;
-pub mod theme;
+pub mod status;
+pub mod table;
+pub mod waterfall;
+pub mod width;
 
+pub use banner::CommandGroup;
+pub use caps::{Caps, TermEnv};
 pub use diagnostic::SourceDiagnostic;
-pub use envelope::Tone;
 pub use facade::Ui;
-pub use spinner::{Spinner, WALKING_PAW_FRAMES};
-pub use theme::{Rgb, Style};
+pub use glyph::Glyphs;
+pub use paint::{Attr, ColorLevel};
+pub use palette::Rgb;
+pub use progress::ProgressBar;
+pub use spinner::Spinner;
+pub use status::Tone;
+pub use table::Align;
+pub use waterfall::Span;

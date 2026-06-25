@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use meow_ui::Ui;
@@ -30,24 +31,37 @@ use node_resolver::errors::{PackageFolderResolveErrorKind, PackageNotFoundError}
 /// so a harness can tell "not built yet" from "you held it wrong".
 pub const EXIT_UNIMPLEMENTED: u8 = 3;
 
+/// (lazy JS, lazy ESM) residual sources re-fed to deno_core under a snapshot.
+type ResidualLazySources = (
+    &'static [(&'static str, &'static str)],
+    &'static [(&'static str, &'static str)],
+);
+
 fn ui() -> Ui {
-    Ui::auto_with_no_color(crate::host::host_no_color())
+    Ui::from_env(&crate::host::term_env())
 }
 
 fn purr(body: &str) {
-    ui().purr(body);
+    ui().success(body);
 }
 
 fn hiss(body: &str) {
-    ui().hiss(body);
+    ui().error(body);
 }
 
 /// meow — a standards-first JavaScript/TypeScript runtime + unified toolchain.
 #[derive(Debug, Parser)]
-#[command(name = "meow", version, about, long_about = None, propagate_version = true)]
+#[command(
+    name = "meow",
+    version,
+    about = meow_ui::banner::TAGLINE,
+    long_about = None,
+    propagate_version = true,
+    styles = meow_help_styles()
+)]
 pub struct Cli {
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 pub fn normalize_argv(mut argv: Vec<OsString>) -> Vec<OsString> {
@@ -405,7 +419,10 @@ impl Command {
 }
 impl Cli {
     pub fn run(self) -> ExitCode {
-        match self.command {
+        let Some(command) = self.command else {
+            return cmd_landing();
+        };
+        match command {
             // === CFG-001 ===
             Command::Sync => cmd_sync(),
             // === /CFG-001 ===
@@ -431,9 +448,10 @@ impl Cli {
             // === OBS-001 ===
             Command::WhyDep(args) => cmd_why_dep(&args),
             // === /OBS-001 ===
+            Command::Doctor => cmd_doctor(),
             other => {
                 let verb = other.landing();
-                hiss(&format!("meow: `{verb}` is not yet implemented"));
+                ui().warn(&format!("meow: `{verb}` is not yet implemented"));
                 ExitCode::from(EXIT_UNIMPLEMENTED)
             }
         }
@@ -545,16 +563,15 @@ fn cmd_lint(args: &PathArgs) -> ExitCode {
     };
 
     for diag in &report.diagnostics {
-        hiss(&meow_ui::diagnostic::render(
-            ui().stderr_style(),
-            &meow_ui::SourceDiagnostic {
-                path: diag.path.to_str().unwrap_or("<invalid path>"),
-                source: diag.source.as_ref(),
-                span: diag.span,
-                message: diag.message.as_str(),
-                label: diag.label.as_deref(),
-            },
-        ));
+        ui().diagnostic(&meow_ui::SourceDiagnostic {
+            path: diag.path.to_str().unwrap_or("<invalid path>"),
+            source: diag.source.as_ref(),
+            span: diag.span,
+            message: diag.message.as_str(),
+            label: diag.label.as_deref(),
+            help: None,
+            note: None,
+        });
     }
 
     if report.diagnostics.is_empty() {
@@ -589,16 +606,15 @@ fn cmd_fmt(args: &FmtArgs) -> ExitCode {
     };
 
     for diag in &report.diagnostics {
-        hiss(&meow_ui::diagnostic::render(
-            ui().stderr_style(),
-            &meow_ui::SourceDiagnostic {
-                path: diag.path.to_str().unwrap_or("<invalid path>"),
-                source: diag.source.as_ref(),
-                span: diag.span,
-                message: diag.message.as_str(),
-                label: diag.label.as_deref(),
-            },
-        ));
+        ui().diagnostic(&meow_ui::SourceDiagnostic {
+            path: diag.path.to_str().unwrap_or("<invalid path>"),
+            source: diag.source.as_ref(),
+            span: diag.span,
+            message: diag.message.as_str(),
+            label: diag.label.as_deref(),
+            help: None,
+            note: None,
+        });
     }
 
     if !report.diagnostics.is_empty() || (args.check && !report.changed.is_empty()) {
@@ -822,14 +838,7 @@ fn render_why_dep(report: &meow_obs::WhyDep) {
         }
     }
     let title = format!("why-dep {}", report.target);
-    println!(
-        "{}",
-        meow_ui::bento::render(
-            Ui::auto_with_no_color(crate::host::host_no_color()).stdout_style(),
-            &title,
-            &lines
-        )
-    );
+    ui().panel(&title, &lines);
 }
 // === /OBS-001 ===
 
@@ -1179,6 +1188,7 @@ fn cmd_remove(args: &PkgArgs) -> ExitCode {
 
 /// `meow install`: resolve declared deps, populate the cache, and write the lockfile.
 fn cmd_install(args: &InstallArgs) -> ExitCode {
+    let started = std::time::Instant::now();
     let projection = match install_projection(args) {
         Ok(projection) => projection,
         Err(err) => {
@@ -1204,7 +1214,7 @@ fn cmd_install(args: &InstallArgs) -> ExitCode {
     {
         Ok(runtime) => runtime,
         Err(err) => {
-            spinner.stop();
+            spinner.clear();
             hiss(&format!(
                 "meow install: cannot start async installer: {err}"
             ));
@@ -1304,7 +1314,7 @@ fn cmd_install(args: &InstallArgs) -> ExitCode {
         })
         // === /PKG-004 ===
     });
-    spinner.stop();
+    spinner.clear();
 
     match outcome {
         Ok(InstallSuccess::Materialized {
@@ -1312,27 +1322,38 @@ fn cmd_install(args: &InstallArgs) -> ExitCode {
             lock_path,
             report,
         }) => {
-            purr(&format!(
-                "installed {} packages → {}",
-                installed,
-                lock_path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("meow.lock.jsonl")
-            ));
+            let u = ui();
+            let lock_name = lock_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("meow.lock.jsonl");
             let payload = if report.bytes_written == 0 && report.packages > 0 && !report.skipped {
-                "copy-on-write payload".to_owned()
+                "copy-on-write".to_owned()
             } else {
-                format!("{} bytes", report.bytes_written)
+                meow_ui::fmt::bytes(report.bytes_written)
             };
-            purr(&format!(
-                "materialized {} packages / {} edges / {} → {}{}",
-                report.packages,
-                report.edges,
-                payload,
-                report.root.display(),
-                if report.skipped { " (skipped)" } else { "" }
-            ));
+            let headline = format!(
+                "{} {}",
+                u.sigil(
+                    meow_ui::Tone::Purr,
+                    &format!("{} packages ready", meow_ui::fmt::count(installed as u64)),
+                ),
+                u.stdout_caps()
+                    .dim(&format!("· {}", meow_ui::fmt::duration(started.elapsed()))),
+            );
+            let mut lines = vec![headline];
+            lines.extend(u.kv(&[
+                (
+                    "materialized".to_owned(),
+                    format!("{} packages · {} edges", report.packages, report.edges),
+                ),
+                ("disk".to_owned(), payload),
+                ("lockfile".to_owned(), lock_name.to_owned()),
+            ]));
+            if report.skipped {
+                lines.push(u.stdout_caps().muted("projection skipped"));
+            }
+            u.panel("meow install", &lines);
             ExitCode::SUCCESS
         }
         Err(err) => {
@@ -1655,6 +1676,12 @@ fn cmd_run(args: &RunArgs) -> ExitCode {
 
 // === RUN-001 ===
 fn cmd_dev(args: &RunScriptArgs) -> ExitCode {
+    let mode = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| runtime_mode(&cwd).ok())
+        .map(mode_label)
+        .unwrap_or("node-compat");
+    ui().dev_banner(meow_version(), mode, "dev", cold_start());
     cmd_run_inner("dev", "dev", run_script_flags(args))
 }
 
@@ -2058,7 +2085,7 @@ async fn run_native_request(
     // snapshot does not bake into the V8 heap. They apply ONLY when loading from
     // the snapshot; in eager mode the extensions register their own lazy sources,
     // so feeding residuals too would double-insert.
-    let (residual_lazy_js, residual_lazy_esm): (&[(&str, &str)], &[(&str, &str)]) =
+    let (residual_lazy_js, residual_lazy_esm): ResidualLazySources =
         if startup_snapshot.is_some() {
             (crate::RESIDUAL_LAZY_JS, crate::RESIDUAL_LAZY_ESM)
         } else {
@@ -2508,13 +2535,26 @@ fn install_node_shim(exe: &Path, shim_path: &Path) -> Result<(), RunCommandError
             })?;
         }
     }
-    symlink(exe, shim_path).map_err(|source| {
-        RunCommandError::Message(format!(
+    match symlink(exe, shim_path) {
+        Ok(()) => Ok(()),
+        // Lost a race with a concurrent meow; if the shim now points at us, that
+        // is success, not failure (installing the shim is idempotent in intent).
+        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+            match std::fs::read_link(shim_path) {
+                Ok(target) if target == exe => Ok(()),
+                _ => Err(RunCommandError::Message(format!(
+                    "cannot install node shim {} -> {}: {source}",
+                    shim_path.display(),
+                    exe.display()
+                ))),
+            }
+        }
+        Err(source) => Err(RunCommandError::Message(format!(
             "cannot install node shim {} -> {}: {source}",
             shim_path.display(),
             exe.display()
-        ))
-    })
+        ))),
+    }
 }
 
 #[cfg(windows)]
@@ -2738,7 +2778,7 @@ mod tests {
     #[test]
     fn install_materialize_flag_parses_as_default_projection() {
         let cli = Cli::try_parse_from(["meow", "install", "--materialize"]).expect("parse cli");
-        let Command::Install(args) = cli.command else {
+        let Some(Command::Install(args)) = cli.command else {
             panic!("expected install command");
         };
         assert!(args.materialize);
@@ -2749,7 +2789,7 @@ mod tests {
     #[test]
     fn install_default_mode_is_materialize() {
         let cli = Cli::try_parse_from(["meow", "install"]).expect("parse cli");
-        let Command::Install(args) = cli.command else {
+        let Some(Command::Install(args)) = cli.command else {
             panic!("expected install command");
         };
         assert!(!args.materialize);
@@ -2763,7 +2803,7 @@ mod tests {
     #[test]
     fn dev_shorthand_parses_trailing_args() {
         let cli = Cli::try_parse_from(["meow", "dev", "--", "watch"]).expect("parse cli");
-        let Command::Dev(args) = cli.command else {
+        let Some(Command::Dev(args)) = cli.command else {
             panic!("expected dev command");
         };
         assert_eq!(args.argv, vec!["watch".to_string()]);
@@ -2870,3 +2910,152 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+// === UX-002 (terminal UX engine wiring) ===
+/// Wall-clock instant captured at process entry, for the cold-start flex on
+/// `meow dev`. Set once from `main` before clap parsing.
+pub static PROCESS_START: OnceLock<std::time::Instant> = OnceLock::new();
+
+/// Record the process-entry instant. Called first thing in `main`.
+pub fn mark_start() {
+    let _ = PROCESS_START.set(std::time::Instant::now());
+}
+
+fn cold_start() -> std::time::Duration {
+    PROCESS_START.get().map(|t| t.elapsed()).unwrap_or_default()
+}
+
+fn meow_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+fn mode_label(mode: meow_runtime::node::NodeMode) -> &'static str {
+    match mode {
+        meow_runtime::node::NodeMode::StrictWeb => "strict-web",
+        _ => "node-compat",
+    }
+}
+
+/// On-brand clap help styling (magenta headers + literals). clap honors NO_COLOR.
+fn meow_help_styles() -> clap::builder::Styles {
+    use clap::builder::styling::{AnsiColor, Styles};
+    Styles::styled()
+        .header(AnsiColor::Magenta.on_default().bold())
+        .usage(AnsiColor::Magenta.on_default().bold())
+        .literal(AnsiColor::BrightMagenta.on_default())
+        .placeholder(AnsiColor::Cyan.on_default())
+}
+
+/// The no-args landing screen: wordmark, tagline, grouped commands, footer.
+fn cmd_landing() -> ExitCode {
+    ui().landing(meow_version(), &command_catalog());
+    ExitCode::SUCCESS
+}
+
+fn command_catalog() -> Vec<meow_ui::CommandGroup<'static>> {
+    use meow_ui::CommandGroup as Group;
+    vec![
+        Group {
+            title: "RUN",
+            commands: &[
+                ("run", "Execute a file or a package.json script"),
+                ("dev", "Start the dev script (meow run dev)"),
+                ("task", "Run a typed task from meow.tasks.ts"),
+                ("test", "Run the isolate-backed test runner"),
+            ],
+        },
+        Group {
+            title: "PACKAGES",
+            commands: &[
+                ("install", "Resolve and install dependencies"),
+                ("add", "Add a dependency and update the lockfile"),
+                ("remove", "Remove a dependency"),
+                ("why-dep", "Explain why a package is in the tree"),
+            ],
+        },
+        Group {
+            title: "QUALITY",
+            commands: &[
+                ("check", "Typecheck the project"),
+                ("lint", "Lint over the shared pipeline"),
+                ("fmt", "Format the project"),
+                ("bundle", "Bundle the module graph"),
+            ],
+        },
+        Group {
+            title: "INSIGHT",
+            commands: &[
+                ("why-slow", "Module-load timeline (cold-start)"),
+                ("why-large", "Largest modules and duplicates"),
+                ("doctor", "Environment, config and lockfile health"),
+                ("sync", "Regenerate shadow tsconfig and types"),
+            ],
+        },
+    ]
+}
+
+/// `meow doctor` — environment, config, and lockfile health as a panel.
+fn cmd_doctor() -> ExitCode {
+    let u = ui();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let root = find_project_root(&cwd);
+
+    let mut lines = vec![u.sigil(meow_ui::Tone::Info, &format!("meow {}", meow_version()))];
+
+    let has_pkg = root.join("package.json").is_file();
+    lines.push(doctor_row(
+        &u,
+        has_pkg,
+        "package.json",
+        if has_pkg { "found" } else { "missing" },
+    ));
+
+    let lock = root.join("meow.lock.jsonl");
+    let (lock_ok, lock_status) = if lock.is_file() {
+        match load_lockfile(&root) {
+            Ok(lf) => (true, format!("{} packages", lf.len())),
+            Err(err) => (false, format!("unreadable: {err}")),
+        }
+    } else {
+        (false, "none — run `meow install`".to_owned())
+    };
+    lines.push(doctor_row(&u, lock_ok, "lockfile", &lock_status));
+
+    let nm = root.join("node_modules").is_dir();
+    lines.push(doctor_row(
+        &u,
+        nm,
+        "node_modules",
+        if nm {
+            "materialized"
+        } else {
+            "not materialized"
+        },
+    ));
+
+    let cache = crate::host::host_home().join(".meow").join("cache");
+    lines.push(doctor_row(
+        &u,
+        cache.is_dir(),
+        "cache",
+        &cache.display().to_string(),
+    ));
+
+    u.panel("meow doctor", &lines);
+    ExitCode::SUCCESS
+}
+
+fn doctor_row(u: &Ui, ok: bool, key: &str, value: &str) -> String {
+    let tone = if ok {
+        meow_ui::Tone::Purr
+    } else {
+        meow_ui::Tone::Warn
+    };
+    format!(
+        "{} {}  {}",
+        u.sigil(tone, ""),
+        u.stdout_caps().muted(&meow_ui::width::pad_end(key, 13)),
+        value
+    )
+}
+// === /UX-002 ===

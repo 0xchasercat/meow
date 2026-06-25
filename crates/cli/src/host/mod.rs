@@ -1,14 +1,9 @@
 //! The CLI's sanctioned **host-boundary seam** (P16 / CONSTITUTION I-6).
 //!
-//! The binary edge — and ONLY here — may read ambient host configuration. This is
-//! the host equivalent of the runtime's single print op: one named place where the
-//! process touches the environment. Library/subsystem crates never read the
-//! environment; they receive already-resolved paths from this edge.
-//!
-//! Reading `$HOME` here locates the global content-addressed cache
-//! (`~/.meow/cache`, CANON §12.1). It does **not** affect execution determinism
-//! (I-6): the cache is content-addressed, so the *path* only changes where bytes
-//! are read from, never *which* (hash-pinned) bytes are loaded.
+//! The binary edge — and ONLY here — may read ambient host configuration. Library
+//! crates never read the environment; they receive already-resolved values from
+//! this edge. Reading `$HOME` locates the global content-addressed cache; the
+//! terminal env feeds the UI engine's capability resolution (UI-001).
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -27,7 +22,45 @@ pub(crate) fn host_meow_tsc() -> Option<OsString> {
     std::env::var_os("MEOW_TSC")
 }
 
-/// Whether the user requested no ANSI color. Host-boundary read for UI-001.
-pub(crate) fn host_no_color() -> bool {
-    std::env::var_os("NO_COLOR").is_some()
+/// Gather terminal-relevant environment once, at the host boundary, into the
+/// plain-data `TermEnv` the UI engine resolves capabilities from (UI-001).
+pub(crate) fn term_env() -> meow_ui::TermEnv {
+    meow_ui::TermEnv {
+        no_color: std::env::var_os("NO_COLOR").is_some(),
+        force_color: parse_force_color(),
+        clicolor_force: std::env::var("CLICOLOR_FORCE")
+            .ok()
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false),
+        ci: std::env::var_os("CI").is_some(),
+        term: std::env::var("TERM").ok(),
+        colorterm: std::env::var("COLORTERM").ok(),
+        term_program: std::env::var("TERM_PROGRAM").ok(),
+        width_hint: std::env::var("COLUMNS").ok().and_then(|v| v.parse().ok()),
+        utf8: detect_utf8(),
+    }
+}
+
+fn parse_force_color() -> Option<u8> {
+    let raw = std::env::var("FORCE_COLOR").ok()?;
+    Some(match raw.trim() {
+        "" | "true" => 3,
+        "false" | "0" => 0,
+        "1" => 1,
+        "2" => 2,
+        _ => 3,
+    })
+}
+
+fn detect_utf8() -> bool {
+    for key in ["LC_ALL", "LC_CTYPE", "LANG"] {
+        if let Ok(val) = std::env::var(key) {
+            if val.is_empty() {
+                continue;
+            }
+            let up = val.to_ascii_uppercase();
+            return up.contains("UTF-8") || up.contains("UTF8");
+        }
+    }
+    true
 }

@@ -7,6 +7,7 @@ mod host;
 include!(concat!(env!("OUT_DIR"), "/snapshot_data.rs"));
 
 fn main() -> std::process::ExitCode {
+    cli::mark_start();
     let argv = cli::normalize_argv(std::env::args_os().collect());
     <cli::Cli as clap::Parser>::parse_from(argv).run()
 }

@@ -54,14 +54,13 @@ const CASES: &[(&[&str], &str)] = &[
     (&["why-large"], "why-large"),
     (&["trace", "x.ts"], "trace"),
     (&["profile", "x.ts"], "profile"),
-    (&["doctor"], "doctor"),
 ];
 #[test]
 fn every_subcommand_stub_is_honest() {
     assert_eq!(
         CASES.len(),
-        8,
-        "8 stub subcommands (task/test/check/why-slow/why-large/trace/profile/doctor); add/remove/lint/fmt/bundle are real commands"
+        7,
+        "7 stub subcommands (task/test/check/why-slow/why-large/trace/profile); doctor/add/remove/lint/fmt/bundle are real commands"
     );
     for (argv, verb) in CASES {
         let expected = format!("meow: `{verb}` is not yet implemented");
@@ -87,8 +86,8 @@ fn lint_reports_debugger_diagnostics() {
     let stderr = String::from_utf8(out.stderr).expect("stderr utf8");
     let file_name = entry.file_name().expect("entry file name");
     assert!(
-        stderr.contains("🙀 [Bad Kitty!]"),
-        "lint should use hiss envelope: {stderr:?}"
+        stderr.contains('^'),
+        "lint should render a caret diagnostic: {stderr:?}"
     );
     assert!(
         stderr.contains(entry.to_string_lossy().as_ref())
@@ -184,15 +183,11 @@ fn bundle_entry_is_skeleton_with_pending_wiring_message() {
     let stdout = String::from_utf8(out.stdout).expect("stdout utf8");
     let stdout_lc = stdout.to_lowercase();
     assert!(
-        stdout.contains("😸 [Purrfect!]") || stdout.contains("😸 [purrfect!]"),
-        "bundle success should use a purr envelope: {stdout:?}"
-    );
-    assert!(
         stdout_lc.contains("resolver wiring") && stdout_lc.contains("pending"),
         "bundle should mention pending resolver wiring: {stdout:?}"
     );
     assert!(
-        stdout_lc.contains("purrfect!") && stdout_lc.contains("bundle"),
+        stdout_lc.contains("bundle"),
         "bundle skeleton success should be identifiable: {stdout:?}"
     );
     std::fs::remove_dir_all(&tmp).ok();
@@ -258,16 +253,16 @@ fn install_success_uses_purr_envelope_in_plain_output() {
     let stdout = String::from_utf8(out.stdout).expect("stdout utf8");
     let stderr = String::from_utf8(out.stderr).expect("stderr utf8");
     assert!(
-        stdout.starts_with("😸 [Purrfect!] installed 0 packages → meow.lock.jsonl"),
-        "install output should report lockfile write"
+        stdout.contains("0 packages ready"),
+        "install output should report the package count: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("meow.lock.jsonl"),
+        "install output should name the lockfile: {stdout:?}"
     );
     assert!(
         stdout.contains("materialized"),
-        "install should default to materialized output"
-    );
-    assert!(
-        stdout.contains("node_modules"),
-        "install output should name the default node_modules projection: {stdout:?}"
+        "install should report the materialized projection: {stdout:?}"
     );
     assert!(
         !stdout.contains("virtual"),
@@ -305,7 +300,7 @@ fn install_parse_error_uses_hiss_envelope_in_plain_output() {
         "install errors stay off stdout: {stdout:?}"
     );
     assert!(
-        stderr.contains("🙀 [Bad Kitty!] meow install:"),
+        stderr.contains("meow install:"),
         "install error should use the hiss envelope: {stderr:?}"
     );
     std::fs::remove_dir_all(&proj).ok();
@@ -325,7 +320,7 @@ fn sync_generates_shadow_configs() {
     let stdout = String::from_utf8(out.stdout).expect("stdout utf8");
     let stderr = String::from_utf8(out.stderr).expect("stderr utf8");
     assert!(
-        stdout.contains("😸 [Purrfect!] meow sync: regenerated .meow/tsconfig.json"),
+        stdout.contains("meow sync: regenerated .meow/tsconfig.json"),
         "sync success should use the purr envelope: {stdout:?}"
     );
     assert!(
@@ -364,7 +359,7 @@ fn sync_missing_config_uses_hiss_envelope_in_plain_output() {
     let stderr = String::from_utf8(out.stderr).expect("stderr utf8");
     assert!(stdout.is_empty(), "sync errors stay off stdout: {stdout:?}");
     assert!(
-        stderr.contains("🙀 [Bad Kitty!] meow sync:"),
+        stderr.contains("meow sync:"),
         "sync error should use the hiss envelope: {stderr:?}"
     );
     std::fs::remove_dir_all(&tmp).ok();
@@ -506,11 +501,11 @@ ui.hiss("boom");
     let stdout = String::from_utf8(out.stdout).expect("stdout utf8");
     let stderr = String::from_utf8(out.stderr).expect("stderr utf8");
     assert!(
-        stdout.contains("raw stdout\n😸 [Purrfect!] hello\n"),
+        stdout.contains("raw stdout\n😸 hello\n"),
         "console.log stays raw while ui.purr is wrapped: {stdout:?}"
     );
     assert!(
-        stderr.contains("raw stderr\n🙀 [Bad Kitty!] boom\n"),
+        stderr.contains("raw stderr\n🙀 boom\n"),
         "console.error stays raw while ui.hiss is wrapped: {stderr:?}"
     );
     std::fs::remove_dir_all(&tmp).ok();
@@ -577,9 +572,13 @@ fn run_forwards_argv_after_double_dash_to_process_argv() {
 
 #[test]
 fn bad_usage_is_distinct() {
-    // No subcommand and a missing required arg are clap usage errors (exit 2),
+    // No subcommand now prints the landing screen (exit 0). A malformed
+    // invocation (missing a required arg) is still a clap usage error (exit 2),
     // never the "not built" exit 3.
-    meow().assert().code(2);
+    meow()
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("meow"));
     meow().arg("run").assert().code(2);
 }
 

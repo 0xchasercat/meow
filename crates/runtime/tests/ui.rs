@@ -78,10 +78,7 @@ hiss("boom");
         .await
         .expect("module runs");
 
-    assert_eq!(
-        *out.borrow(),
-        "😸 [Purrfect!] hello\n🐾 [Pouncing...] working\n"
-    );
-    assert_eq!(*err.borrow(), "🙀 [Bad Kitty!] boom\n");
+    assert_eq!(*out.borrow(), "😸 hello\n🐾 working\n");
+    assert_eq!(*err.borrow(), "🙀 boom\n");
     std::fs::remove_dir_all(&root).ok();
 }

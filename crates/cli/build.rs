@@ -67,7 +67,7 @@ fn main() {
 
 fn emit_table(
     out: &mut String,
-    out_dir: &PathBuf,
+    out_dir: &std::path::Path,
     name: &str,
     prefix: &str,
     items: &[(String, String)],
