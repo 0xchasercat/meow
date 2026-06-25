@@ -68,6 +68,20 @@ impl ProgressBar {
         self.repaint();
     }
 
+    /// Replace the trailing label without changing the counts.
+    pub fn set_label(&mut self, label: impl Into<String>) {
+        self.label = label.into();
+        self.repaint();
+    }
+
+    /// Set current, total, and label together (one repaint).
+    pub fn update(&mut self, current: u64, total: u64, label: impl Into<String>) {
+        self.current = current;
+        self.total = total;
+        self.label = label.into();
+        self.repaint();
+    }
+
     fn repaint(&self) {
         if !self.animate {
             return;

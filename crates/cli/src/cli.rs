@@ -1207,14 +1207,14 @@ fn cmd_install(args: &InstallArgs) -> ExitCode {
         }
     };
 
-    let spinner = ui().spinner("installing dependencies");
+    let mut bar = ui().progress(0, "resolving dependencies");
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
     {
         Ok(runtime) => runtime,
         Err(err) => {
-            spinner.clear();
+            bar.clear();
             hiss(&format!(
                 "meow install: cannot start async installer: {err}"
             ));
@@ -1251,7 +1251,6 @@ fn cmd_install(args: &InstallArgs) -> ExitCode {
             .iter()
             .map(|(name, req)| (name.clone(), meow_pkg::DepSpec::Range(req.clone())))
             .collect::<BTreeMap<_, _>>();
-        let mut fetched = 0usize;
         let override_specs = overrides
             .into_iter()
             .map(|(name, req)| (name, meow_pkg::DepSpec::Range(req)))
@@ -1264,30 +1263,30 @@ fn cmd_install(args: &InstallArgs) -> ExitCode {
         }
         let lockfile = installer
             .resolve_with_progress_async(&direct, |progress| match progress {
-                meow_pkg::InstallProgress::MetadataFetched {
-                    package,
-                    fetched: n,
-                } => {
-                    fetched = n;
-                    spinner.set_label(format!("metadata {fetched} pkgs · last {package}"));
+                meow_pkg::InstallProgress::MetadataFetched { package, fetched } => {
+                    bar.set_label(format!("resolving · {fetched} packages · {package}"));
                 }
                 meow_pkg::InstallProgress::PackageDownloaded {
                     package,
                     downloaded,
                     total,
                 } => {
-                    spinner.set_label(format!(
-                        "downloaded {downloaded}/{total} tarballs · last {package}"
-                    ));
+                    bar.update(
+                        downloaded as u64,
+                        total as u64,
+                        format!("downloading · {package}"),
+                    );
                 }
                 meow_pkg::InstallProgress::PackageCached {
                     package,
                     cached,
                     pending,
                 } => {
-                    spinner.set_label(format!(
-                        "cached {cached} pkgs · {pending} pending · last {package}"
-                    ));
+                    bar.update(
+                        cached as u64,
+                        (cached + pending) as u64,
+                        format!("linking · {package}"),
+                    );
                 }
             })
             .await
@@ -1302,7 +1301,7 @@ fn cmd_install(args: &InstallArgs) -> ExitCode {
             meow_pkg::resolve_roots(&direct_deps, &lockfile).map_err(|err| err.to_string())?;
         let graph = meow_pkg::ResolutionGraph::assemble(std::sync::Arc::new(lockfile), roots)
             .map_err(|err| err.to_string())?;
-        spinner.set_label("materializing node_modules …".to_owned());
+        bar.set_label("materializing node_modules");
         let report = meow_pkg::Materializer::new(&cache, &graph, &root)
             .materialize_async(&projection)
             .await
@@ -1314,7 +1313,7 @@ fn cmd_install(args: &InstallArgs) -> ExitCode {
         })
         // === /PKG-004 ===
     });
-    spinner.clear();
+    bar.clear();
 
     match outcome {
         Ok(InstallSuccess::Materialized {
