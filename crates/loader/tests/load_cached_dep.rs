@@ -15,9 +15,7 @@ use deno_core::{
     RequestedModuleType,
 };
 use meow_graph::GraphDb;
-use meow_loader::{
-    MeowModuleLoader, ModuleKind, ModuleLocator, ResolveError, Resolver,
-};
+use meow_loader::{MeowModuleLoader, ModuleKind, ModuleLocator, ResolveError, Resolver};
 use meow_pkg::{
     Cache, CacheError, LockEntry, Lockfile, PackageName, RegistryProvenance, Version, VersionReq,
 };
@@ -97,7 +95,7 @@ fn archive(files: &[(&str, &[u8])]) -> Vec<u8> {
 }
 
 /// Canonical `file://` URL for a cached member: the REAL unpacked-store path
-/// `<cache>/unpacked/<algo>-<hex>/<member>` (the meow-cache:// scheme is gone).
+/// `<cache>/unpacked/<algo>-<hex>/<member>`.
 fn cache_url(cache_root: &Path, hash: &meow_pkg::ContentHash, member: &str) -> Url {
     let path = cache_root
         .join("unpacked")
@@ -328,10 +326,10 @@ async fn run_entry(
         None => node_extensions_without_bridge(cwd),
     });
     // === /RT-007 ===
-let mut rt = Runtime::new(RuntimeOptions {
+    let mut rt = Runtime::new(RuntimeOptions {
         module_loader: loader,
         extensions,
-max_heap_size: None,
+        max_heap_size: None,
         startup_snapshot: None,
         residual_lazy_js_sources: &[],
         residual_lazy_esm_sources: &[],
@@ -398,7 +396,7 @@ async fn cached_dep_runs_end_to_end_with_no_node_modules() {
             exts.push(sink_ext);
             exts
         },
-max_heap_size: None,
+        max_heap_size: None,
         startup_snapshot: None,
         residual_lazy_js_sources: &[],
         residual_lazy_esm_sources: &[],
@@ -445,10 +443,7 @@ fn one_resolver_handles_relative_and_bare() {
     assert!(matches!(rel_loc, ModuleLocator::LocalFile(_)));
 
     let (bare_url, bare_loc) = resolver.locate("dep", &referrer).expect("bare resolves");
-    assert_eq!(
-        bare_url,
-        cache_url(&cache_root, &dep_hash, "index.js")
-    );
+    assert_eq!(bare_url, cache_url(&cache_root, &dep_hash, "index.js"));
     match bare_loc {
         ModuleLocator::Cached { package, member } => {
             assert_eq!(package, dep_hash);
@@ -934,7 +929,7 @@ async fn extensionless_cached_commonjs_bin_runs_via_native_cjs_runtime() {
     let loader: Rc<dyn ModuleLoader> = Rc::new(MeowModuleLoader::new(
         resolver.clone(),
         Rc::new(RefCell::new(GraphDb::new())),
-));
+    ));
     let (out, sink_ext) = capture();
     let mut rt = Runtime::new(RuntimeOptions {
         module_loader: loader,
@@ -948,7 +943,7 @@ async fn extensionless_cached_commonjs_bin_runs_via_native_cjs_runtime() {
             exts.push(sink_ext);
             exts
         },
-max_heap_size: None,
+        max_heap_size: None,
         startup_snapshot: None,
         residual_lazy_js_sources: &[],
         residual_lazy_esm_sources: &[],

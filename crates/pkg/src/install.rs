@@ -160,6 +160,7 @@ pub struct Installer<'a> {
     registry_url: String,
     meow_req: VersionReq,
     reuse_lockfile: Option<Lockfile>,
+    overrides: BTreeMap<PackageName, DepSpec>,
 }
 
 #[derive(Debug, Clone)]
@@ -196,12 +197,26 @@ impl<'a> Installer<'a> {
             registry_url: registry_url.into(),
             meow_req,
             reuse_lockfile: None,
+            overrides: BTreeMap::new(),
         }
     }
 
     pub fn with_reuse_lockfile(mut self, lockfile: Lockfile) -> Installer<'a> {
         self.reuse_lockfile = Some(lockfile);
         self
+    }
+
+    pub fn with_overrides(mut self, overrides: BTreeMap<PackageName, DepSpec>) -> Installer<'a> {
+        self.overrides = overrides;
+        self
+    }
+
+    fn effective_spec<'spec>(
+        &'spec self,
+        name: &PackageName,
+        spec: &'spec DepSpec,
+    ) -> &'spec DepSpec {
+        self.overrides.get(name).unwrap_or(spec)
     }
 
     /// Resolve, verify, cache, and pin the complete dependency graph.
@@ -251,49 +266,80 @@ impl<'a> Installer<'a> {
         let mut queue = VecDeque::new();
         let mut selected: BTreeMap<PackageName, BTreeSet<Version>> = BTreeMap::new();
         let host = HostPlatform::current();
+        let mut done = BTreeSet::new();
+        let mut jobs = Vec::new();
 
-        let direct_names = direct
-            .iter()
-            .map(|(name, spec)| spec.registry_package(name).clone())
-            .collect();
+        let mut direct_fetch = Vec::new();
+        let mut direct_names = BTreeSet::new();
+        for (name, spec) in direct {
+            let effective_spec = self.effective_spec(name, spec);
+            let registry_name = effective_spec.registry_package(name).clone();
+            if self.resolve_locked_node(
+                name,
+                effective_spec,
+                &mut selected,
+                &mut queue,
+                &mut done,
+                &mut jobs,
+            )? {
+                continue;
+            }
+            direct_names.insert(registry_name.clone());
+            direct_fetch.push((
+                name.clone(),
+                registry_name,
+                effective_spec.selection_spec().clone(),
+            ));
+        }
         self.prefetch_metadata_parallel(&mut metadata, direct_names, &mut on_progress)
             .await?;
-        for (name, spec) in direct {
-            let registry_name = spec.registry_package(name).clone();
+        for (name, registry_name, selection_spec) in direct_fetch {
             let meta = metadata.get(&registry_name).cloned().ok_or_else(|| {
                 InstallError::Registry(RegistryError::Metadata {
                     name: registry_name.to_string(),
                     reason: "metadata missing after prefetch".to_owned(),
                 })
             })?;
-            let version = select_version(&registry_name, &meta, spec.selection_spec())?;
+            let version = select_version(&registry_name, &meta, &selection_spec)?;
             selected
                 .entry(name.clone())
                 .or_default()
                 .insert(version.clone());
             queue.push_back(QueueNode {
-                name: name.clone(),
+                name,
                 registry_name,
                 version,
             });
         }
 
-        let mut done = BTreeSet::new();
-        let mut jobs = Vec::new();
-
         while !queue.is_empty() {
             let batch: Vec<QueueNode> = queue.drain(..).collect();
-            let batch_names = batch
-                .iter()
-                .map(|node| node.registry_name.clone())
-                .collect();
+            let mut fetch_batch = Vec::new();
+            let mut batch_names = BTreeSet::new();
+            for node in batch {
+                if done.contains(&(node.name.clone(), node.version.clone())) {
+                    continue;
+                }
+                if self.resolve_locked_exact_node(
+                    &node.name,
+                    &node.version,
+                    &mut selected,
+                    &mut queue,
+                    &mut done,
+                    &mut jobs,
+                )? {
+                    continue;
+                }
+                batch_names.insert(node.registry_name.clone());
+                fetch_batch.push(node);
+            }
             self.prefetch_metadata_parallel(&mut metadata, batch_names, &mut on_progress)
                 .await?;
 
             let mut planned = Vec::new();
             let mut dep_names = BTreeSet::new();
 
-            for node in batch {
+            for node in fetch_batch {
                 if done.contains(&(node.name.clone(), node.version.clone())) {
                     continue;
                 }
@@ -310,15 +356,27 @@ impl<'a> Installer<'a> {
                     }
                 })?;
                 dep_names.extend(
-                    version_meta.dependencies.iter().map(|(dep, raw_req)| {
-                        DepSpec::parse(raw_req).registry_package(dep).clone()
-                    }),
+                    version_meta
+                        .dependencies
+                        .iter()
+                        .filter_map(|(dep, raw_req)| {
+                            let dep_spec = DepSpec::parse(raw_req);
+                            let effective_spec = self.effective_spec(dep, &dep_spec);
+                            self.cached_locked_entry_for_spec(dep, &effective_spec)
+                                .is_none()
+                                .then(|| effective_spec.registry_package(dep).clone())
+                        }),
                 );
                 dep_names.extend(version_meta.optional_dependencies.iter().filter_map(
                     |(dep, raw_req)| {
                         let dep_spec = DepSpec::parse(raw_req);
-                        let dep_registry_name = dep_spec.registry_package(dep);
-                        package_name_is_next_swc_for_host(dep_registry_name, host)
+                        let effective_spec = self.effective_spec(dep, &dep_spec);
+                        let dep_registry_name = effective_spec.registry_package(dep);
+                        if !package_name_is_next_swc_for_host(dep_registry_name, host) {
+                            return None;
+                        }
+                        self.cached_locked_entry_for_spec(dep, &effective_spec)
+                            .is_none()
                             .then(|| dep_registry_name.clone())
                     },
                 ));
@@ -333,7 +391,10 @@ impl<'a> Installer<'a> {
                             return None;
                         }
                         let dep_spec = DepSpec::parse(raw_req);
-                        Some(dep_spec.registry_package(dep).clone())
+                        let effective_spec = self.effective_spec(dep, &dep_spec);
+                        self.cached_locked_entry_for_spec(dep, &effective_spec)
+                            .is_none()
+                            .then(|| effective_spec.registry_package(dep).clone())
                     },
                 ));
                 planned.push(PlannedNode {
@@ -350,15 +411,30 @@ impl<'a> Installer<'a> {
                 let mut dependencies = BTreeMap::new();
                 for (dep, raw_req) in &node.version_meta.dependencies {
                     let dep_spec = DepSpec::parse(raw_req);
-                    let dep_registry_name = dep_spec.registry_package(dep).clone();
+                    let effective_spec = self.effective_spec(dep, &dep_spec);
+                    let dep_registry_name = effective_spec.registry_package(dep).clone();
+                    if let Some(entry) =
+                        self.locked_entry_for_spec(dep, effective_spec.selection_spec())
+                    {
+                        dependencies.insert(dep.clone(), entry.version.clone());
+                        queue.push_back(QueueNode {
+                            name: dep.clone(),
+                            registry_name: dep_registry_name,
+                            version: entry.version.clone(),
+                        });
+                        continue;
+                    }
                     let dep_meta = metadata.get(&dep_registry_name).ok_or_else(|| {
                         InstallError::Registry(RegistryError::Metadata {
                             name: dep_registry_name.to_string(),
                             reason: "metadata missing after prefetch".to_owned(),
                         })
                     })?;
-                    let dep_version =
-                        select_version(&dep_registry_name, dep_meta, dep_spec.selection_spec())?;
+                    let dep_version = select_version(
+                        &dep_registry_name,
+                        dep_meta,
+                        effective_spec.selection_spec(),
+                    )?;
                     dependencies.insert(dep.clone(), dep_version.clone());
                     queue.push_back(QueueNode {
                         name: dep.clone(),
@@ -368,8 +444,20 @@ impl<'a> Installer<'a> {
                 }
                 for (dep, raw_req) in &node.version_meta.optional_dependencies {
                     let dep_spec = DepSpec::parse(raw_req);
-                    let dep_registry_name = dep_spec.registry_package(dep).clone();
+                    let effective_spec = self.effective_spec(dep, &dep_spec);
+                    let dep_registry_name = effective_spec.registry_package(dep).clone();
                     if !package_name_is_next_swc_for_host(&dep_registry_name, host) {
+                        continue;
+                    }
+                    if let Some(entry) =
+                        self.locked_entry_for_spec(dep, effective_spec.selection_spec())
+                    {
+                        dependencies.insert(dep.clone(), entry.version.clone());
+                        queue.push_back(QueueNode {
+                            name: dep.clone(),
+                            registry_name: dep_registry_name,
+                            version: entry.version.clone(),
+                        });
                         continue;
                     }
                     let dep_meta = metadata.get(&dep_registry_name).ok_or_else(|| {
@@ -378,8 +466,11 @@ impl<'a> Installer<'a> {
                             reason: "metadata missing after prefetch".to_owned(),
                         })
                     })?;
-                    let dep_version =
-                        select_version(&dep_registry_name, dep_meta, dep_spec.selection_spec())?;
+                    let dep_version = select_version(
+                        &dep_registry_name,
+                        dep_meta,
+                        effective_spec.selection_spec(),
+                    )?;
                     let dep_locked_meta = dep_meta.versions.get(&dep_version).ok_or_else(|| {
                         InstallError::MissingVersion {
                             name: dep_registry_name.to_string(),
@@ -418,20 +509,37 @@ impl<'a> Installer<'a> {
                         continue;
                     }
                     let dep_spec = DepSpec::parse(raw_req);
-                    if let Some(existing) = selected
-                        .get(peer)
-                        .and_then(|set| max_selected_satisfying(set, &dep_spec))
-                    {
+                    let effective_spec = self.effective_spec(peer, &dep_spec);
+                    if let Some(existing) = selected.get(peer).and_then(|set| {
+                        max_selected_satisfying(set, effective_spec.selection_spec())
+                    }) {
                         dependencies.insert(peer.clone(), existing);
                         continue;
                     }
-                    let dep_registry_name = dep_spec.registry_package(peer).clone();
+                    let dep_registry_name = effective_spec.registry_package(peer).clone();
+                    if let Some(entry) =
+                        self.locked_entry_for_spec(peer, effective_spec.selection_spec())
+                    {
+                        dependencies.insert(peer.clone(), entry.version.clone());
+                        selected
+                            .entry(peer.clone())
+                            .or_default()
+                            .insert(entry.version.clone());
+                        queue.push_back(QueueNode {
+                            name: peer.clone(),
+                            registry_name: dep_registry_name,
+                            version: entry.version.clone(),
+                        });
+                        continue;
+                    }
                     let Some(dep_meta) = metadata.get(&dep_registry_name) else {
                         continue;
                     };
-                    let Ok(dep_version) =
-                        select_version(&dep_registry_name, dep_meta, dep_spec.selection_spec())
-                    else {
+                    let Ok(dep_version) = select_version(
+                        &dep_registry_name,
+                        dep_meta,
+                        effective_spec.selection_spec(),
+                    ) else {
                         continue;
                     };
                     dependencies.insert(peer.clone(), dep_version.clone());
@@ -502,6 +610,121 @@ impl<'a> Installer<'a> {
         Ok(lockfile)
     }
 
+    fn resolve_locked_node(
+        &self,
+        name: &PackageName,
+        spec: &DepSpec,
+        selected: &mut BTreeMap<PackageName, BTreeSet<Version>>,
+        queue: &mut VecDeque<QueueNode>,
+        done: &mut BTreeSet<(PackageName, Version)>,
+        jobs: &mut Vec<ResolvedNode>,
+    ) -> Result<bool, InstallError> {
+        let Some(entry) = self.locked_entry_for_spec(name, spec) else {
+            return Ok(false);
+        };
+        self.resolve_locked_entry(entry, selected, queue, done, jobs)
+    }
+
+    fn resolve_locked_exact_node(
+        &self,
+        name: &PackageName,
+        version: &Version,
+        selected: &mut BTreeMap<PackageName, BTreeSet<Version>>,
+        queue: &mut VecDeque<QueueNode>,
+        done: &mut BTreeSet<(PackageName, Version)>,
+        jobs: &mut Vec<ResolvedNode>,
+    ) -> Result<bool, InstallError> {
+        let Some(entry) = self
+            .reuse_lockfile
+            .as_ref()
+            .and_then(|lockfile| lockfile.get(name, version))
+        else {
+            return Ok(false);
+        };
+        self.resolve_locked_entry(entry, selected, queue, done, jobs)
+    }
+
+    fn resolve_locked_entry(
+        &self,
+        entry: &LockEntry,
+        selected: &mut BTreeMap<PackageName, BTreeSet<Version>>,
+        queue: &mut VecDeque<QueueNode>,
+        done: &mut BTreeSet<(PackageName, Version)>,
+        jobs: &mut Vec<ResolvedNode>,
+    ) -> Result<bool, InstallError> {
+        if entry.registry.registry != self.registry_url || entry.meow != self.meow_req {
+            return Ok(false);
+        }
+        if !self.cache.contains(&entry.integrity) {
+            return Ok(false);
+        }
+        if !done.insert((entry.name.clone(), entry.version.clone())) {
+            return Ok(true);
+        }
+        selected
+            .entry(entry.name.clone())
+            .or_default()
+            .insert(entry.version.clone());
+        for (dep_name, dep_version) in &entry.dependencies {
+            selected
+                .entry(dep_name.clone())
+                .or_default()
+                .insert(dep_version.clone());
+            queue.push_back(QueueNode {
+                name: dep_name.clone(),
+                registry_name: dep_name.clone(),
+                version: dep_version.clone(),
+            });
+        }
+        jobs.push(ResolvedNode {
+            name: entry.name.clone(),
+            version: entry.version.clone(),
+            tarball: String::new(),
+            integrity: String::new(),
+            dependencies: entry.dependencies.clone(),
+        });
+        Ok(true)
+    }
+
+    fn locked_entry_for_spec(&self, name: &PackageName, spec: &DepSpec) -> Option<&LockEntry> {
+        let lockfile = self.reuse_lockfile.as_ref()?;
+        let req = match spec {
+            DepSpec::Range(req) => req,
+            DepSpec::Tag(_) => return None,
+            DepSpec::Alias { spec, .. } => return self.locked_entry_for_spec(name, spec),
+        };
+        let arms = req.disjunctions().ok()?;
+        let mut selected: Option<(semver::Version, &LockEntry)> = None;
+        for entry in lockfile.iter() {
+            if &entry.name != name {
+                continue;
+            }
+            if entry.registry.registry != self.registry_url || entry.meow != self.meow_req {
+                continue;
+            }
+            let Ok(version) = semver::Version::parse(entry.version.as_str()) else {
+                continue;
+            };
+            if !arms.iter().any(|arm| arm.matches(&version)) {
+                continue;
+            }
+            match &selected {
+                Some((best, _)) if version <= *best => {}
+                _ => selected = Some((version, entry)),
+            }
+        }
+        selected.map(|(_, entry)| entry)
+    }
+
+    fn cached_locked_entry_for_spec(
+        &self,
+        name: &PackageName,
+        spec: &DepSpec,
+    ) -> Option<&LockEntry> {
+        let entry = self.locked_entry_for_spec(name, spec)?;
+        self.cache.contains(&entry.integrity).then_some(entry)
+    }
+
     fn reusable_lock_entry(&self, node: &ResolvedNode) -> Result<Option<LockEntry>, InstallError> {
         let Some(entry) = self
             .reuse_lockfile
@@ -517,10 +740,10 @@ impl<'a> Installer<'a> {
             return Ok(None);
         }
 
-        match self.cache.read(&entry.integrity) {
-            Ok(_) => Ok(Some(entry.clone())),
-            Err(CacheError::NotFound(_) | CacheError::IntegrityMismatch { .. }) => Ok(None),
-            Err(err) => Err(InstallError::Cache(err)),
+        if self.cache.contains(&entry.integrity) {
+            Ok(Some(entry.clone()))
+        } else {
+            Ok(None)
         }
     }
 

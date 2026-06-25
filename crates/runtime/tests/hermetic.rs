@@ -6,6 +6,8 @@
 //! Tests assert observable JS behavior, not plumbing (CRAFT). The host-touching
 //! state itself (clock/rng/env) is unit-tested in `src/hermetic/state.rs`.
 
+mod real_loader;
+
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -14,7 +16,7 @@ use meow_runtime::hermetic::{extensions, HermeticConfig, RngSource};
 use meow_runtime::web::{extensions as web_extensions, NetCaps, WebOptions};
 use meow_runtime::{
     print_sink_extension, AllowAll, ModuleSpecifier, PrintSink, Runtime, RuntimeError,
-    RuntimeOptions, TrivialModuleLoader,
+    RuntimeOptions,
 };
 
 /// Capture sink + the captured buffer (console output; deterministic, no OS).
@@ -31,17 +33,18 @@ fn capture() -> (Rc<RefCell<String>>, deno_core::Extension) {
 /// No Web globals (RT-006 does not depend on RT-004); the `crypto`/`performance`
 /// rebinds in `hermetic.js` are guarded and simply skip when absent.
 fn hermetic_runtime(cfg: HermeticConfig) -> (Rc<RefCell<String>>, Runtime) {
+    let root = real_loader::unique_dir("hermetic");
     let (out, sink_ext) = capture();
     let mut exts = extensions(cfg);
     exts.push(sink_ext);
     let rt = Runtime::new(RuntimeOptions {
-            module_loader: Rc::new(TrivialModuleLoader::new()),
-            extensions: exts,
-            max_heap_size: None,
-            startup_snapshot: None,
-            residual_lazy_js_sources: &[],
-            residual_lazy_esm_sources: &[],
-        })
+        module_loader: real_loader::loader_for(&root),
+        extensions: exts,
+        max_heap_size: None,
+        startup_snapshot: None,
+        residual_lazy_js_sources: &[],
+        residual_lazy_esm_sources: &[],
+    })
     .expect("runtime initializes with hermetic shadows");
     (out, rt)
 }
@@ -211,6 +214,7 @@ async fn hermetic_seed_drives_math_random() {
 /// shadows appended after — exactly the `meow run` order, so `hermetic.js` rebinds
 /// the real `crypto.getRandomValues`.
 fn web_hermetic_runtime(cfg: HermeticConfig) -> (Rc<RefCell<String>>, Runtime) {
+    let root = real_loader::unique_dir("web-hermetic");
     let (out, sink_ext) = capture();
     let caps: NetCaps = Arc::new(AllowAll);
     let mut exts = web_extensions(WebOptions {
@@ -220,14 +224,14 @@ fn web_hermetic_runtime(cfg: HermeticConfig) -> (Rc<RefCell<String>>, Runtime) {
     exts.extend(extensions(cfg));
     exts.push(sink_ext);
     let rt = Runtime::new(RuntimeOptions {
-            module_loader: Rc::new(TrivialModuleLoader::new()),
-            extensions: exts,
-            max_heap_size: None,
-            startup_snapshot: None,
-            residual_lazy_js_sources: &[],
-            residual_lazy_esm_sources: &[],
-        })
-        .expect("runtime initializes with web + hermetic");
+        module_loader: real_loader::loader_for(&root),
+        extensions: exts,
+        max_heap_size: None,
+        startup_snapshot: None,
+        residual_lazy_js_sources: &[],
+        residual_lazy_esm_sources: &[],
+    })
+    .expect("runtime initializes with web + hermetic");
     (out, rt)
 }
 

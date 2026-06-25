@@ -3,13 +3,14 @@
 //! uncaught exception becomes a typed error (never a panic), top-level await is
 //! driven to completion, and the crate introduces no ambient host reads (I-6).
 
+mod real_loader;
+
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use deno_core::{extension, op2};
 use meow_runtime::{
     print_sink_extension, ModuleSpecifier, PrintSink, Runtime, RuntimeError, RuntimeOptions,
-    TrivialModuleLoader,
 };
 
 /// A print sink that accumulates `console.log` output (and a separate buffer for
@@ -37,8 +38,8 @@ fn spec(url: &str) -> ModuleSpecifier {
 }
 
 fn runtime_with(extensions: Vec<deno_core::Extension>) -> Runtime {
-Runtime::new(RuntimeOptions {
-        module_loader: Rc::new(TrivialModuleLoader::new()),
+    Runtime::new(RuntimeOptions {
+        module_loader: real_loader::loader_for(&real_loader::unique_dir("runtime")),
         extensions,
         max_heap_size: None,
         startup_snapshot: None,
@@ -197,26 +198,21 @@ async fn file_specifier_runs_from_disk() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// A .ts entry fails honestly (TypeScript needs RT-003), surfaced as a module error.
+// A .ts entry is parsed and stripped through the real loader/Oxc boundary.
 #[tokio::test]
-async fn typescript_entry_fails_honestly() {
+async fn typescript_entry_runs_through_real_loader() {
     let dir = std::env::temp_dir().join(format!("meow-rt-ts-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("entry.ts");
     std::fs::write(&path, "const x: number = 1; console.log(x);").unwrap();
     let url = ModuleSpecifier::from_file_path(&path).unwrap();
 
-    let mut rt = runtime_with(vec![]);
-    let result = rt.run_main_module(&url).await;
-    match result {
-        Err(RuntimeError::Module { source, .. }) => {
-            assert!(
-                source.to_string().contains("RT-003"),
-                "expected the honest TS message, got {source}"
-            );
-        }
-        other => panic!("expected RuntimeError::Module for .ts, got {other:?}"),
-    }
+    let (out, _err, sink_ext) = capture();
+    let mut rt = runtime_with(vec![sink_ext]);
+    rt.run_main_module(&url)
+        .await
+        .expect("typescript module runs");
+    assert_eq!(*out.borrow(), "1\n");
     std::fs::remove_dir_all(&dir).ok();
 }
 

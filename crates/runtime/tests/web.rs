@@ -7,6 +7,8 @@
 //! Tests assert behavior from JS via `meow run`-style module evaluation, not
 //! plumbing.
 
+mod real_loader;
+
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -14,7 +16,6 @@ use std::sync::Arc;
 use meow_runtime::web::{extensions, NetCaps, WebOptions};
 use meow_runtime::{
     print_sink_extension, ModuleSpecifier, PrintSink, Runtime, RuntimeError, RuntimeOptions,
-    TrivialModuleLoader,
 };
 
 // --- helpers ---------------------------------------------------------------
@@ -31,6 +32,7 @@ fn capture() -> (Rc<RefCell<String>>, deno_core::Extension) {
 
 /// Build a default runtime with the Web globals installed and a capture sink.
 fn web_runtime(caps: NetCaps) -> (Rc<RefCell<String>>, Runtime) {
+    let root = real_loader::unique_dir("web");
     let (out, sink_ext) = capture();
     let mut exts = extensions(WebOptions {
         caps,
@@ -38,14 +40,14 @@ fn web_runtime(caps: NetCaps) -> (Rc<RefCell<String>>, Runtime) {
     });
     exts.push(sink_ext);
     let rt = Runtime::new(RuntimeOptions {
-            module_loader: Rc::new(TrivialModuleLoader::new()),
-            extensions: exts,
-max_heap_size: None,
-            startup_snapshot: None,
-            residual_lazy_js_sources: &[],
-            residual_lazy_esm_sources: &[],
-        })
-        .expect("runtime initializes with web globals");
+        module_loader: real_loader::loader_for(&root),
+        extensions: exts,
+        max_heap_size: None,
+        startup_snapshot: None,
+        residual_lazy_js_sources: &[],
+        residual_lazy_esm_sources: &[],
+    })
+    .expect("runtime initializes with web globals");
     (out, rt)
 }
 

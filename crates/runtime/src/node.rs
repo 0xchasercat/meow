@@ -8,10 +8,8 @@
 #[path = "node_bridge.rs"]
 pub mod node_bridge;
 
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -118,7 +116,7 @@ pub fn extensions(opts: NodeOptions) -> Vec<Extension> {
     };
 
     let mut exts = vec![
-        process_exit_state_extension(),
+        process_exit_state_extension(&env),
         runtime::init(),
         deno_webidl::deno_webidl::init(),
         deno_web::deno_web::init(blob_store, None, false, broadcast_channel),
@@ -128,7 +126,7 @@ pub fn extensions(opts: NodeOptions) -> Vec<Extension> {
         deno_io::deno_io::init(Some(deno_io::Stdio::default())),
         deno_fs::deno_fs::init(fs.clone()),
         deno_telemetry::deno_telemetry::init(),
-        deno_os::deno_os::init(None),
+        deno_os::deno_os::init(Some(deno_os::ExitCode::default())),
         deno_process::deno_process::init(None),
     ];
 
@@ -180,13 +178,18 @@ pub fn extensions(opts: NodeOptions) -> Vec<Extension> {
     exts
 }
 
-fn process_exit_state_extension() -> Extension {
-    let cell = crate::ext::ProcessExitCell(Rc::new(RefCell::new(None)));
-    let child_pipe = child_pipe_from_env();
+fn process_exit_state_extension(env: &BTreeMap<String, String>) -> Extension {
+    let child_pipe = child_pipe_from_env(env);
     Extension {
         name: "meow_process_exit_state",
         op_state_fn: Some(Box::new(move |state: &mut OpState| {
-            state.put(cell.clone());
+            if state.try_borrow::<crate::ext::ProcessExitCode>().is_none() {
+                let exit_code = state
+                    .try_borrow::<deno_os::ExitCode>()
+                    .cloned()
+                    .unwrap_or_default();
+                state.put(crate::ext::ProcessExitCode::new(exit_code));
+            }
             state.put::<deno_node::ops::handle_wrap::AsyncId>(
                 deno_node::ops::handle_wrap::AsyncId::default(),
             );
@@ -213,6 +216,23 @@ struct NodeBootstrapInfo {
     cwd: String,
     main_module: Option<String>,
     env: BTreeMap<String, String>,
+    pid: u32,
+    ppid: u32,
+}
+
+#[cfg(unix)]
+fn parent_process_id() -> u32 {
+    unsafe { libc::getppid() as u32 }
+}
+
+#[cfg(windows)]
+fn parent_process_id() -> u32 {
+    0
+}
+
+#[cfg(not(any(unix, windows)))]
+fn parent_process_id() -> u32 {
+    0
 }
 
 #[op2]
@@ -237,6 +257,8 @@ fn op_meow_node_bootstrap_info(state: &mut OpState) -> NodeBootstrapInfo {
         cwd: bootstrap.cwd.to_string_lossy().into_owned(),
         main_module,
         env: bootstrap.env.clone(),
+        pid: std::process::id(),
+        ppid: parent_process_id(),
     }
 }
 
@@ -258,11 +280,11 @@ fn node_bootstrap_state_extension(
 
 deno_core::extension!(meow_node_bootstrap, ops = [op_meow_node_bootstrap_info],);
 
-fn child_pipe_from_env() -> Option<deno_node::ChildPipeFd> {
-    let fd = std::env::var("NODE_CHANNEL_FD").ok()?.parse().ok()?;
-    let serialization = std::env::var("NODE_CHANNEL_SERIALIZATION_MODE")
-        .ok()
-        .and_then(|raw| deno_node::ops::ipc::ChildIpcSerialization::from_str(&raw).ok())
+fn child_pipe_from_env(env: &BTreeMap<String, String>) -> Option<deno_node::ChildPipeFd> {
+    let fd = env.get("NODE_CHANNEL_FD")?.parse().ok()?;
+    let serialization = env
+        .get("NODE_CHANNEL_SERIALIZATION_MODE")
+        .and_then(|raw| deno_node::ops::ipc::ChildIpcSerialization::from_str(raw).ok())
         .unwrap_or(deno_node::ops::ipc::ChildIpcSerialization::Json);
     Some(deno_node::ChildPipeFd(fd, serialization))
 }
@@ -271,8 +293,8 @@ pub fn take_process_exit_code(js_runtime: &JsRuntime) -> Option<i32> {
     let op_state = js_runtime.op_state();
     let state = op_state.borrow();
     state
-        .try_borrow::<crate::ext::ProcessExitCell>()
-        .and_then(|cell| cell.0.borrow_mut().take())
+        .try_borrow::<crate::ext::ProcessExitCode>()
+        .and_then(|exit_code| exit_code.take())
 }
 /// Refresh the Node bootstrap state (argv, cwd, env) in the runtime's OpState
 /// and update the JS `process` global to match.

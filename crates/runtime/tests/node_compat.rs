@@ -278,7 +278,7 @@ fn node_runtime(
     extensions.extend(hermetic::extensions(hermetic_cfg));
     extensions.push(sink);
 
-let runtime = Runtime::new(RuntimeOptions {
+    let runtime = Runtime::new(RuntimeOptions {
         module_loader: loader,
         extensions,
         max_heap_size: None,
@@ -439,12 +439,13 @@ async fn process_argv_cwd_and_platform_are_wired() {
         console.log(process.argv.join("|"));
         console.log(process.cwd());
         console.log(process.platform + ":" + process.arch);
+        console.log(`${typeof process.pid}:${typeof process.ppid}:${typeof process.pid.toString(36)}`);
         "#,
     )
     .await
     .expect("module runs");
     let expected = format!(
-        "meow|{entry}|one|two\n{}\ndarwin:arm64\n",
+        "meow|{entry}|one|two\n{}\ndarwin:arm64\nnumber:number:string\n",
         proj.to_string_lossy()
     );
     assert_eq!(*out.borrow(), expected);
@@ -768,6 +769,35 @@ console.log(`${hasIsatty}:${stdoutIsTTY}:${stderrIsTTY}`);
         .await
         .expect("CommonJS tty shim shape runs");
     assert_eq!(*out.borrow(), "true:true:true\n");
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[tokio::test]
+async fn non_tty_stdin_uses_generic_raw_mode_fallback_shape() {
+    let proj = unique_dir("cjs-non-tty-raw-mode-shape");
+    let entry = proj.join("main.cjs");
+    std::fs::write(
+        &entry,
+        r#"require("tty");
+const source = String(process.stdin.setRawMode);
+console.log([
+  process.stdin.constructor && process.stdin.constructor.name,
+  typeof process.stdin._handle?.setRawMode,
+  source.includes("_handle.setRawMode"),
+  source.includes("io.stdin.setRaw"),
+].join(":"));
+"#,
+    )
+    .expect("write entry");
+    let (out, mut rt) = node_runtime(
+        node::NodeMode::Enabled,
+        &proj,
+        vec!["meow".to_owned(), entry.to_string_lossy().into_owned()],
+    );
+    run_file(&mut rt, &entry)
+        .await
+        .expect("CommonJS non-TTY raw mode fallback shape runs");
+    assert_eq!(*out.borrow(), "Duplex:undefined:false:true\n");
     std::fs::remove_dir_all(&proj).ok();
 }
 

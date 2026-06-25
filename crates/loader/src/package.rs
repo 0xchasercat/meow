@@ -13,6 +13,8 @@ pub struct PackageJson {
     pub package_type: Option<String>,
     #[serde(default)]
     pub main: Option<String>,
+    #[serde(default)]
+    pub module: Option<String>,
     // === RUN-001 ===
     #[serde(default)]
     pub bin: Option<BinField>,

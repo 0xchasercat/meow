@@ -10,15 +10,13 @@
 //! `meow:*` surfaces (RT-005 `meow:http`, UI-001 `meow:ui`) live in separate
 //! extensions layered through [`crate::RuntimeOptions`].
 
-use std::cell::RefCell;
+use std::cell::Cell;
 use std::io::{self, Write};
 use std::rc::Rc;
 
 use deno_core::{op2, OpState};
 
-use crate::fs_events::{
-    op_meow_fs_events_close, op_meow_fs_events_open, op_meow_fs_events_poll,
-};
+use crate::fs_events::{op_meow_fs_events_close, op_meow_fs_events_open, op_meow_fs_events_poll};
 pub mod http;
 pub mod ui;
 
@@ -36,7 +34,32 @@ pub type PrintFn = Rc<dyn Fn(&str, bool)>;
 pub struct PrintSink(pub PrintFn);
 
 #[derive(Clone)]
-pub(crate) struct ProcessExitCell(pub Rc<RefCell<Option<i32>>>);
+pub(crate) struct ProcessExitCode {
+    code: deno_os::ExitCode,
+    requested: Rc<Cell<bool>>,
+}
+
+impl ProcessExitCode {
+    pub(crate) fn new(code: deno_os::ExitCode) -> Self {
+        Self {
+            code,
+            requested: Rc::new(Cell::new(false)),
+        }
+    }
+
+    pub(crate) fn record(&mut self, code: i32) {
+        self.requested.set(true);
+        self.code.set(code);
+    }
+
+    pub(crate) fn take(&self) -> Option<i32> {
+        if self.requested.replace(false) {
+            Some(self.code.get())
+        } else {
+            None
+        }
+    }
+}
 
 /// The ONLY host I/O op in the base runtime extension. Synchronous, infallible-by-
 /// contract write that honors a [`PrintSink`] override when present, else writes
@@ -94,8 +117,8 @@ fn op_bootstrap_unstable_args() -> Vec<String> {
 
 #[op2(fast)]
 fn op_meow_record_process_exit(state: &mut OpState, code: i32) {
-    if let Some(cell) = state.try_borrow::<ProcessExitCell>() {
-        *cell.0.borrow_mut() = Some(code);
+    if let Some(exit_code) = state.try_borrow_mut::<ProcessExitCode>() {
+        exit_code.record(code);
     }
 }
 

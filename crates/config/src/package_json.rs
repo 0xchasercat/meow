@@ -27,6 +27,8 @@ pub struct PackageJson {
     #[serde(default)]
     pub peer_dependencies: BTreeMap<PackageName, String>,
     #[serde(default)]
+    pub overrides: BTreeMap<PackageName, String>,
+    #[serde(default)]
     pub scripts: BTreeMap<String, String>,
     #[serde(default)]
     pub workspaces: Option<PackageJsonWorkspaces>,
@@ -67,6 +69,12 @@ impl PackageJson {
         merge_dependency_section(&mut merged, &self.dependencies)?;
         merge_dev_dependency_section(&mut merged, &self.dev_dependencies)?;
         Ok(merged)
+    }
+
+    pub fn package_overrides(&self) -> Result<BTreeMap<PackageName, VersionReq>, ConfigError> {
+        let mut overrides = BTreeMap::new();
+        merge_dependency_section(&mut overrides, &self.overrides)?;
+        Ok(overrides)
     }
 }
 
@@ -200,6 +208,9 @@ mod tests {
   "peerDependencies": {
     "react": "^19.0.0"
   },
+  "overrides": {
+    "vite": "^7"
+  },
   "scripts": {
     "dev": "vite"
   },
@@ -235,6 +246,13 @@ mod tests {
                 .get(&PackageName::new("react"))
                 .map(String::as_str),
             Some("^19.0.0")
+        );
+        assert_eq!(
+            package_json
+                .overrides
+                .get(&PackageName::new("vite"))
+                .map(String::as_str),
+            Some("^7")
         );
         assert_eq!(
             package_json.scripts.get("dev").map(String::as_str),
@@ -314,6 +332,22 @@ mod tests {
             }
             other => panic!("got {other:?}, want ConflictingDependencySpecifier"),
         }
+    }
+
+    #[test]
+    fn package_overrides_parse_semver_specs() {
+        let package_json = PackageJson {
+            overrides: BTreeMap::from([(PackageName::new("vite"), "^7".to_owned())]),
+            ..PackageJson::default()
+        };
+
+        let overrides = package_json.package_overrides().expect("parse overrides");
+        assert_eq!(
+            overrides
+                .get(&PackageName::new("vite"))
+                .map(VersionReq::as_str),
+            Some("^7")
+        );
     }
 
     #[test]

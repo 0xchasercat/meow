@@ -231,14 +231,14 @@ async fn resolution_graph_runs_without_node_modules_and_preserves_multi_version_
     ));
     let (out, sink_ext) = capture();
     let mut runtime = Runtime::new(RuntimeOptions {
-            module_loader: loader,
-            extensions: vec![sink_ext],
-max_heap_size: None,
-            startup_snapshot: None,
-            residual_lazy_js_sources: &[],
-            residual_lazy_esm_sources: &[],
-        })
-        .expect("runtime initializes");
+        module_loader: loader,
+        extensions: vec![sink_ext],
+        max_heap_size: None,
+        startup_snapshot: None,
+        residual_lazy_js_sources: &[],
+        residual_lazy_esm_sources: &[],
+    })
+    .expect("runtime initializes");
     let spec = ModuleSpecifier::from_file_path(&entry).expect("entry url");
     runtime.run_main_module(&spec).await.expect("entry runs");
 

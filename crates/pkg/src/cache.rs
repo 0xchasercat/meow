@@ -26,7 +26,9 @@ impl Cache {
     /// Use an explicit cache root (tests, vendored caches, or a host-resolved
     /// path). The root is created lazily on first [`store`](Cache::store).
     pub fn with_root(root: impl Into<PathBuf>) -> Cache {
-        Cache { root: root.into() }
+        let root = root.into();
+        let root = fs::canonicalize(&root).unwrap_or(root);
+        Cache { root }
     }
 
     /// Cache rooted at `<home>/.meow/cache` (CANON §12.1). The caller supplies

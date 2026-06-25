@@ -21,7 +21,6 @@
 mod error;
 mod ext;
 mod fs_events;
-mod loader;
 pub mod native;
 pub mod typegen;
 // === RT-005 ===
@@ -69,9 +68,8 @@ pub use deno_core::ModuleSpecifier;
 
 pub use error::{JsExceptionReport, RuntimeError};
 pub use ext::http::ops::HttpError;
-pub use ext::{http_extension, print_sink_extension, ui_extension, PrintSink};
 pub use ext::meow_runtime;
-pub use loader::TrivialModuleLoader;
+pub use ext::{http_extension, print_sink_extension, ui_extension, PrintSink};
 // === RT-002 ===
 pub use io::{
     io_capability_extension, AllowAll, CapDenied, CapRequest, CapabilityCheck, RuntimeIoError,
@@ -88,9 +86,8 @@ pub struct Runtime {
 /// Construction inputs. Deliberately minimal at P0 — `extensions` is the
 /// registration seam (A4).
 pub struct RuntimeOptions {
-    /// Resolves + fetches modules. At P0 this is [`TrivialModuleLoader`];
-    /// the real resolver replaces it with the shared resolver. Required (no
-    /// implicit default → no ambient fs authority).
+    /// Resolves + fetches modules. Required explicitly so tests and production
+    /// exercise the same resolver path and no ambient fs authority is implied.
     pub module_loader: std::rc::Rc<dyn deno_core::ModuleLoader>,
     /// Subsystem-contributed ops/extensions. This crate's own `meow_runtime`
     /// extension is always prepended internally; callers never pass it.
@@ -165,6 +162,23 @@ fn system_memory() -> Option<usize> {
     None
 }
 
+#[cfg(unix)]
+fn maximize_fd_limit() {
+    unsafe {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
+            limit.rlim_cur = limit.rlim_max.min(10240);
+            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn maximize_fd_limit() {}
+
 impl Runtime {
     /// Creates the isolate, prepending this crate's `meow_runtime` extension
     /// (ops + `console` bootstrap) to `options.extensions`. No host reads.
@@ -180,21 +194,18 @@ impl Runtime {
     /// plumbing; they only go live behind a mediated, capability-enforced API in
     /// a later spec (meow:fs + SEC/P6).
     pub fn new(options: RuntimeOptions) -> Result<Runtime, RuntimeError> {
+        maximize_fd_limit();
         let mut extensions = Vec::with_capacity(options.extensions.len() + 1);
         extensions.push(ext::meow_runtime::init());
         extensions.extend(options.extensions);
-        let heap_limit = options
-            .max_heap_size
-            .unwrap_or_else(default_heap_size);
+        let heap_limit = options.max_heap_size.unwrap_or_else(default_heap_size);
         let js_runtime = JsRuntime::try_new(DenoRuntimeOptions {
             module_loader: Some(options.module_loader),
             extensions,
             extension_transpiler: Some(std::rc::Rc::new(|specifier, source| {
                 maybe_transpile_source(specifier, source)
             })),
-            create_params: Some(
-                deno_core::v8::CreateParams::default().heap_limits(0, heap_limit),
-            ),
+            create_params: Some(deno_core::v8::CreateParams::default().heap_limits(0, heap_limit)),
             startup_snapshot: options.startup_snapshot,
             residual_lazy_js_sources: options.residual_lazy_js_sources,
             residual_lazy_esm_sources: options.residual_lazy_esm_sources,
@@ -210,7 +221,7 @@ impl Runtime {
         &mut self,
         name: &'static str,
         src: impl Into<ModuleCodeString>,
-) -> Result<v8::Global<v8::Value>, RuntimeError> {
+    ) -> Result<v8::Global<v8::Value>, RuntimeError> {
         self.js_runtime
             .execute_script(name, src.into())
             .map_err(|err| error::uncaught_from_js(name, &err))
@@ -318,7 +329,12 @@ pub fn maybe_transpile_source(
     ),
     deno_error::JsErrorBox,
 > {
-    use deno_ast::{MediaType, ModuleKind, ParseParams, SourceMapOption};
+    use oxc_allocator::Allocator;
+    use oxc_codegen::Codegen;
+    use oxc_parser::{ParseOptions, Parser};
+    use oxc_semantic::SemanticBuilder;
+    use oxc_span::SourceType;
+    use oxc_transformer::{TransformOptions, Transformer};
 
     let specifier_str = specifier.as_str();
     let should_transpile = specifier_str.starts_with("node:")
@@ -329,53 +345,98 @@ pub fn maybe_transpile_source(
         || specifier_str.ends_with(".tsx")
         || specifier_str.ends_with(".jsx");
 
-    if should_transpile {
-        let parsed_specifier =
-            deno_core::ModuleSpecifier::parse(specifier_str).unwrap_or_else(|_| {
-                deno_core::ModuleSpecifier::parse(&format!("file:///{}", specifier_str)).unwrap()
-            });
+    if !should_transpile {
+        return Ok((source, None));
+    }
 
-        let media_type = if specifier_str.ends_with(".tsx") {
-            MediaType::Tsx
-        } else if specifier_str.ends_with(".jsx") {
-            MediaType::Jsx
-        } else {
-            MediaType::TypeScript
-        };
-
-        let parsed = deno_ast::parse_module(ParseParams {
-            specifier: parsed_specifier,
-            text: source.as_str().into(),
-            media_type,
-            capture_tokens: false,
-            scope_analysis: false,
-            maybe_syntax: None,
+    let source_text = source.as_str();
+    let source_path = source_path_for_oxc(specifier_str);
+    let source_type = SourceType::from_path(&source_path)
+        .unwrap_or_else(|_| source_type_from_specifier(specifier_str));
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, source_text, source_type)
+        .with_options(ParseOptions {
+            allow_return_outside_function: true,
+            ..ParseOptions::default()
         })
-        .map_err(deno_error::JsErrorBox::from_err)?;
+        .parse();
+    if parsed.panicked || !parsed.errors.is_empty() {
+        let message = parsed
+            .errors
+            .into_iter()
+            .map(|error| format!("{:?}", error.with_source_code(source_text.to_owned())))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(deno_error::JsErrorBox::generic(format!(
+            "Oxc parse failed for {specifier_str}: {message}"
+        )));
+    }
 
-        let transpiled = parsed
-            .transpile(
-                &deno_ast::TranspileOptions {
-                    imports_not_used_as_values: deno_ast::ImportsNotUsedAsValues::Remove,
-                    ..Default::default()
-                },
-                &deno_ast::TranspileModuleOptions {
-                    module_kind: Some(ModuleKind::Esm),
-                },
-                &deno_ast::EmitOptions {
-                    source_map: SourceMapOption::Separate,
-                    inline_sources: true,
-                    ..Default::default()
-                },
-            )
-            .map_err(deno_error::JsErrorBox::from_err)?
-            .into_source();
+    let mut program = parsed.program;
+    let semantic = SemanticBuilder::new()
+        .with_excess_capacity(2.0)
+        .with_enum_eval(true)
+        .build(&program);
+    if !semantic.errors.is_empty() {
+        let message = semantic
+            .errors
+            .into_iter()
+            .map(|error| format!("{:?}", error.with_source_code(source_text.to_owned())))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(deno_error::JsErrorBox::generic(format!(
+            "Oxc semantic analysis failed for {specifier_str}: {message}"
+        )));
+    }
 
-        Ok((
-            transpiled.text.into(),
-            transpiled.source_map.map(|s| s.into_bytes().into()),
-        ))
+    let transform_options = TransformOptions {
+        typescript: oxc_transformer::TypeScriptOptions {
+            only_remove_type_imports: true,
+            ..oxc_transformer::TypeScriptOptions::default()
+        },
+        ..TransformOptions::default()
+    };
+    let transformed = Transformer::new(&allocator, &source_path, &transform_options)
+        .build_with_scoping(semantic.semantic.into_scoping(), &mut program);
+    if !transformed.errors.is_empty() {
+        let message = transformed
+            .errors
+            .into_iter()
+            .map(|error| format!("{:?}", error.with_source_code(source_text.to_owned())))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(deno_error::JsErrorBox::generic(format!(
+            "Oxc transform failed for {specifier_str}: {message}"
+        )));
+    }
+
+    let code = Codegen::new().build(&program).code;
+    Ok((code.into(), None))
+}
+
+fn source_path_for_oxc(specifier: &str) -> std::path::PathBuf {
+    if let Ok(url) = deno_core::ModuleSpecifier::parse(specifier) {
+        if let Ok(path) = url.to_file_path() {
+            return path;
+        }
+        let path = url.path();
+        if let Some(name) = path.rsplit('/').next().filter(|name| !name.is_empty()) {
+            return std::path::PathBuf::from(name);
+        }
+    }
+    std::path::PathBuf::from(specifier.rsplit('/').next().unwrap_or(specifier))
+}
+
+fn source_type_from_specifier(specifier: &str) -> oxc_span::SourceType {
+    if specifier.ends_with(".tsx") {
+        oxc_span::SourceType::tsx()
+    } else if specifier.ends_with(".jsx") {
+        oxc_span::SourceType::jsx()
+    } else if specifier.ends_with(".mjs") {
+        oxc_span::SourceType::mjs()
+    } else if specifier.ends_with(".cjs") {
+        oxc_span::SourceType::cjs()
     } else {
-        Ok((source, None))
+        oxc_span::SourceType::ts()
     }
 }

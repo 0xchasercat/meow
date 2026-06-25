@@ -47,8 +47,6 @@ fn version_and_help_succeed() {
         .stdout(predicate::str::contains("run"));
 }
 const CASES: &[(&[&str], &str)] = &[
-    (&["add", "pkg"], "add"),
-    (&["remove", "pkg"], "remove"),
     (&["task", "t"], "task"),
     (&["test"], "test"),
     (&["check"], "check"),
@@ -62,8 +60,8 @@ const CASES: &[(&[&str], &str)] = &[
 fn every_subcommand_stub_is_honest() {
     assert_eq!(
         CASES.len(),
-        10,
-        "10 stub subcommands (add/remove/task/test/check/why-slow/why-large/trace/profile/doctor); lint/fmt/bundle are real commands"
+        8,
+        "8 stub subcommands (task/test/check/why-slow/why-large/trace/profile/doctor); add/remove/lint/fmt/bundle are real commands"
     );
     for (argv, verb) in CASES {
         let expected = format!("meow: `{verb}` is not yet implemented");
@@ -201,13 +199,50 @@ fn bundle_entry_is_skeleton_with_pending_wiring_message() {
 }
 
 #[test]
-fn install_vfs_mode_remains_an_honest_stub() {
-    meow()
-        .args(["install", "--mode", "vfs"])
-        .assert()
-        .code(3)
-        .stdout(predicate::str::is_empty())
-        .stderr(predicate::str::contains("not yet implemented"));
+#[cfg(unix)]
+fn run_preserves_native_tty_raw_mode_under_pseudo_terminal() {
+    let script_bin = std::path::Path::new("/usr/bin/script");
+    if !script_bin.exists() {
+        return;
+    }
+    let tmp = load_tmp("tty-raw-mode");
+    let entry = tmp.join("probe.js");
+    std::fs::write(
+        &entry,
+        r#"console.log([
+  process.stdin.isTTY,
+  process.stdout.isTTY,
+  process.stdin.constructor && process.stdin.constructor.name,
+  String(process.stdin.setRawMode).includes("_handle.setRawMode"),
+  String(process.stdin.setRawMode).includes("io.stdin.setRaw"),
+].join(":"));
+process.stdin.setRawMode(true);
+console.log("raw:" + process.stdin.isRaw);
+process.stdin.setRawMode(false);
+"#,
+    )
+    .expect("write tty probe");
+    let transcript = tmp.join("typescript");
+    let meow_bin = assert_cmd::cargo::cargo_bin("meow");
+    let status = StdCommand::new(script_bin)
+        .arg("-q")
+        .arg(&transcript)
+        .arg(meow_bin)
+        .arg("run")
+        .arg(&entry)
+        .status()
+        .expect("run script pseudo-terminal");
+    assert!(status.success(), "pseudo-terminal run should succeed");
+    let output = std::fs::read_to_string(&transcript).expect("read transcript");
+    assert!(
+        output.contains("true:true:ReadStream:true:false"),
+        "stdin must keep native node:tty ReadStream raw-mode method: {output:?}"
+    );
+    assert!(
+        output.contains("raw:true"),
+        "native raw-mode transition should report isRaw=true: {output:?}"
+    );
+    std::fs::remove_dir_all(&tmp).ok();
 }
 
 #[test]
@@ -348,6 +383,102 @@ fn run_executes_a_trivial_mjs_module() {
         .assert()
         .success()
         .stdout(predicate::str::contains("hello from meow"));
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[test]
+fn node_compat_run_uses_live_clock_and_os_entropy_by_default() {
+    let tmp = load_tmp("run-live-hermetic-defaults");
+    let entry = tmp.join("live.mjs");
+    std::fs::write(
+        &entry,
+        r#"console.log(`now=${Date.now()}`);
+console.log(`random=${Math.random()}`);
+"#,
+    )
+    .expect("write live hermetic probe");
+
+    let run_once = || {
+        let out = meow()
+            .current_dir(&tmp)
+            .arg("run")
+            .arg("--no-snapshot")
+            .arg(&entry)
+            .output()
+            .expect("run live hermetic probe");
+        assert!(out.status.success(), "meow run should succeed: {out:?}");
+        String::from_utf8(out.stdout).expect("stdout utf8")
+    };
+
+    let first = run_once();
+    let second = run_once();
+    let now = first
+        .lines()
+        .find_map(|line| line.strip_prefix("now="))
+        .and_then(|value| value.parse::<f64>().ok())
+        .expect("now line");
+    assert_ne!(
+        now, 1_780_790_400_000.0,
+        "node-compatible meow run must not inherit strict-web frozen time by default: {first:?}"
+    );
+    assert!(
+        now > 1_735_689_600_000.0,
+        "node-compatible meow run should expose a recent host clock: {first:?}"
+    );
+    let first_random = first
+        .lines()
+        .find_map(|line| line.strip_prefix("random="))
+        .expect("first random line");
+    let second_random = second
+        .lines()
+        .find_map(|line| line.strip_prefix("random="))
+        .expect("second random line");
+    assert_ne!(
+        first_random, second_random,
+        "node-compatible meow run should seed Math.random from OS entropy by default"
+    );
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[test]
+fn strict_web_run_keeps_deterministic_clock_and_entropy_by_default() {
+    let tmp = load_tmp("run-strict-hermetic-defaults");
+    std::fs::write(tmp.join("meow.config.json"), br#"{ "mode": "strict-web" }"#)
+        .expect("write strict-web config");
+    let entry = tmp.join("strict.mjs");
+    std::fs::write(
+        &entry,
+        r#"console.log(`now=${Date.now()}`);
+console.log(`random=${Math.random()}`);
+"#,
+    )
+    .expect("write strict hermetic probe");
+
+    let run_once = || {
+        let out = meow()
+            .current_dir(&tmp)
+            .arg("run")
+            .arg("--no-snapshot")
+            .arg(&entry)
+            .output()
+            .expect("run strict hermetic probe");
+        assert!(
+            out.status.success(),
+            "strict-web meow run should succeed: {out:?}"
+        );
+        String::from_utf8(out.stdout).expect("stdout utf8")
+    };
+
+    let first = run_once();
+    let second = run_once();
+    assert!(
+        first.contains("now=1780790400000"),
+        "strict-web meow run should keep the frozen virtual epoch: {first:?}"
+    );
+    assert_eq!(
+        first, second,
+        "strict-web meow run should keep deterministic seeded entropy by default"
+    );
     std::fs::remove_dir_all(&tmp).ok();
 }
 

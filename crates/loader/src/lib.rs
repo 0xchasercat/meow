@@ -86,23 +86,31 @@ fn op_cjs_resolve_and_load(
         }
         ModuleLocator::Native { .. } => false,
     };
-    let filename = match &resolved.locator {
-        ModuleLocator::Native { .. } => cjs_filename_for(&resolved.url, &resolved.url),
-        _ => state
-            .resolver
-            .projected_path_for(&resolved.locator)
-            .map(Ok)
-            .unwrap_or_else(|| state.resolver.runtime_path_for(&resolved.locator))
-            .map_err(|err| deno_error::JsErrorBox::generic(format!("meow: {err}")))?
-            .to_string_lossy()
-            .into_owned(),
+    let (url, filename) = match &resolved.locator {
+        ModuleLocator::Native { .. } => (
+            resolved.url.to_string(),
+            cjs_filename_for(&resolved.url, &resolved.url),
+        ),
+        _ => {
+            let path = state
+                .resolver
+                .projected_path_for(&resolved.locator)
+                .map(Ok)
+                .unwrap_or_else(|| state.resolver.runtime_path_for(&resolved.locator))
+                .map_err(|err| deno_error::JsErrorBox::generic(format!("meow: {err}")))?;
+            let url = Url::from_file_path(&path)
+                .ok()
+                .map(|url| url.to_string())
+                .unwrap_or_else(|| resolved.url.to_string());
+            (url, path.to_string_lossy().into_owned())
+        }
     };
     let dirname = PathBuf::from(&filename)
         .parent()
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_default();
     Ok(CjsLoadedModule {
-        url: resolved.url.to_string(),
+        url,
         filename,
         dirname,
         source: if is_napi {

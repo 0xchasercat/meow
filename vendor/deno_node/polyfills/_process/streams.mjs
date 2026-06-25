@@ -363,28 +363,24 @@ export const initStdin = (warmup = false) => {
       getStdinIsTTY = () => value;
     },
   });
-  stdin._isRawMode = false;
-  stdin.setRawMode = (enable) => {
-    if (io.stdin?.isTerminal()) {
-      try {
+  if (typeof stdin.setRawMode !== "function") {
+    stdin._isRawMode = false;
+    stdin.setRawMode = (enable) => {
+      if (io.stdin?.isTerminal()) {
         io.stdin.setRaw(enable);
-      } catch {
-        // Raw mode unavailable in this runtime (e.g. the op_set_raw TTY op is
-        // not wired). Degrade gracefully like a non-supporting terminal instead
-        // of throwing into consumers such as ora's end-of-build spinner.
       }
-    }
-    stdin._isRawMode = enable;
-    return stdin;
-  };
-  ObjectDefineProperty(stdin, "isRaw", {
-    __proto__: null,
-    enumerable: true,
-    configurable: true,
-    get() {
-      return stdin._isRawMode;
-    },
-  });
+      stdin._isRawMode = enable;
+      return stdin;
+    };
+    ObjectDefineProperty(stdin, "isRaw", {
+      __proto__: null,
+      enumerable: true,
+      configurable: true,
+      get() {
+        return stdin._isRawMode;
+      },
+    });
+  }
 
   return stdin;
 };

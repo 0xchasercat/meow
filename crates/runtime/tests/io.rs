@@ -4,6 +4,8 @@
 //! never a panic), TCP connect succeeds to a live listener and fails typed to a
 //! closed port, and bad input rejects without panicking (CRAFT no-panic).
 
+mod real_loader;
+
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -12,7 +14,7 @@ use std::time::Duration;
 
 use meow_runtime::{
     io_capability_extension, print_sink_extension, CapDenied, CapRequest, CapabilityCheck,
-    ModuleSpecifier, PrintSink, Runtime, RuntimeError, RuntimeOptions, TrivialModuleLoader,
+    ModuleSpecifier, PrintSink, Runtime, RuntimeError, RuntimeOptions,
 };
 
 // --- helpers ---------------------------------------------------------------
@@ -27,8 +29,8 @@ fn capture() -> (Rc<RefCell<String>>, deno_core::Extension) {
 }
 
 fn runtime_with(extensions: Vec<deno_core::Extension>) -> Runtime {
-Runtime::new(RuntimeOptions {
-        module_loader: Rc::new(TrivialModuleLoader::new()),
+    Runtime::new(RuntimeOptions {
+        module_loader: real_loader::loader_for(&real_loader::unique_dir("runtime")),
         extensions,
         max_heap_size: None,
         startup_snapshot: None,

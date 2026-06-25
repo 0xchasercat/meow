@@ -181,6 +181,7 @@ pub enum Command {
     /// Shorthand for `meow run dev`.
     Dev(RunScriptArgs),
     /// Install dependencies into the active projection (default: symlinked node_modules).
+    #[command(alias = "i")]
     Install(InstallArgs),
     /// Add a dependency + update the lockfile.
     Add(PkgArgs),
@@ -285,9 +286,6 @@ pub struct InstallArgs {
     /// Vendor directory (default "vendor"); meaningful only for vendor projection.
     #[arg(long, default_value = "vendor")]
     pub vendor_dir: PathBuf,
-    /// Deprecated for node_modules; use `--vendor` for a copy-based projection.
-    #[arg(long)]
-    pub copy: bool,
     /// Remove any existing projection tree before writing.
     #[arg(long)]
     pub clean: bool,
@@ -311,10 +309,6 @@ pub struct TypesArgs {
 
 #[derive(Debug, Clone, ValueEnum)]
 pub enum InstallMode {
-    /// Deprecated lock/cache-only install; explicit opt-out from the default projection.
-    Pnp,
-    /// Experimental virtual filesystem projection.
-    Vfs,
     /// Default: strict symlinked node_modules backed by the global unpacked store.
     Materialize,
     /// Copy-based vendor/ projection for air-gapped deploys.
@@ -417,6 +411,8 @@ impl Cli {
             // === /CFG-001 ===
             // === PKG-002 ===
             Command::Install(args) => cmd_install(&args),
+            Command::Add(args) => cmd_add(&args),
+            Command::Remove(args) => cmd_remove(&args),
             // === /PKG-002 ===
             // === RT-005 ===
             Command::Types(args) => cmd_types(&args),
@@ -1077,10 +1073,6 @@ async fn read_limited_response(response: reqwest::Response, limit: u64) -> Resul
 }
 
 enum InstallSuccess {
-    Pnp {
-        installed: usize,
-        lock_path: PathBuf,
-    },
     Materialized {
         installed: usize,
         lock_path: PathBuf,
@@ -1088,16 +1080,105 @@ enum InstallSuccess {
     },
 }
 
-/// `meow install`: resolve declared deps, populate the cache, and write the lockfile.
-fn cmd_install(args: &InstallArgs) -> ExitCode {
-    if matches!(args.mode, InstallMode::Vfs) {
-        hiss(&format!(
-            "meow install: `--mode {}` is not yet implemented",
-            install_mode_name(&args.mode)
-        ));
-        return ExitCode::from(EXIT_UNIMPLEMENTED);
+fn default_install_args() -> InstallArgs {
+    InstallArgs {
+        mode: InstallMode::Materialize,
+        materialize: false,
+        vendor: false,
+        vendor_dir: PathBuf::from("vendor"),
+        clean: false,
+        packages: Vec::new(),
+    }
+}
+
+fn cmd_add(args: &PkgArgs) -> ExitCode {
+    let root = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            hiss(&format!(
+                "meow add: cannot resolve the current directory: {err}"
+            ));
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            hiss(&format!("meow add: cannot start async resolver: {err}"));
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let outcome: Result<Vec<(meow_pkg::PackageName, meow_pkg::VersionReq)>, String> = runtime
+        .block_on(async {
+            let registry = NpmRegistry::npm()?;
+            let mut resolved = Vec::with_capacity(args.packages.len());
+            for package in &args.packages {
+                let (name, req) = requested_dependency(&registry, package)
+                    .await
+                    .map_err(|err| err.to_string())?;
+                meow_config::add_dependency(&root, name.clone(), req.clone())
+                    .map_err(|err| err.to_string())?;
+                resolved.push((name, req));
+            }
+            Ok(resolved)
+        });
+
+    let resolved = match outcome {
+        Ok(resolved) => resolved,
+        Err(err) => {
+            hiss(&format!("meow add: {err}"));
+            return ExitCode::FAILURE;
+        }
+    };
+
+    for (name, req) in resolved {
+        purr(&format!("added {name}@{}", req.as_str()));
+    }
+    cmd_install(&default_install_args())
+}
+
+fn cmd_remove(args: &PkgArgs) -> ExitCode {
+    let root = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            hiss(&format!(
+                "meow remove: cannot resolve the current directory: {err}"
+            ));
+            return ExitCode::FAILURE;
+        }
+    };
+
+    for package in &args.packages {
+        let (name, req) = match split_package_arg(package) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                hiss(&format!("meow remove: {err}"));
+                return ExitCode::FAILURE;
+            }
+        };
+        if req.is_some() {
+            hiss(&format!(
+                "meow remove: package specifier {package:?} includes a version; remove by package name"
+            ));
+            return ExitCode::FAILURE;
+        }
+        if let Err(err) = meow_config::remove_dependency(&root, &name) {
+            hiss(&format!("meow remove: {err}"));
+            return ExitCode::FAILURE;
+        }
+        purr(&format!("removed {name}"));
     }
 
+    cmd_install(&default_install_args())
+}
+
+/// `meow install`: resolve declared deps, populate the cache, and write the lockfile.
+fn cmd_install(args: &InstallArgs) -> ExitCode {
     let projection = match install_projection(args) {
         Ok(projection) => projection,
         Err(err) => {
@@ -1143,6 +1224,9 @@ fn cmd_install(args: &InstallArgs) -> ExitCode {
         let direct_deps = package_json
             .direct_dependencies()
             .map_err(|err| err.to_string())?;
+        let overrides = package_json
+            .package_overrides()
+            .map_err(|err| err.to_string())?;
         // === /CFG-003 ===
 
         let cache = meow_pkg::Cache::in_home(crate::host::host_home());
@@ -1158,8 +1242,13 @@ fn cmd_install(args: &InstallArgs) -> ExitCode {
             .map(|(name, req)| (name.clone(), meow_pkg::DepSpec::Range(req.clone())))
             .collect::<BTreeMap<_, _>>();
         let mut fetched = 0usize;
+        let override_specs = overrides
+            .into_iter()
+            .map(|(name, req)| (name, meow_pkg::DepSpec::Range(req)))
+            .collect::<BTreeMap<_, _>>();
         let mut installer =
-            meow_pkg::Installer::new(registry.clone(), &cache, registry.base_url(), meow_req);
+            meow_pkg::Installer::new(registry.clone(), &cache, registry.base_url(), meow_req)
+                .with_overrides(override_specs);
         if let Some(lockfile) = prior_lockfile {
             installer = installer.with_reuse_lockfile(lockfile);
         }
@@ -1199,27 +1288,21 @@ fn cmd_install(args: &InstallArgs) -> ExitCode {
             .map_err(|err| err.to_string())?;
 
         // === PKG-004 ===
-        if let Some(opts) = projection {
-            let roots =
-                meow_pkg::resolve_roots(&direct_deps, &lockfile).map_err(|err| err.to_string())?;
-            let graph = meow_pkg::ResolutionGraph::assemble(std::sync::Arc::new(lockfile), roots)
-                .map_err(|err| err.to_string())?;
-            spinner.set_label("materializing node_modules …".to_owned());
-            let report = meow_pkg::Materializer::new(&cache, &graph, &root)
-                .materialize(&opts)
-                .map_err(|err| err.to_string())?;
-            return Ok(InstallSuccess::Materialized {
-                installed,
-                lock_path,
-                report,
-            });
-        }
-        // === /PKG-004 ===
-
-        Ok(InstallSuccess::Pnp {
+        let roots =
+            meow_pkg::resolve_roots(&direct_deps, &lockfile).map_err(|err| err.to_string())?;
+        let graph = meow_pkg::ResolutionGraph::assemble(std::sync::Arc::new(lockfile), roots)
+            .map_err(|err| err.to_string())?;
+        spinner.set_label("materializing node_modules …".to_owned());
+        let report = meow_pkg::Materializer::new(&cache, &graph, &root)
+            .materialize_async(&projection)
+            .await
+            .map_err(|err| err.to_string())?;
+        Ok(InstallSuccess::Materialized {
             installed,
             lock_path,
+            report,
         })
+        // === /PKG-004 ===
     });
     spinner.stop();
 
@@ -1237,27 +1320,18 @@ fn cmd_install(args: &InstallArgs) -> ExitCode {
                     .and_then(|name| name.to_str())
                     .unwrap_or("meow.lock.jsonl")
             ));
+            let payload = if report.bytes_written == 0 && report.packages > 0 && !report.skipped {
+                "copy-on-write payload".to_owned()
+            } else {
+                format!("{} bytes", report.bytes_written)
+            };
             purr(&format!(
-                "materialized {} packages / {} edges / {} bytes → {}{}",
+                "materialized {} packages / {} edges / {} → {}{}",
                 report.packages,
                 report.edges,
-                report.bytes_written,
+                payload,
                 report.root.display(),
                 if report.skipped { " (skipped)" } else { "" }
-            ));
-            ExitCode::SUCCESS
-        }
-        Ok(InstallSuccess::Pnp {
-            installed,
-            lock_path,
-        }) => {
-            purr(&format!(
-                "installed {} packages → {} (no projection; deprecated --mode pnp)",
-                installed,
-                lock_path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("meow.lock.jsonl")
             ));
             ExitCode::SUCCESS
         }
@@ -1357,73 +1431,35 @@ fn runtime_meow_requirement() -> Result<meow_pkg::VersionReq, String> {
 }
 
 // === PKG-004 ===
-fn install_projection(args: &InstallArgs) -> Result<Option<meow_pkg::MaterializeOptions>, String> {
+fn install_projection(args: &InstallArgs) -> Result<meow_pkg::MaterializeOptions, String> {
     let selection = if args.materialize {
-        Some(InstallMode::Materialize)
+        InstallMode::Materialize
     } else if args.vendor {
-        Some(InstallMode::Vendor)
+        InstallMode::Vendor
     } else {
-        match args.mode {
-            InstallMode::Pnp => None,
-            InstallMode::Vfs => None,
-            InstallMode::Materialize => Some(InstallMode::Materialize),
-            InstallMode::Vendor => Some(InstallMode::Vendor),
-        }
+        args.mode.clone()
     };
 
-    if selection.is_none() {
-        if args.copy {
-            return Err(
-                "`--copy` cannot be used with `--mode pnp` or `--mode vfs`; use `--vendor` for a copy-based projection".to_owned(),
-            );
-        }
-        if args.clean {
-            return Err(
-                "`--clean` cannot be used with `--mode pnp` or `--mode vfs`; use default materialize or vendor".to_owned(),
-            );
-        }
-        if args.vendor_dir != Path::new("vendor") {
-            return Err("`--vendor-dir` requires `--vendor` or `--mode vendor`".to_owned());
-        }
-        return Ok(None);
-    }
-
-    if matches!(selection, Some(InstallMode::Materialize)) && args.vendor_dir != Path::new("vendor")
-    {
+    if matches!(selection, InstallMode::Materialize) && args.vendor_dir != Path::new("vendor") {
         return Err("`--vendor-dir` requires `--vendor` or `--mode vendor`".to_owned());
     }
 
-    if matches!(selection, Some(InstallMode::Materialize)) && args.copy {
-        return Err(
-            "`--copy` is no longer a node_modules mode; default materialize is strict symlinks, use `--vendor` for copies".to_owned(),
-        );
-    }
-
     match selection {
-        Some(InstallMode::Materialize) => {
+        InstallMode::Materialize => {
             let mut opts = meow_pkg::MaterializeOptions::node_modules();
             opts.clean = args.clean;
-            Ok(Some(opts))
+            Ok(opts)
         }
-        Some(InstallMode::Vendor) => {
+        InstallMode::Vendor => {
             let mut opts = meow_pkg::MaterializeOptions::vendor();
             opts.clean = args.clean;
             opts.vendor_dir = args.vendor_dir.clone();
-            Ok(Some(opts))
+            Ok(opts)
         }
-        _ => Ok(None),
     }
 }
 // === /PKG-004 ===
 
-fn install_mode_name(mode: &InstallMode) -> &'static str {
-    match mode {
-        InstallMode::Pnp => "pnp",
-        InstallMode::Vfs => "vfs",
-        InstallMode::Materialize => "materialize",
-        InstallMode::Vendor => "vendor",
-    }
-}
 // === /PKG-002 ===
 
 // === RT-006 ===
@@ -1459,8 +1495,8 @@ fn run_script_flags(args: &RunScriptArgs) -> RunFlagView<'_> {
 }
 // === /RUN-001 ===
 
-/// Build the hermetic (clock/rng/env) config from the `meow run` grant flags. No
-/// flags = fully deterministic (I-6); each `--allow-*` flips one source (A6).
+/// Build the raw hermetic (clock/rng/env) config from the `meow run` grant flags.
+/// Mode-specific CLI defaults are applied by `run_hermetic_config`.
 fn hermetic_config(args: &RunFlagView<'_>) -> meow_runtime::hermetic::HermeticConfig {
     let mut cfg = meow_runtime::hermetic::HermeticConfig::default();
     if args.allow_clock {
@@ -1505,8 +1541,11 @@ fn run_hermetic_config(
     mode: meow_runtime::node::NodeMode,
 ) -> meow_runtime::hermetic::HermeticConfig {
     let mut cfg = hermetic_config(args);
-    if matches!(mode, meow_runtime::node::NodeMode::Enabled) && args.allow_env.is_none() {
-        cfg = cfg.with_env_all();
+    if matches!(mode, meow_runtime::node::NodeMode::Enabled) {
+        cfg = cfg.with_real_clock().with_os_rng();
+        if args.allow_env.is_none() {
+            cfg = cfg.with_env_all();
+        }
     }
     if matches!(mode, meow_runtime::node::NodeMode::StrictWeb) {
         cfg.env = meow_runtime::hermetic::EnvPolicy::Deny;
@@ -1756,6 +1795,45 @@ impl RuntimeNodeBridge {
             .ok()?;
         Some(resolved.kind)
     }
+
+    fn projected_referrer_path(&self, path: &Path) -> Option<PathBuf> {
+        let referrer = Url::from_file_path(path).ok()?;
+        let resolved = self.resolver.resolve(referrer.as_str(), &referrer).ok()?;
+        self.resolver.projected_path_for(&resolved.locator)
+    }
+}
+
+fn nearest_package_root(path: &Path) -> Option<PathBuf> {
+    let mut current = if path.is_dir() {
+        Some(path)
+    } else {
+        path.parent()
+    };
+    while let Some(dir) = current {
+        if dir.join("package.json").is_file() {
+            return Some(dir.to_path_buf());
+        }
+        if dir.ends_with("node_modules") {
+            return None;
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+fn push_node_module_paths(paths: &mut Vec<String>, from: &Path) {
+    let mut current_path = from;
+    let mut maybe_parent = Some(current_path);
+    while let Some(parent) = maybe_parent {
+        if !parent.ends_with("node_modules") {
+            let candidate = parent.join("node_modules").to_string_lossy().into_owned();
+            if !paths.contains(&candidate) {
+                paths.push(candidate);
+            }
+        }
+        current_path = parent;
+        maybe_parent = current_path.parent();
+    }
 }
 
 impl NpmPackageFolderResolver for RuntimeNodeBridge {
@@ -1765,6 +1843,12 @@ impl NpmPackageFolderResolver for RuntimeNodeBridge {
         referrer: &UrlOrPathRef,
     ) -> Result<PathBuf, PackageFolderResolveError> {
         let referrer_url = self.referrer_url(referrer)?;
+        if let Ok(package_root) = self
+            .resolver
+            .package_root_for_require(specifier, &referrer_url)
+        {
+            return Ok(package_root);
+        }
         let resolved = self
             .resolver
             .resolve_require(specifier, &referrer_url)
@@ -1773,10 +1857,16 @@ impl NpmPackageFolderResolver for RuntimeNodeBridge {
             })?;
 
         let package_root = match resolved.locator {
-            meow_loader::ModuleLocator::Cached { package, .. } => {
-                self.store.ensure(&package).map_err(|err| {
-                    self.missing_package_with_extra(specifier, referrer, Some(err.to_string()))
-                })?
+            meow_loader::ModuleLocator::Cached { ref package, .. } => {
+                if let Some(projected) = self.resolver.projected_path_for(&resolved.locator) {
+                    nearest_package_root(&projected)
+                        .or_else(|| projected.parent().map(Path::to_path_buf))
+                        .unwrap_or(projected)
+                } else {
+                    self.store.ensure(package).map_err(|err| {
+                        self.missing_package_with_extra(specifier, referrer, Some(err.to_string()))
+                    })?
+                }
             }
             meow_loader::ModuleLocator::LocalFile(ref path) => {
                 path.parent().unwrap_or(path.as_path()).to_path_buf()
@@ -1814,6 +1904,12 @@ impl InNpmPackageChecker for RuntimeNodeBridge {
             return false;
         };
         path.starts_with(self.store.root())
+            || self
+                .resolver
+                .project_root()
+                .to_file_path()
+                .ok()
+                .is_some_and(|root| path.starts_with(root.join("node_modules")))
     }
 }
 
@@ -1860,17 +1956,11 @@ impl NodeRequireLoader for RuntimeNodeBridge {
     }
 
     fn resolve_require_node_module_paths(&self, from: &Path) -> Vec<String> {
-        let mut paths = Vec::with_capacity(from.components().count());
-        let mut current_path = from;
-        let mut maybe_parent = Some(current_path);
-        while let Some(parent) = maybe_parent {
-            if !parent.ends_with("node_modules") {
-                paths.push(parent.join("node_modules").to_string_lossy().into_owned());
-            }
-            current_path = parent;
-            maybe_parent = current_path.parent();
+        let mut paths = Vec::with_capacity(from.components().count() + 4);
+        if let Some(projected_from) = self.projected_referrer_path(from) {
+            push_node_module_paths(&mut paths, &projected_from);
         }
-
+        push_node_module_paths(&mut paths, from);
         paths
     }
 
@@ -1926,14 +2016,7 @@ async fn run_native_request(
 
     // === RT-004 ===
     let caps: meow_runtime::web::NetCaps = std::sync::Arc::new(meow_runtime::AllowAll);
-    let mut extensions = if ctx.node_mode == meow_runtime::node::NodeMode::StrictWeb {
-        meow_runtime::web::extensions(meow_runtime::web::WebOptions {
-            caps: caps.clone(),
-            user_agent: format!("meow/{}", env!("CARGO_PKG_VERSION")),
-        })
-    } else {
-        Vec::new()
-    };
+    let mut extensions = Vec::new();
     // === RT-005 ===
     extensions.push(meow_runtime::http_extension());
     // === UI-001 ===
@@ -2020,7 +2103,11 @@ fn prepare_direct_file_run(
 ) -> Result<NativeRunRequest, RunCommandError> {
     let abs = resolve_local_entry(cwd, target, true)?
         .ok_or_else(|| RunCommandError::Message(format!("cannot find {target}")))?;
-    native_file_request(find_project_root(cwd), cwd.to_path_buf(), abs, argv)
+    let entry_root = abs
+        .parent()
+        .map(find_project_root)
+        .unwrap_or_else(|| find_project_root(cwd));
+    native_file_request(entry_root, cwd.to_path_buf(), abs, argv)
 }
 
 fn native_file_request(
@@ -2167,14 +2254,28 @@ fn resolve_package_bin(
             continue;
         };
         let member = normalize_cached_member(name.as_str(), raw_member)?;
-        let bin_path = root.join(&member);
-        if !bin_path.is_file() {
+        let runtime_bin_path = root.join(&member);
+        if !runtime_bin_path.is_file() {
             return Err(RunCommandError::MissingBinFile {
                 package: name.to_string(),
                 command: command.to_owned(),
                 target: member,
             });
         }
+        let key = format!("{}@{}", name.as_str().replace('/', "+"), version);
+        let projected_bin_path = ctx
+            .project_dir
+            .join("node_modules")
+            .join(".meow")
+            .join(key)
+            .join("node_modules")
+            .join(name.as_str())
+            .join(&member);
+        let bin_path = if projected_bin_path.is_file() {
+            projected_bin_path
+        } else {
+            runtime_bin_path
+        };
         let spec = Url::from_file_path(&bin_path)
             .map_err(|()| RunCommandError::InvalidEntryPath(bin_path.display().to_string()))?;
         matches.push((name.to_string(), spec, bin_path));
@@ -2654,21 +2755,9 @@ mod tests {
         assert!(!args.materialize);
         assert!(matches!(args.mode, InstallMode::Materialize));
         assert!(!args.vendor);
-        let opts = install_projection(&args)
-            .expect("projection selection")
-            .expect("default projection");
+        let opts = install_projection(&args).expect("projection selection");
         assert!(matches!(opts.projection, meow_pkg::Projection::NodeModules));
         assert!(matches!(opts.link, meow_pkg::LinkStrategy::Symlink));
-    }
-
-    #[test]
-    fn install_copy_is_rejected_for_default_node_modules_projection() {
-        let cli = Cli::try_parse_from(["meow", "install", "--copy"]).expect("parse cli");
-        let Command::Install(args) = cli.command else {
-            panic!("expected install command");
-        };
-        let err = install_projection(&args).expect_err("copy must not alter node_modules mode");
-        assert!(err.contains("strict symlinks"));
     }
 
     #[test]

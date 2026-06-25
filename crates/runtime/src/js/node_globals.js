@@ -12,7 +12,19 @@ import * as nodeConstantsModule from "node:constants";
 const load = core.loadExtScript;
 const bootstrapInfo = typeof core.ops.op_meow_node_bootstrap_info === "function"
   ? core.ops.op_meow_node_bootstrap_info()
-  : { args: [], argv: [], cwd: "", mainModule: undefined, env: {} };
+  : { args: [], argv: [], cwd: "", mainModule: undefined, env: {}, pid: 0, ppid: 0 };
+if (globalThis.Deno && typeof globalThis.Deno === "object") {
+  try {
+    if (globalThis.Deno.pid === undefined && bootstrapInfo.pid !== undefined) {
+      Object.defineProperty(globalThis.Deno, "pid", { value: bootstrapInfo.pid, writable: true, configurable: true });
+    }
+    if (globalThis.Deno.ppid === undefined && bootstrapInfo.ppid !== undefined) {
+      Object.defineProperty(globalThis.Deno, "ppid", { value: bootstrapInfo.ppid, writable: true, configurable: true });
+    }
+  } catch {
+    // Frozen Deno namespace; later process compatibility shims are best-effort.
+  }
+}
 const hostPlatform = typeof core.ops.op_meow_host_platform === "function"
   ? core.ops.op_meow_host_platform()
   : (core.build?.os ?? "");
@@ -71,6 +83,32 @@ Object.defineProperty(globalThis, "process", {
   configurable: true,
 });
 
+function meowSetObjectValue(target, name, value) {
+  if (!target || typeof target !== "object" || value === undefined) return;
+  const descriptor = Object.getOwnPropertyDescriptor(target, name);
+  if (!descriptor) {
+    Object.defineProperty(target, name, { value, writable: true, configurable: true });
+    return;
+  }
+  if (descriptor.configurable) {
+    Object.defineProperty(target, name, { value, writable: true, configurable: true });
+    return;
+  }
+  if (descriptor.writable) {
+    target[name] = value;
+  }
+}
+
+function meowSetProcessValue(name, value) {
+  meowSetObjectValue(processValue, name, value);
+  meowSetObjectValue(globalThis.process, name, value);
+}
+
+function meowInstallProcessIds(info) {
+  meowSetProcessValue("pid", globalThis.Deno?.pid ?? info?.pid);
+  meowSetProcessValue("ppid", globalThis.Deno?.ppid ?? info?.ppid);
+}
+
 const meowProcessEnvProxyTag = Symbol.for("meow.process.env.proxy");
 function meowNormalizeEnvValue(value) {
   return value === null ? undefined : value;
@@ -102,6 +140,7 @@ function meowInstallProcessEnv() {
   });
 }
 meowInstallProcessEnv();
+
 
 // === CLEAN-003 env overlay ===
 // CJS now runs through Deno's node:module (the synthetic cjs.ts bridge was
@@ -153,6 +192,12 @@ if (globalThis.Deno) {
     const denoFs = load("ext:deno_fs/30_fs.js");
 
     denoNs.args = Array.isArray(bootstrapInfo.args) ? [...bootstrapInfo.args] : [];
+    if (bootstrapInfo.pid !== undefined) {
+      Object.defineProperty(denoNs, "pid", { value: bootstrapInfo.pid, writable: true, configurable: true });
+    }
+    if (bootstrapInfo.ppid !== undefined) {
+      Object.defineProperty(denoNs, "ppid", { value: bootstrapInfo.ppid, writable: true, configurable: true });
+    }
     if (denoNs.version === undefined) {
       denoNs.version = {};
     }
@@ -465,20 +510,41 @@ if (globalThis.Deno) {
   ) {
     processValue.execPath = denoNs.execPath();
   }
-  if (processValue && typeof processValue === "object" && denoNs.pid !== undefined) {
-    Object.defineProperty(processValue, "pid", {
-      value: denoNs.pid,
+  function meowRecordProcessExit(code = 0) {
+    const numeric = code === undefined ? 0 : Number(code);
+    const normalized = Number.isFinite(numeric) ? numeric | 0 : 0;
+    if (typeof core.ops.op_meow_record_process_exit === "function") {
+      core.ops.op_meow_record_process_exit(normalized);
+    }
+    return normalized;
+  }
+  if (processValue && typeof processValue === "object") {
+    const originalExit = typeof processValue.exit === "function"
+      ? processValue.exit.bind(processValue)
+      : undefined;
+    Object.defineProperty(processValue, "exit", {
+      value(code) {
+        meowRecordProcessExit(code);
+        if (originalExit) return originalExit(code);
+        throw { __meowProcessExit: true, code: meowRecordProcessExit(code) };
+      },
+      writable: true,
+      configurable: true,
+    });
+    const originalReallyExit = typeof processValue.reallyExit === "function"
+      ? processValue.reallyExit.bind(processValue)
+      : undefined;
+    Object.defineProperty(processValue, "reallyExit", {
+      value(code) {
+        meowRecordProcessExit(code);
+        if (originalReallyExit) return originalReallyExit(code);
+        throw { __meowProcessExit: true, code: meowRecordProcessExit(code) };
+      },
       writable: true,
       configurable: true,
     });
   }
-  if (processValue && typeof processValue === "object" && denoNs.ppid !== undefined) {
-    Object.defineProperty(processValue, "ppid", {
-      value: denoNs.ppid,
-      writable: true,
-      configurable: true,
-    });
-  }
+  meowInstallProcessIds(bootstrapInfo);
   if (typeof denoNs.watchFs !== "function") {
     // Real OS file watching via the host notify-backed ops. Push-based: returns
     // immediately and change events arrive on a channel. Replaces the old
@@ -590,6 +656,12 @@ function meowApplyDenoNamespace(info) {
   if (denoNs) {
     try {
       denoNs.args = Array.isArray(info.args) ? [...info.args] : [];
+      if (info.pid !== undefined) {
+        Object.defineProperty(denoNs, "pid", { value: info.pid, writable: true, configurable: true });
+      }
+      if (info.ppid !== undefined) {
+        Object.defineProperty(denoNs, "ppid", { value: info.ppid, writable: true, configurable: true });
+      }
       if (info.mainModule) {
         denoNs.mainModule = info.mainModule;
       }
@@ -619,13 +691,14 @@ function meowApplyDenoNamespace(info) {
     }
   }
   meowInstallProcessEnv();
+  meowInstallProcessIds(info);
 }
 
 function meowRunNodeBootstrap(info, warmup) {
   if (typeof globalThis.nodeBootstrap !== "function") return;
   try {
     globalThis.nodeBootstrap({
-      usesLocalNodeModulesDir: true,
+      usesLocalNodeModulesDir: false,
       argv0: info.argv?.[0] ?? "meow",
       runningOnMainThread: true,
       nodeDebug: "",
@@ -637,6 +710,7 @@ function meowRunNodeBootstrap(info, warmup) {
       throw error;
     }
   }
+  meowInstallProcessIds(info);
 }
 
 // Invoked by the host (meow-runtime refresh_bootstrap_state) at runtime when booting

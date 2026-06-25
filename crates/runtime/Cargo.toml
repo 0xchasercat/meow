@@ -52,7 +52,12 @@ deno_semver = { workspace = true }
 sys_traits = { workspace = true }
 deno_os = { workspace = true }
 deno_process = { workspace = true }
-deno_ast = { version = "0.53.2", features = ["transpiling", "type_strip"] }
+oxc_allocator = { workspace = true }
+oxc_parser = { workspace = true }
+oxc_semantic = { workspace = true }
+oxc_span = { workspace = true }
+oxc_codegen = { workspace = true }
+oxc_transformer = { workspace = true }
 # === /RT-007 ===
 # PKG-002's `meow install` HTTPS client (`reqwest`) and runtime TLS both use
 # `rustls`; installing the aws-lc-rs default in runtime avoids provider ambiguity.

@@ -120,12 +120,12 @@ impl ContentHash {
         p
     }
     // === LOAD-003 ===
-    /// Canonical URL-host form for `meow-cache://`: `"<algo>-<lowerhex>"`.
+    /// Canonical unpacked-store directory key: `"<algo>-<lowerhex>"`.
     pub fn to_url_host(&self) -> String {
         format!("{}-{}", self.algo.as_str(), to_hex(self.digest()))
     }
 
-    /// Parse the canonical URL-host form `"<algo>-<lowerhex>"`.
+    /// Parse the canonical unpacked-store directory key `"<algo>-<lowerhex>"`.
     pub fn from_url_host(s: &str) -> Result<ContentHash, ParseHashError> {
         let (algo_str, hex) = s
             .split_once('-')

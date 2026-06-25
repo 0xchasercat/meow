@@ -11,9 +11,7 @@ use deno_core::{
     ModuleType, RequestedModuleType,
 };
 use meow_graph::GraphDb;
-use meow_loader::{
-    MeowModuleLoader, ModuleKind, ModuleLocator, ResolveError, Resolver,
-};
+use meow_loader::{MeowModuleLoader, ModuleKind, ModuleLocator, ResolveError, Resolver};
 use meow_pkg::{Cache, LockEntry, Lockfile, PackageName, RegistryProvenance, Version, VersionReq};
 
 fn unique_dir(tag: &str) -> std::path::PathBuf {
@@ -78,7 +76,7 @@ fn archive(files: &[(&str, &[u8])]) -> Vec<u8> {
         .expect("finish gzip")
 }
 
-/// Canonical `file://` URL for a cached member after the meow-cache:// scheme
+/// Canonical `file://` URL for a cached member in the unpacked store.
 /// removal: the REAL unpacked-store path `<cache>/unpacked/<algo>-<hex>/<member>`.
 fn cache_url(proj: &std::path::Path, hash: &meow_pkg::ContentHash, member: &str) -> Url {
     let path = proj
@@ -356,6 +354,291 @@ fn nested_dependencies_and_multi_version_follow_owner_lock_entries() {
 }
 
 #[test]
+fn phantom_dependency_fallback_selects_highest_locked_version() {
+    let proj = unique_dir("phantom");
+    let cache = Arc::new(Cache::with_root(proj.join("cache")));
+    let owner_hash = cache
+        .store(&archive(&[
+            (
+                "package.json",
+                br#"{"name":"owner","version":"1.0.0","exports":"./index.js","type":"module","dependencies":{"dep":"1.0.0"}}"#,
+            ),
+            ("index.js", b"export const owner = true;\n"),
+        ]))
+        .expect("store owner");
+    let dep1_hash = cache
+        .store(&archive(&[
+            (
+                "package.json",
+                br#"{"name":"dep","version":"1.0.0","exports":"./index.js","type":"module"}"#,
+            ),
+            ("index.js", b"export const version = 'dep-1';\n"),
+        ]))
+        .expect("store dep1");
+    let dep2_hash = cache
+        .store(&archive(&[
+            (
+                "package.json",
+                br#"{"name":"dep","version":"2.0.0","exports":"./index.js","type":"module"}"#,
+            ),
+            ("index.js", b"export const version = 'dep-2';\n"),
+        ]))
+        .expect("store dep2");
+    let phantom1_hash = cache
+        .store(&archive(&[
+            (
+                "package.json",
+                br#"{"name":"phantom","version":"1.0.0","exports":"./index.js","type":"module"}"#,
+            ),
+            ("index.js", b"export const version = 'phantom-1';\n"),
+        ]))
+        .expect("store phantom1");
+    let phantom2_hash = cache
+        .store(&archive(&[
+            (
+                "package.json",
+                br#"{"name":"phantom","version":"2.0.0","exports":"./index.js","type":"module"}"#,
+            ),
+            ("index.js", b"export const version = 'phantom-2';\n"),
+        ]))
+        .expect("store phantom2");
+
+    let mut lockfile = Lockfile::new();
+    lockfile.upsert(lock_entry("dep", "1.0.0", dep1_hash.clone(), &[]));
+    lockfile.upsert(lock_entry("dep", "2.0.0", dep2_hash.clone(), &[]));
+    lockfile.upsert(lock_entry(
+        "owner",
+        "1.0.0",
+        owner_hash.clone(),
+        &[("dep", "1.0.0")],
+    ));
+    lockfile.upsert(lock_entry("phantom", "1.0.0", phantom1_hash, &[]));
+    lockfile.upsert(lock_entry("phantom", "2.0.0", phantom2_hash.clone(), &[]));
+    let resolver = resolver_with(&proj, cache, lockfile, root_deps(&[("owner", "1.0.0")]));
+    let owner_referrer = cache_url(&proj, &owner_hash, "index.js");
+
+    let (explicit_url, _) = resolver
+        .locate("dep", &owner_referrer)
+        .expect("explicit owner dependency resolves");
+    assert_eq!(explicit_url, cache_url(&proj, &dep1_hash, "index.js"));
+
+    let (phantom_url, _) = resolver
+        .locate("phantom", &owner_referrer)
+        .expect("phantom dependency fallback resolves");
+    assert_eq!(phantom_url, cache_url(&proj, &phantom2_hash, "index.js"));
+
+    let missing = resolver
+        .locate("missing", &owner_referrer)
+        .expect_err("missing phantom still errors");
+    assert!(matches!(
+        missing,
+        ResolveError::BareSpecifierNotInLockfile { .. }
+    ));
+
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[test]
+fn explicit_dependency_export_miss_can_rescue_with_highest_locked_version() {
+    let proj = unique_dir("phantom-export");
+    let cache = Arc::new(Cache::with_root(proj.join("cache")));
+    let owner_hash = cache
+        .store(&archive(&[
+            (
+                "package.json",
+                br#"{"name":"owner","version":"1.0.0","exports":"./index.js","type":"module","dependencies":{"helper":"1.0.0"}}"#,
+            ),
+            ("index.js", b"export const owner = true;\n"),
+        ]))
+        .expect("store owner");
+    let helper1_hash = cache
+        .store(&archive(&[
+            (
+                "package.json",
+                br#"{"name":"helper","version":"1.0.0","exports":{".":"./index.js"},"type":"module"}"#,
+            ),
+            ("index.js", b"export const root = 'helper-1';\n"),
+        ]))
+        .expect("store helper1");
+    let helper2_hash = cache
+        .store(&archive(&[
+            (
+                "package.json",
+                br#"{"name":"helper","version":"2.0.0","exports":{".":"./index.js","./markdown":"./markdown.js"},"type":"module"}"#,
+            ),
+            ("index.js", b"export const root = 'helper-2';\n"),
+            ("markdown.js", b"export const markdown = true;\n"),
+        ]))
+        .expect("store helper2");
+
+    let mut lockfile = Lockfile::new();
+    lockfile.upsert(lock_entry("helper", "1.0.0", helper1_hash.clone(), &[]));
+    lockfile.upsert(lock_entry("helper", "2.0.0", helper2_hash.clone(), &[]));
+    lockfile.upsert(lock_entry(
+        "owner",
+        "1.0.0",
+        owner_hash.clone(),
+        &[("helper", "1.0.0")],
+    ));
+    let resolver = resolver_with(&proj, cache, lockfile, root_deps(&[("owner", "1.0.0")]));
+    let owner_referrer = cache_url(&proj, &owner_hash, "index.js");
+
+    let (explicit_root_url, _) = resolver
+        .locate("helper", &owner_referrer)
+        .expect("explicit root dependency still wins");
+    assert_eq!(
+        explicit_root_url,
+        cache_url(&proj, &helper1_hash, "index.js")
+    );
+
+    let (rescued_subpath_url, _) = resolver
+        .locate("helper/markdown", &owner_referrer)
+        .expect("export miss rescues through highest locked version");
+    assert_eq!(
+        rescued_subpath_url,
+        cache_url(&proj, &helper2_hash, "markdown.js")
+    );
+
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[test]
+fn projected_pnpm_referrer_recovers_cached_owner_for_package_imports() {
+    let proj = unique_dir("projected-owner");
+    let cache = Arc::new(Cache::with_root(proj.join("cache")));
+    let starlight_hash = cache
+        .store(&archive(&[
+            (
+                "package.json",
+                br##"{"name":"@astrojs/starlight","version":"0.39.3","type":"module","exports":"./index.js","imports":{"#import-plugin":"./integrations/import-plugin.js"}}"##,
+            ),
+            ("index.js", b"export const starlight = true;\n"),
+            ("integrations/remark-rehype.js", b"import plugin from '#import-plugin';\nexport default plugin;\n"),
+            ("integrations/import-plugin.js", b"export default function plugin() {}\n"),
+        ]))
+        .expect("store starlight");
+
+    let mut lockfile = Lockfile::new();
+    lockfile.upsert(lock_entry(
+        "@astrojs/starlight",
+        "0.39.3",
+        starlight_hash.clone(),
+        &[],
+    ));
+    let resolver = resolver_with(
+        &proj,
+        cache,
+        lockfile,
+        root_deps(&[("@astrojs/starlight", "0.39.3")]),
+    );
+    let projected_root = proj
+        .join("node_modules")
+        .join(".pnpm")
+        .join("@astrojs+starlight@0.39.3_astro@6.4.8")
+        .join("node_modules")
+        .join("@astrojs")
+        .join("starlight");
+    std::fs::create_dir_all(projected_root.join("integrations")).expect("create projected tree");
+    std::fs::write(
+        projected_root.join("package.json"),
+        br##"{"name":"@astrojs/starlight","version":"0.39.3","type":"module","exports":"./index.js","imports":{"#import-plugin":"./integrations/import-plugin.js"}}"##,
+    )
+    .expect("write projected manifest");
+    std::fs::write(
+        projected_root.join("integrations/remark-rehype.js"),
+        b"import plugin from '#import-plugin';\nexport default plugin;\n",
+    )
+    .expect("write projected referrer");
+
+    let referrer = Url::from_file_path(projected_root.join("integrations/remark-rehype.js"))
+        .expect("projected referrer URL");
+    let (url, locator) = resolver
+        .locate("#import-plugin", &referrer)
+        .expect("package import resolves against projected package owner");
+    assert_eq!(
+        url,
+        cache_url(&proj, &starlight_hash, "integrations/import-plugin.js")
+    );
+    assert!(matches!(
+        locator,
+        ModuleLocator::Cached { package, member }
+            if package == starlight_hash && member == "integrations/import-plugin.js"
+    ));
+
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[test]
+fn projected_path_prefers_exact_pnpm_entry_over_stale_top_level_alias() {
+    let proj = unique_dir("pnpm-projection");
+    let cache = Arc::new(Cache::with_root(proj.join("cache")));
+    let workerd_hash = cache
+        .store(&archive(&[
+            (
+                "package.json",
+                br#"{"name":"workerd","version":"1.20260623.1","main":"lib/main.js"}"#,
+            ),
+            ("lib/main.js", b"module.exports = 'fresh';\n"),
+        ]))
+        .expect("store workerd");
+
+    let mut lockfile = Lockfile::new();
+    lockfile.upsert(lock_entry(
+        "workerd",
+        "1.20260623.1",
+        workerd_hash.clone(),
+        &[],
+    ));
+    let resolver = resolver_with(
+        &proj,
+        cache,
+        lockfile,
+        root_deps(&[("workerd", "1.20260623.1")]),
+    );
+
+    let stale_root = proj.join("node_modules").join("workerd");
+    std::fs::create_dir_all(stale_root.join("lib")).expect("create stale alias");
+    std::fs::write(
+        stale_root.join("package.json"),
+        br#"{"name":"workerd","version":"1.20260609.1","main":"lib/main.js"}"#,
+    )
+    .expect("write stale manifest");
+    std::fs::write(
+        stale_root.join("lib/main.js"),
+        b"module.exports = 'stale';\n",
+    )
+    .expect("write stale main");
+
+    let pnpm_root = proj
+        .join("node_modules")
+        .join(".pnpm")
+        .join("workerd@1.20260623.1")
+        .join("node_modules")
+        .join("workerd");
+    std::fs::create_dir_all(pnpm_root.join("lib")).expect("create pnpm package");
+    std::fs::write(
+        pnpm_root.join("package.json"),
+        br#"{"name":"workerd","version":"1.20260623.1","main":"lib/main.js"}"#,
+    )
+    .expect("write pnpm manifest");
+    std::fs::write(
+        pnpm_root.join("lib/main.js"),
+        b"module.exports = 'fresh';\n",
+    )
+    .expect("write pnpm main");
+
+    let projected = resolver
+        .projected_path_for(&ModuleLocator::Cached {
+            package: workerd_hash,
+            member: "lib/main.js".to_owned(),
+        })
+        .expect("exact pnpm projection exists");
+    assert_eq!(projected, pnpm_root.join("lib/main.js"));
+
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[test]
 fn legacy_main_extensionless_json_and_cjs_boundary_work_end_to_end() {
     let proj = unique_dir("formats");
     let cache = Arc::new(Cache::with_root(proj.join("cache")));
@@ -464,6 +747,41 @@ fn legacy_main_extensionless_json_and_cjs_boundary_work_end_to_end() {
         !proj.join("node_modules").exists(),
         "no node_modules is created"
     );
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[test]
+fn legacy_package_module_field_is_import_only_entrypoint() {
+    let proj = unique_dir("legacy-module-field");
+    let cache = Arc::new(Cache::with_root(proj.join("cache")));
+    let dual_hash = cache
+        .store(&archive(&[
+            (
+                "package.json",
+                br#"{"name":"dual","version":"1.0.0","main":"./cjs/index.cjs","module":"./esm/index.js","type":"module"}"#,
+            ),
+            ("cjs/index.cjs", b"module.exports = { AttributeAction: 'cjs' };\n"),
+            ("esm/index.js", b"export const AttributeAction = 'esm';\n"),
+        ]))
+        .expect("store dual package");
+
+    let mut lockfile = Lockfile::new();
+    lockfile.upsert(lock_entry("dual", "1.0.0", dual_hash.clone(), &[]));
+    let resolver = resolver_with(&proj, cache, lockfile, root_deps(&[("dual", "1.0.0")]));
+    let referrer = Url::from_file_path(proj.join("main.ts")).expect("referrer URL");
+
+    let imported = resolver
+        .resolve("dual", &referrer)
+        .expect("import resolves");
+    assert_eq!(imported.url, cache_url(&proj, &dual_hash, "esm/index.js"));
+    assert_eq!(imported.kind, ModuleKind::Esm);
+
+    let required = resolver
+        .resolve_require("dual", &referrer)
+        .expect("require resolves");
+    assert_eq!(required.url, cache_url(&proj, &dual_hash, "cjs/index.cjs"));
+    assert_eq!(required.kind, ModuleKind::Cjs);
+
     std::fs::remove_dir_all(&proj).ok();
 }
 

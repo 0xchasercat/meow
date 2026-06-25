@@ -56,14 +56,14 @@ async fn meow_ui_import_emits_enveloped_lines() {
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let mut runtime = Runtime::new(RuntimeOptions {
-            module_loader: loader,
-            extensions: vec![sink_ext, ui_extension()],
-max_heap_size: None,
-            startup_snapshot: None,
-            residual_lazy_js_sources: &[],
-            residual_lazy_esm_sources: &[],
-        })
-        .expect("runtime initializes");
+        module_loader: loader,
+        extensions: vec![sink_ext, ui_extension()],
+        max_heap_size: None,
+        startup_snapshot: None,
+        residual_lazy_js_sources: &[],
+        residual_lazy_esm_sources: &[],
+    })
+    .expect("runtime initializes");
     let spec = ModuleSpecifier::from_file_path(root.join("main.mjs")).expect("main specifier");
     runtime
         .run_main_module_from_source(
