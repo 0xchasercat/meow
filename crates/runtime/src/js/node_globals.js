@@ -71,6 +71,38 @@ Object.defineProperty(globalThis, "process", {
   configurable: true,
 });
 
+const meowProcessEnvProxyTag = Symbol.for("meow.process.env.proxy");
+function meowNormalizeEnvValue(value) {
+  return value === null ? undefined : value;
+}
+function meowInstallProcessEnv() {
+  if (!processValue || typeof processValue !== "object") return;
+  const envTarget = processValue.env;
+  if (!envTarget || typeof envTarget !== "object" || envTarget[meowProcessEnvProxyTag]) return;
+  const proxy = new Proxy(envTarget, {
+    get(target, prop, receiver) {
+      if (prop === meowProcessEnvProxyTag) return true;
+      if (typeof prop !== "string") return Reflect.get(target, prop, receiver);
+      return meowNormalizeEnvValue(Reflect.get(target, prop, receiver));
+    },
+    getOwnPropertyDescriptor(target, prop) {
+      const descriptor = Reflect.getOwnPropertyDescriptor(target, prop);
+      if (!descriptor) return descriptor;
+      if ("value" in descriptor) {
+        return { ...descriptor, value: meowNormalizeEnvValue(descriptor.value) };
+      }
+      return descriptor;
+    },
+  });
+  Object.defineProperty(processValue, "env", {
+    value: proxy,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
+}
+meowInstallProcessEnv();
+
 // === CLEAN-003 env overlay ===
 // CJS now runs through Deno's node:module (the synthetic cjs.ts bridge was
 // deleted). cjs.ts used to overlay meow's bootstrap env onto process.env; port
@@ -351,7 +383,7 @@ if (globalThis.Deno) {
       get(key) {
         const k = String(key);
         if (k in overlay) return overlay[k] === null ? undefined : overlay[k];
-        return liveGet(k);
+        return meowNormalizeEnvValue(liveGet(k));
       },
       set(key, value) {
         overlay[String(key)] = String(value);
@@ -586,6 +618,7 @@ function meowApplyDenoNamespace(info) {
       }
     }
   }
+  meowInstallProcessEnv();
 }
 
 function meowRunNodeBootstrap(info, warmup) {

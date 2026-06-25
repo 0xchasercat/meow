@@ -8,7 +8,7 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -51,6 +51,9 @@ pub struct Cli {
 }
 
 pub fn normalize_argv(mut argv: Vec<OsString>) -> Vec<OsString> {
+    if invoked_as_node(argv.first()) {
+        return normalize_node_argv(argv);
+    }
     if argv.len() <= 1 {
         return argv;
     }
@@ -74,6 +77,55 @@ pub fn normalize_argv(mut argv: Vec<OsString>) -> Vec<OsString> {
         index += 1;
     }
     out.extend(argv.into_iter().skip(index));
+    out
+}
+
+fn invoked_as_node(argv0: Option<&OsString>) -> bool {
+    argv0
+        .and_then(|arg| Path::new(arg).file_name())
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name == "node" || name == "node.exe")
+}
+
+fn normalize_node_argv(argv: Vec<OsString>) -> Vec<OsString> {
+    let mut out = Vec::with_capacity(argv.len() + 2);
+    let mut iter = argv.into_iter();
+    out.push(iter.next().unwrap_or_else(|| OsString::from("node")));
+    out.push(OsString::from("run"));
+
+    let mut pending_value_for: Option<OsString> = None;
+    let mut script_seen = false;
+    for arg in iter {
+        if pending_value_for.take().is_some() {
+            continue;
+        }
+        if !script_seen {
+            let raw = arg.to_string_lossy();
+            if raw == "-e" || raw == "--eval" || raw == "-p" || raw == "--print" {
+                out.push(arg);
+                return out;
+            }
+            if raw == "-r" || raw == "--require" || raw == "--import" || raw == "--loader" {
+                pending_value_for = Some(arg);
+                continue;
+            }
+            if raw.starts_with("--require=")
+                || raw.starts_with("--import=")
+                || raw.starts_with("--loader=")
+            {
+                continue;
+            }
+            if raw.starts_with('-') {
+                continue;
+            }
+            out.push(arg);
+            out.push(OsString::from("--"));
+            script_seen = true;
+        } else {
+            out.push(arg);
+        }
+    }
+
     out
 }
 
@@ -1390,9 +1442,7 @@ fn run_flags(args: &RunArgs) -> RunFlagView<'_> {
         allow_clock: args.allow_clock,
         allow_random: args.allow_random,
         allow_env: &args.allow_env,
-        max_old_space_size: args
-            .max_old_space_size
-            .or_else(env_max_old_space_size),
+        max_old_space_size: args.max_old_space_size.or_else(env_max_old_space_size),
         no_snapshot: args.no_snapshot,
     }
 }
@@ -1403,9 +1453,7 @@ fn run_script_flags(args: &RunScriptArgs) -> RunFlagView<'_> {
         allow_clock: args.allow_clock,
         allow_random: args.allow_random,
         allow_env: &args.allow_env,
-        max_old_space_size: args
-            .max_old_space_size
-            .or_else(env_max_old_space_size),
+        max_old_space_size: args.max_old_space_size.or_else(env_max_old_space_size),
         no_snapshot: args.no_snapshot,
     }
 }
@@ -1643,7 +1691,7 @@ async fn execute_script_body(
     cli_argv: &[String],
     flags: RunFlagView<'_>,
 ) -> Result<ExitCode, RunCommandError> {
-    let env = lifecycle_env(event, script, &ctx.project_dir, init_cwd);
+    let env = lifecycle_env(event, script, &ctx.project_dir, init_cwd)?;
     match plan_script(ctx, script, cli_argv)? {
         PlannedScript::Native(request) => run_native_request(&request, flags, env).await,
         PlannedScript::Shell { script, argv } => {
@@ -1856,6 +1904,7 @@ async fn run_native_request(
             "x86_64" => "x64".to_owned(),
             other => other.to_owned(),
         });
+    install_node_shim_env(&mut env)?;
     let ctx = build_runtime_context(&request.project_dir)?;
     let resolver = meow_loader::Resolver::from_resolution(
         &ctx.graph,
@@ -2126,9 +2175,8 @@ fn resolve_package_bin(
                 target: member,
             });
         }
-        let spec = Url::from_file_path(&bin_path).map_err(|()| {
-            RunCommandError::InvalidEntryPath(bin_path.display().to_string())
-        })?;
+        let spec = Url::from_file_path(&bin_path)
+            .map_err(|()| RunCommandError::InvalidEntryPath(bin_path.display().to_string()))?;
         matches.push((name.to_string(), spec, bin_path));
     }
 
@@ -2280,7 +2328,7 @@ fn lifecycle_env(
     script: &str,
     project_dir: &Path,
     init_cwd: &Path,
-) -> BTreeMap<String, String> {
+) -> Result<BTreeMap<String, String>, RunCommandError> {
     let mut env = BTreeMap::new();
     env.insert(
         "INIT_CWD".to_owned(),
@@ -2295,7 +2343,88 @@ fn lifecycle_env(
             .to_string_lossy()
             .into_owned(),
     );
-    env
+    install_node_shim_env(&mut env)?;
+    Ok(env)
+}
+
+fn install_node_shim_env(env: &mut BTreeMap<String, String>) -> Result<(), RunCommandError> {
+    let exe = std::env::current_exe().map_err(|source| {
+        RunCommandError::Message(format!("cannot resolve current executable: {source}"))
+    })?;
+    let home = crate::host::host_home();
+    let shim_dir = home.join(".meow").join("bin");
+    std::fs::create_dir_all(&shim_dir).map_err(|source| {
+        RunCommandError::Message(format!(
+            "cannot create node shim directory {}: {source}",
+            shim_dir.display()
+        ))
+    })?;
+    let shim_path = shim_dir.join(if cfg!(windows) { "node.exe" } else { "node" });
+    install_node_shim(&exe, &shim_path)?;
+
+    env.insert(
+        "npm_node_execpath".to_owned(),
+        shim_path.to_string_lossy().into_owned(),
+    );
+    env.insert("NODE".to_owned(), shim_path.to_string_lossy().into_owned());
+
+    let current_path = env
+        .get("PATH")
+        .cloned()
+        .or_else(|| std::env::var("PATH").ok())
+        .unwrap_or_default();
+    let mut paths = std::env::split_paths(&current_path).collect::<Vec<_>>();
+    if paths.first() != Some(&shim_dir) {
+        paths.retain(|path| path != &shim_dir);
+        paths.insert(0, shim_dir);
+    }
+    let joined = std::env::join_paths(paths).map_err(|source| {
+        RunCommandError::Message(format!("cannot construct PATH for node shim: {source}"))
+    })?;
+    env.insert("PATH".to_owned(), joined.to_string_lossy().into_owned());
+    Ok(())
+}
+
+#[cfg(unix)]
+fn install_node_shim(exe: &Path, shim_path: &Path) -> Result<(), RunCommandError> {
+    use std::os::unix::fs::symlink;
+
+    match std::fs::read_link(shim_path) {
+        Ok(target) if target == exe => return Ok(()),
+        Ok(_) => std::fs::remove_file(shim_path).map_err(|source| {
+            RunCommandError::Message(format!(
+                "cannot replace node shim {}: {source}",
+                shim_path.display()
+            ))
+        })?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {
+            std::fs::remove_file(shim_path).map_err(|source| {
+                RunCommandError::Message(format!(
+                    "cannot replace node shim {}: {source}",
+                    shim_path.display()
+                ))
+            })?;
+        }
+    }
+    symlink(exe, shim_path).map_err(|source| {
+        RunCommandError::Message(format!(
+            "cannot install node shim {} -> {}: {source}",
+            shim_path.display(),
+            exe.display()
+        ))
+    })
+}
+
+#[cfg(windows)]
+fn install_node_shim(exe: &Path, shim_path: &Path) -> Result<(), RunCommandError> {
+    std::fs::copy(exe, shim_path).map(|_| ()).map_err(|source| {
+        RunCommandError::Message(format!(
+            "cannot install node shim {} from {}: {source}",
+            shim_path.display(),
+            exe.display()
+        ))
+    })
 }
 
 fn run_shell_command(
@@ -2563,8 +2692,52 @@ mod tests {
             vec![
                 OsString::from("meow"),
                 OsString::from("run"),
-                OsString::from("/Users/me/.meow/cache/unpacked/sha512-abc/dist/server/start-server.js"),
+                OsString::from(
+                    "/Users/me/.meow/cache/unpacked/sha512-abc/dist/server/start-server.js"
+                ),
                 OsString::from("--flag"),
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_argv_maps_node_shim_script_to_run_with_trailing_args() {
+        let argv = normalize_argv(vec![
+            OsString::from("/Users/me/.meow/bin/node"),
+            OsString::from("/Users/me/project/node_modules/next/dist/compiled/turbopack/worker.js"),
+            OsString::from("56556"),
+        ]);
+        assert_eq!(
+            argv,
+            vec![
+                OsString::from("/Users/me/.meow/bin/node"),
+                OsString::from("run"),
+                OsString::from(
+                    "/Users/me/project/node_modules/next/dist/compiled/turbopack/worker.js"
+                ),
+                OsString::from("--"),
+                OsString::from("56556"),
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_argv_maps_node_shim_after_preload_flags() {
+        let argv = normalize_argv(vec![
+            OsString::from("node"),
+            OsString::from("--require"),
+            OsString::from("source-map-support/register"),
+            OsString::from("worker.js"),
+            OsString::from("56556"),
+        ]);
+        assert_eq!(
+            argv,
+            vec![
+                OsString::from("node"),
+                OsString::from("run"),
+                OsString::from("worker.js"),
+                OsString::from("--"),
+                OsString::from("56556"),
             ]
         );
     }
@@ -2583,7 +2756,9 @@ mod tests {
             vec![
                 OsString::from("meow"),
                 OsString::from("run"),
-                OsString::from("/Users/me/.meow/cache/unpacked/sha512-abc/dist/server/start-server.js"),
+                OsString::from(
+                    "/Users/me/.meow/cache/unpacked/sha512-abc/dist/server/start-server.js"
+                ),
             ]
         );
     }
