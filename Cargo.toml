@@ -76,6 +76,9 @@ rustc-hash = "2"
 # incremental layer is hand-built behind GraphDb (see crates/graph/src/db.rs). A swap to
 # salsa later is contained behind the facade. oxc_transformer remains deferred; TOOL-001
 # pins oxc_codegen below for printing from this same AST generation.
+# === ADR-5 === tsc output parsing for meow-ui diagnostic rendering
+regex = "1"
+# === /ADR-5 ===
 # === /GRAPH-001 ===
 # === TOOL-001 ===
 oxc_codegen = "0.134"

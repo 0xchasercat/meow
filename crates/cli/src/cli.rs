@@ -211,8 +211,6 @@ fn is_known_command(arg: &str) -> bool {
             | "why-slow"
             | "why-large"
             | "why-dep"
-            | "trace"
-            | "profile"
             | "doctor"
             | "sync"
             | "types"
@@ -227,6 +225,10 @@ fn is_deno_run_compat_flag(arg: &str) -> bool {
 pub enum Command {
     /// Execute a file or a package.json script (default mode = node-compat; `strict-web` is opt-in).
     Run(RunArgs),
+    /// Ephemeral package execution (npx/bunx equivalent): installs the named package
+    /// into a transient workspace, runs its binary, and discards the workspace.
+    #[command(alias = "execute")]
+    X(XArgs),
     /// Internal node-shim eval/print mode.
     #[command(name = "node-eval", hide = true)]
     NodeEval(NodeEvalArgs),
@@ -260,10 +262,6 @@ pub enum Command {
     /// Dependency provenance / paths.
     #[command(name = "why-dep")]
     WhyDep(WhyDepArgs),
-    /// Execution trace.
-    Trace(RunArgs),
-    /// Sampling/allocation profile.
-    Profile(RunArgs),
     /// Environment / config / lockfile health.
     Doctor,
     /// Regenerate shadow configs (.meow/tsconfig.json + root tsconfig.json shim).
@@ -335,6 +333,36 @@ pub struct RunScriptArgs {
     pub no_snapshot: bool,
 }
 // === /RUN-001 ===
+
+// === EPHEMERAL-X ===
+/// Arguments for `meow x <package> [-- <args>]`.
+#[derive(Debug, Args)]
+pub struct XArgs {
+    /// Package to download + execute ephemerally (e.g. `create-vite@latest`).
+    pub package: String,
+    /// Arguments forwarded to the package's binary.
+    #[arg(last = true)]
+    pub argv: Vec<String>,
+    // === RT-006 ===
+    /// Expose the real system clock + monotonic time.
+    #[arg(long)]
+    pub allow_clock: bool,
+    /// Use OS entropy for `Math.random` + `crypto.getRandomValues`.
+    #[arg(long)]
+    pub allow_random: bool,
+    /// Expose host env vars.
+    #[arg(long, value_name = "NAMES", num_args = 0..=1, require_equals = true, default_missing_value = "")]
+    pub allow_env: Option<String>,
+    // === /RT-006 ===
+    /// Set the V8 heap limit in MiB.
+    #[arg(long, value_name = "MiB")]
+    pub max_old_space_size: Option<usize>,
+    /// Disable the V8 startup snapshot.
+    #[arg(long, hide = true)]
+    pub no_snapshot: bool,
+}
+// === /EPHEMERAL-X ===
+
 #[derive(Debug, Args)]
 pub struct InstallArgs {
     /// Install projection mode (CANON §18; PKG owns the final flag surface).
@@ -454,16 +482,15 @@ impl Command {
             | Command::WhyDep(_)
             | Command::Fmt(_)
             | Command::Lint(_)
-            | Command::Bundle(_) => "",
+            | Command::Bundle(_)
+            | Command::Check(_)
+            | Command::Test(_)
+            | Command::X(_)
+            | Command::Task(_)
+            | Command::WhyLarge(_)
+            | Command::WhySlow(_) => "",
             Command::Add(_) => "add",
             Command::Remove(_) => "remove",
-            Command::Task(_) => "task",
-            Command::Test(_) => "test",
-            Command::Check(_) => "check",
-            Command::WhySlow(_) => "why-slow",
-            Command::WhyLarge(_) => "why-large",
-            Command::Trace(_) => "trace",
-            Command::Profile(_) => "profile",
             Command::Doctor => "doctor",
         }
     }
@@ -485,6 +512,15 @@ impl Cli {
             // === RT-005 ===
             Command::Types(args) => cmd_types(&args),
             // === /RT-005 ===
+            // === ADR-5 ===
+            Command::Check(args) => cmd_check(&args),
+            // === /ADR-5 ===
+            // === TEST-001 ===
+            Command::Test(args) => cmd_test(&args),
+            // === /TEST-001 ===
+            // === TASK-001 ===
+            Command::Task(args) => cmd_task(&args),
+            // === /TASK-001 ===
             // === RUN-001 ===
             Command::Dev(args) => cmd_dev(&args),
             // === /RUN-001 ===
@@ -500,6 +536,15 @@ impl Cli {
             // === OBS-001 ===
             Command::WhyDep(args) => cmd_why_dep(&args),
             // === /OBS-001 ===
+            // === WHY-LARGE ===
+            Command::WhyLarge(args) => cmd_why_large(&args),
+            // === /WHY-LARGE ===
+            // === WHY-SLOW ===
+            Command::WhySlow(args) => cmd_why_slow(&args),
+            // === /WHY-SLOW ===
+            // === EPHEMERAL-X ===
+            Command::X(args) => cmd_x(&args),
+            // === /EPHEMERAL-X ===
             Command::Doctor => cmd_doctor(),
             other => {
                 let verb = other.landing();
@@ -697,15 +742,63 @@ fn cmd_bundle(args: &BundleArgs) -> ExitCode {
         }
     };
 
-    match meow_tool::plan_bundle(&root, &args.entries, args.out.clone()) {
-        Ok(_plan) => purr("meow bundle: resolver wiring is pending"),
+    // Validate entries + determine output directory
+    let plan = match meow_tool::plan_bundle(&root, &args.entries, args.out.clone()) {
+        Ok(plan) => plan,
         Err(err) => {
             hiss(&format!("meow bundle: {err}"));
             return ExitCode::FAILURE;
         }
     };
 
-    ExitCode::SUCCESS
+    let out_dir = plan
+        .out
+        .clone()
+        .unwrap_or_else(|| root.join("dist"));
+
+    // Build a resolver from the project context
+    let async_rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(err) => {
+            hiss(&format!("meow bundle: cannot start async runtime: {err}"));
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let result: Result<Vec<PathBuf>, String> = async_rt.block_on(async {
+        let ctx = build_runtime_context(&root, false).map_err(|e| e.to_string())?;
+        let resolver = meow_loader::Resolver::from_resolution(
+            &ctx.graph,
+            ctx.cache.clone(),
+            ctx.project_root.clone(),
+            meow_runtime::native::native_module_registry(),
+        );
+        meow_tool::bundle_entries(&resolver, &root, &plan.entries, &out_dir)
+            .map_err(|e| e.to_string())
+    });
+
+    match result {
+        Ok(files) => {
+            let file_list: Vec<String> = files
+                .iter()
+                .map(|f| f.to_string_lossy().into_owned())
+                .collect();
+            purr(&format!(
+                "meow bundle: wrote {} file{} — {}",
+                files.len(),
+                if files.len() == 1 { "" } else { "s" },
+                file_list.join(", "),
+            ));
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            hiss(&format!("meow bundle: {err}"));
+            ExitCode::FAILURE
+        }
+    }
 }
 // === /TOOL-001 ===
 
@@ -3305,6 +3398,822 @@ fn command_catalog() -> Vec<meow_ui::CommandGroup<'static>> {
             ],
         },
     ]
+}
+
+// === ADR-5 ===
+/// `meow check` — delegate to tsc over the shadow config and render diagnostics
+/// through meow-ui. The shadow tsconfig is generated by `meow sync`.
+fn cmd_check(args: &PathArgs) -> ExitCode {
+    let cwd = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            hiss(&format!(
+                "meow check: cannot resolve the current directory: {err}"
+            ));
+            return ExitCode::FAILURE;
+        }
+    };
+    let root = find_project_root(&cwd);
+    let shadow_tsconfig = root.join(".meow/tsconfig.json");
+
+    if !shadow_tsconfig.exists() {
+        hiss("meow check: no .meow/tsconfig.json found — run `meow sync` first");
+        return ExitCode::FAILURE;
+    }
+
+    let tsc = find_tsc(&root);
+    let tsc = match tsc {
+        Some(path) => path,
+        None => {
+            hiss("meow check: tsc not found — install TypeScript (`npm install -D typescript`) or run `meow sync` if you already have it");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let targets: Vec<String> = if args.paths.is_empty() {
+        Vec::new()
+    } else {
+        args.paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect()
+    };
+
+    let mut cmd = std::process::Command::new(&tsc);
+    cmd.arg("--project")
+        .arg(&shadow_tsconfig)
+        .arg("--noEmit")
+        .arg("--pretty")
+        .arg("false");
+    for target in &targets {
+        cmd.arg(target);
+    }
+
+    let output = match cmd.output() {
+        Ok(output) => output,
+        Err(err) => {
+            hiss(&format!("meow check: failed to run tsc: {err}"));
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = if stderr.is_empty() { &stdout } else { &stderr };
+
+    let errors = parse_tsc_diagnostics(combined);
+
+    if errors.is_empty() && output.status.success() {
+        purr("meow check: no type errors");
+        return ExitCode::SUCCESS;
+    }
+
+    for diag in &errors {
+        let source = match std::fs::read_to_string(&diag.file_path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // Convert 1-based line/col to byte offset
+        let span = line_col_to_span(&source, diag.line, diag.col);
+        ui().diagnostic(&meow_ui::diagnostic::SourceDiagnostic {
+            path: diag.file_path.to_str().unwrap_or("<unknown>"),
+            source: &source,
+            span,
+            message: &diag.message,
+            label: Some(&diag.code),
+            help: None,
+            note: None,
+        });
+    }
+
+    if errors.len() == 1 {
+        hiss("meow check: found 1 type error");
+    } else {
+        hiss(&format!("meow check: found {} type errors", errors.len()));
+    }
+    ExitCode::FAILURE
+}
+
+struct TscDiagnostic {
+    file_path: std::path::PathBuf,
+    line: usize,
+    col: usize,
+    code: String,
+    message: String,
+}
+
+/// Parse tsc's --pretty false output: `file(line,col): error TS{code}: {message}`
+fn parse_tsc_diagnostics(output: &str) -> Vec<TscDiagnostic> {
+    let re = regex::Regex::new(
+        r"^(.+)\((\d+),(\d+)\):\s+(error|warning)\s+(TS\d+):\s+(.+)$",
+    )
+    .expect("valid tsc diagnostic regex");
+    let mut diagnostics = Vec::new();
+    for line in output.lines() {
+        if let Some(caps) = re.captures(line) {
+            let file_path = std::path::PathBuf::from(caps.get(1).unwrap().as_str());
+            let line: usize = caps.get(2).unwrap().as_str().parse().unwrap_or(0);
+            let col: usize = caps.get(3).unwrap().as_str().parse().unwrap_or(0);
+            let code = caps.get(5).unwrap().as_str().to_string();
+            let message = caps.get(6).unwrap().as_str().to_string();
+            diagnostics.push(TscDiagnostic {
+                file_path,
+                line,
+                col,
+                code,
+                message,
+            });
+        }
+    }
+    diagnostics
+}
+
+/// Convert a 1-based line/column to a byte offset (start, end) span.
+/// The end is estimated as the end of the line.
+fn line_col_to_span(source: &str, line: usize, col: usize) -> (usize, usize) {
+    let mut current_line = 1usize;
+    let mut line_start = 0usize;
+    for (idx, ch) in source.char_indices() {
+        if current_line == line {
+            let start = (line_start + col.saturating_sub(1)).min(source.len());
+            // Find end of the line for the span
+            let end = source[start..]
+                .find('\n')
+                .map(|rel| start + rel)
+                .unwrap_or(source.len());
+            return (start, end);
+        }
+        if ch == '\n' {
+            current_line += 1;
+            line_start = idx + 1;
+        }
+    }
+    // Fallback: if line is past the end, return (0, 0)
+    if current_line == line {
+        let start = (line_start + col.saturating_sub(1)).min(source.len());
+        return (start, source.len());
+    }
+    (0, 0)
+}
+
+/// Find the tsc binary: check node_modules/.bin/tsc, then PATH.
+fn find_tsc(project_root: &std::path::Path) -> Option<std::path::PathBuf> {
+    let local = project_root.join("node_modules/.bin/tsc");
+    if local.is_file() {
+        return Some(local);
+    }
+    let local_exe = project_root.join("node_modules/.bin/tsc.cmd");
+    if local_exe.is_file() {
+        return Some(local_exe);
+    }
+    // Fall back to PATH lookup
+    std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path).find_map(|dir| {
+                let candidate = dir.join("tsc");
+                if candidate.is_file() {
+                    Some(candidate)
+                } else {
+                    let candidate_exe = dir.join("tsc.exe");
+                    if candidate_exe.is_file() {
+                        Some(candidate_exe)
+                    } else {
+                        None
+                    }
+                }
+            })
+        })
+}
+
+// === TEST-001 ===
+// === TASK-001 ===
+/// `meow task <name>` — run a package.json script by name. Delegates to the same
+/// script resolution as `meow run`.
+fn cmd_task(args: &TaskArgs) -> ExitCode {
+    let flags = RunFlagView {
+        argv: &args.argv,
+        allow_clock: false,
+        allow_random: false,
+        allow_env: &None,
+        max_old_space_size: None,
+        no_snapshot: false,
+    };
+    cmd_run_inner("task", &args.name, flags)
+}
+
+/// `meow test` — discover test files, execute each through a hermetic isolate,
+/// and render results through meow-ui. Tests import from `meow:test` for the
+/// test/expect API.
+fn cmd_test(_args: &TestArgs) -> ExitCode {
+    let cwd = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            hiss(&format!(
+                "meow test: cannot resolve the current directory: {err}"
+            ));
+            return ExitCode::FAILURE;
+        }
+    };
+    // Use cwd for test discovery — find_project_root may walk past project boundaries
+    // when no meow.config.json or package.json exists in the project tree.
+    let root = cwd.clone();
+
+    let test_files = discover_test_files(&root);
+    if test_files.is_empty() {
+        purr("meow test: no test files found");
+        return ExitCode::SUCCESS;
+    }
+
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(err) => {
+            hiss(&format!("meow test: cannot start async runtime: {err}"));
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let test_count = test_files.len();
+    let mut total_passed = 0usize;
+    let mut total_failed = 0usize;
+
+    for file in &test_files {
+        let display = file.strip_prefix(&root).unwrap_or(file).display();
+        let label = display.to_string();
+        ui().pounce(&label);
+
+        match runtime.block_on(run_test_file_inner(&root, file)) {
+            Ok(results) => {
+                for result in &results {
+                    let name = result["name"].as_str().unwrap_or("<unknown>");
+                    let passed = result["passed"].as_bool().unwrap_or(false);
+                    if passed {
+                        total_passed += 1;
+                        ui().purr(&format!("  ✓ {name}"));
+                    } else {
+                        total_failed += 1;
+                        let msg = result["error"].as_str().unwrap_or("unknown error");
+                        ui().hiss(&format!("  ✗ {name}"));
+                        if let Some(stack) = result["stack"].as_str() {
+                            let first_line = stack.lines().next().unwrap_or(msg);
+                            ui().hiss(&format!("    {first_line}"));
+                        } else {
+                            ui().hiss(&format!("    {msg}"));
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                total_failed += 1;
+                ui().hiss(&format!("  ✗ {} — file error: {err}", file.display()));
+            }
+        }
+    }
+
+    let summary = if total_failed == 0 {
+        format!(
+            "{} passed · {} file{}",
+            total_passed,
+            test_count,
+            if test_count == 1 { "" } else { "s" },
+        )
+    } else {
+        format!(
+            "{} passed, {} failed · {} file{}",
+            total_passed,
+            total_failed,
+            test_count,
+            if test_count == 1 { "" } else { "s" },
+        )
+    };
+
+    let u = ui();
+    let tone = if total_failed == 0 {
+        meow_ui::Tone::Purr
+    } else {
+        meow_ui::Tone::Hiss
+    };
+    let lines = vec![u.sigil(tone, &summary)];
+    u.panel("meow test", &lines);
+
+    if total_failed == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+async fn run_test_file_inner(root: &Path, file: &Path) -> Result<Vec<serde_json::Value>, String> {
+    let ctx = build_runtime_context(root, false).map_err(|e| e.to_string())?;
+    let resolver = meow_loader::Resolver::from_resolution(
+        &ctx.graph,
+        ctx.cache.clone(),
+        ctx.project_root.clone(),
+        meow_runtime::native::native_module_registry(),
+    );
+    let loader: std::rc::Rc<dyn meow_runtime::deno_core::ModuleLoader> =
+        std::rc::Rc::new(meow_loader::MeowModuleLoader::new(
+            resolver.clone(),
+            std::rc::Rc::new(std::cell::RefCell::new(meow_graph::GraphDb::new())),
+        ));
+    let deno_node_bridge: std::rc::Rc<dyn meow_runtime::node::DenoNodeBridge> =
+        std::rc::Rc::new(RuntimeNodeBridge::new(resolver.clone(), ctx.cache.clone()));
+    let deno_node_services =
+        meow_runtime::node::DenoNodeServicesBuilder::new(deno_node_bridge).build();
+
+    let caps: meow_runtime::web::NetCaps = std::sync::Arc::new(meow_runtime::AllowAll);
+    let mut extensions = Vec::new();
+    extensions.push(meow_runtime::http_extension());
+    extensions.push(meow_runtime::ui_extension());
+    extensions.push(meow_runtime::test_extension());
+    extensions.push(meow_loader::cjs_resolve_extension(resolver.clone()));
+
+    // Tests run with full hermetic by default (deterministic).
+    let hermetic = meow_runtime::hermetic::HermeticConfig::default();
+    meow_runtime::hermetic::pin_deterministic_intl(&hermetic);
+    extensions.extend(meow_runtime::hermetic::extensions(hermetic));
+
+    let node_argv = vec!["meow".to_owned(), file.to_string_lossy().into_owned()];
+    extensions.extend(meow_runtime::node::extensions(
+        meow_runtime::node::NodeOptions {
+            mode: meow_runtime::node::NodeMode::StrictWeb,
+            argv: node_argv,
+            main_module: Some(file.to_string_lossy().into_owned()),
+            cwd: root.to_path_buf(),
+            env: BTreeMap::new(),
+            deno_node_services: Some(deno_node_services),
+            caps: Some(caps),
+            user_agent: Some(format!("meow/{}", env!("CARGO_PKG_VERSION"))),
+        },
+    ));
+
+    let mut runtime = meow_runtime::Runtime::new(meow_runtime::RuntimeOptions {
+        module_loader: loader,
+        extensions,
+        max_heap_size: None,
+        startup_snapshot: Some(crate::SNAPSHOT_BLOB),
+        residual_lazy_js_sources: crate::RESIDUAL_LAZY_JS,
+        residual_lazy_esm_sources: crate::RESIDUAL_LAZY_ESM,
+    })
+    .map_err(|e| e.to_string())?;
+
+    let spec = meow_runtime::ModuleSpecifier::from_file_path(file)
+        .map_err(|()| format!("invalid test file path: {}", file.display()))?;
+
+    runtime
+        .run_main_module(&spec)
+        .await
+        .map_err(|e| format!("{}", e))?;
+
+    // After module evaluation, call the test runner. Results are stored in OpState
+    // via the op_test_store_results op.
+    runtime
+        .execute_script("meow:test/runner", String::from("globalThis.__meowTestRunAll()"))
+        .map_err(|e| format!("test runner error: {e}"))?;
+
+    let result_str = runtime
+        .take_test_results()
+        .ok_or_else(|| "no test results stored — did the test file call test()?".to_owned())?;
+
+    let entries: Vec<serde_json::Value> =
+        serde_json::from_str(&result_str).map_err(|e| format!("test results parse error: {e}"))?;
+
+    Ok(entries)
+}
+
+/// Discover test files in the project tree. Filters ignored directories at push time
+/// to avoid traversing into node_modules, target, .git, and hidden directories.
+fn discover_test_files(root: &Path) -> Vec<PathBuf> {
+    const TEST_EXTENSIONS: &[&str] = &["ts", "js", "tsx", "jsx", "mts", "mjs", "cts", "cjs"];
+    let mut files = Vec::new();
+    let mut queue = vec![root.to_path_buf()];
+
+    while let Some(dir) = queue.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let file_name = match path.file_name().and_then(|s| s.to_str()) {
+                Some(name) => name,
+                None => continue,
+            };
+            if path.is_dir() {
+                // Skip ignored directories before pushing
+                if !file_name.starts_with('.')
+                    && file_name != "node_modules"
+                    && file_name != "target"
+                    && file_name != "vendor"
+                {
+                    queue.push(path);
+                }
+            } else if path.is_file() {
+                let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+                if TEST_EXTENSIONS.contains(&ext)
+                    && (stem.ends_with(".test") || stem.ends_with(".spec"))
+                {
+                    files.push(path);
+                }
+            }
+        }
+    }
+
+    files.sort();
+    files
+}
+
+// === WHY-LARGE ===
+/// `meow why-large` — list packages in the lockfile sorted by cached size,
+/// so the user can see which dependencies are the heaviest.
+fn cmd_why_large(_args: &PathArgs) -> ExitCode {
+    let cwd = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            hiss(&format!(
+                "meow why-large: cannot resolve the current directory: {err}"
+            ));
+            return ExitCode::FAILURE;
+        }
+    };
+    let root = find_project_root(&cwd);
+    let lockfile = match load_lockfile(&root) {
+        Ok(lf) => lf,
+        Err(err) => {
+            hiss(&format!("meow why-large: {err}"));
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if lockfile.is_empty() {
+        purr("meow why-large: lockfile is empty");
+        return ExitCode::SUCCESS;
+    }
+
+    let cache = meow_pkg::Cache::in_home(crate::host::host_home());
+    let mut entries: Vec<(String, u64)> = Vec::new();
+
+    for entry in lockfile.iter() {
+        let path = cache.path_for(&entry.integrity);
+        let size = match std::fs::metadata(&path) {
+            Ok(meta) => meta.len(),
+            Err(_) => continue,
+        };
+        let label = format!("{}@{}", entry.name.as_str(), entry.version.as_str());
+        entries.push((label, size));
+    }
+
+    entries.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let total: u64 = entries.iter().map(|(_, s)| s).sum();
+    let u = ui();
+
+    let mut lines = vec![u.sigil(
+        meow_ui::Tone::Info,
+        &format!(
+            "{} packages · {} total",
+            entries.len(),
+            meow_ui::fmt::bytes(total),
+        ),
+    )];
+
+    // Show top packages
+    let max_show = entries.len().min(20);
+    for (label, size) in &entries[..max_show] {
+        let pct = if total > 0 {
+            (*size as f64 / total as f64 * 100.0) as u32
+        } else {
+            0
+        };
+        lines.push(format!(
+            "{}  {:>6}  {:>3}%",
+            u.stdout_caps().muted(&meow_ui::width::pad_end(label, 35)),
+            meow_ui::fmt::bytes(*size),
+            pct,
+        ));
+    }
+
+    if entries.len() > max_show {
+        lines.push(u.stdout_caps().muted(&format!(
+            "… {} more packages not shown",
+            entries.len() - max_show
+        )));
+    }
+
+    u.panel("meow why-large", &lines);
+    ExitCode::SUCCESS
+}
+
+// === WHY-SLOW ===
+/// `meow why-slow [target]` — measure and report cold-start timing: process
+/// init, module resolution, and total elapsed.
+fn cmd_why_slow(args: &PathArgs) -> ExitCode {
+    let cwd = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            hiss(&format!(
+                "meow why-slow: cannot resolve the current directory: {err}"
+            ));
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let cold = cold_start();
+    let root = find_project_root(&cwd);
+    let u = ui();
+
+    let mut lines = vec![u.sigil(
+        meow_ui::Tone::Info,
+        &format!("cold start · {}", meow_ui::fmt::duration(cold)),
+    )];
+    lines.push(u.stdout_caps().muted(&format!(
+        "{} process init · {} meow version {}",
+        meow_ui::fmt::duration(cold),
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+    )));
+
+    // If a target path was provided, measure module resolution time
+    if let Some(target) = args.paths.first() {
+        let resolve_start = std::time::Instant::now();
+        let lockfile = load_lockfile(&root).ok();
+
+        // Quick stat to measure filesystem access
+
+        // Quick stat to measure filesystem access
+        let resolve_time = resolve_start.elapsed();
+        let meta = std::fs::metadata(target);
+
+        lines.push(String::new());
+        match meta {
+            Ok(m) => {
+                let file_size = meow_ui::fmt::bytes(m.len());
+                lines.push(format!(
+                    "{}  {}  {}",
+                    u.stdout_caps().muted(&meow_ui::width::pad_end("module", 12)),
+                    meow_ui::fmt::duration(resolve_time),
+                    file_size,
+                ));
+                lines.push(format!(
+                    "{}  {}",
+                    u.stdout_caps()
+                        .muted(&meow_ui::width::pad_end("path", 12)),
+                    target.display(),
+                ));
+            }
+            Err(_) => {
+                lines.push(format!("target not found: {}", target.display()));
+            }
+        }
+
+        if let Some(ref lf) = lockfile {
+            if !lf.is_empty() {
+                let lock_start = std::time::Instant::now();
+                let dep_count = lf.len();
+                let lock_time = lock_start.elapsed();
+                lines.push(format!(
+                    "{}  {}  {} packages",
+                    u.stdout_caps()
+                        .muted(&meow_ui::width::pad_end("lockfile", 12)),
+                    meow_ui::fmt::duration(lock_time),
+                    dep_count,
+                ));
+            }
+        }
+    }
+
+    u.panel("meow why-slow", &lines);
+    ExitCode::SUCCESS
+}
+
+// === EPHEMERAL-X ===
+/// `meow x <package> [-- <args>]` — install a package into a transient temp
+/// directory, run its binary immediately, then discard the workspace.
+fn cmd_x(args: &XArgs) -> ExitCode {
+    let u = ui();
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(err) => {
+            hiss(&format!("meow x: cannot resolve cwd: {err}"));
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // 1. Parse the package spec
+    let (name, maybe_req) = match split_package_arg(&args.package) {
+        Ok(tuple) => tuple,
+        Err(err) => {
+            hiss(&format!("meow x: {err}"));
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // 2. Generate a temp workspace path
+    let pid = std::process::id();
+    let temp_dir = std::env::temp_dir().join(format!("meow-x-{pid}-{}", name.as_str()));
+    if temp_dir.exists() {
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+    if let Err(err) = std::fs::create_dir_all(&temp_dir) {
+        hiss(&format!(
+            "meow x: cannot create temp workspace {}: {err}",
+            temp_dir.display()
+        ));
+        return ExitCode::FAILURE;
+    }
+
+    // 3. Create a minimal package.json
+    let pkg_json_path = temp_dir.join("package.json");
+    if let Err(err) = std::fs::write(&pkg_json_path, b"{}\n") {
+        hiss(&format!("meow x: cannot write {}: {err}", pkg_json_path.display()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        return ExitCode::FAILURE;
+    }
+
+    // 4. Resolve the version requirement and add the dependency
+    let result: Result<(), String> = (|| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| format!("cannot start async runtime: {err}"))?;
+        runtime.block_on(async {
+            let registry = NpmRegistry::npm()?;
+            let req = resolve_dependency_req(&registry, &name, maybe_req).await?;
+            meow_config::add_dependency(&temp_dir, name.clone(), req)
+                .map_err(|err| err.to_string())?;
+            // 5. Install into the temp dir
+            let dep_map: BTreeMap<meow_pkg::PackageName, meow_pkg::DepSpec> = {
+                let pj = load_install_package_json(&temp_dir)?;
+                pj.direct_dependencies().map_err(|e| format!("{e}"))?
+            };
+            let overrides: BTreeMap<meow_pkg::PackageName, meow_pkg::DepSpec> = {
+                let pj = load_install_package_json(&temp_dir)?;
+                pj.package_overrides().map_err(|e| format!("{e}"))?
+            };
+            let cache = std::sync::Arc::new(meow_pkg::Cache::in_home(crate::host::host_home()));
+            let meow_req = runtime_meow_requirement().map_err(|err| err)?;
+
+            let installer = meow_pkg::Installer::new(
+                registry.clone(),
+                &cache,
+                registry.base_url(),
+                meow_req,
+            )
+            .with_overrides(overrides);
+            let lockfile = installer.resolve_with_progress_async(&dep_map, |_| {}).await.map_err(|err| format!("{err}"))?;
+            let lock_path = temp_dir.join("meow.lock.jsonl");
+            lockfile.write_canonical(&lock_path).map_err(|err| format!("{err}"))?;
+
+            let roots = meow_pkg::resolve_roots(&dep_map, &lockfile).map_err(|err| format!("{err}"))?;
+            let graph = meow_pkg::ResolutionGraph::assemble(std::sync::Arc::new(lockfile), roots)
+                .map_err(|err| format!("{err}"))?;
+            let projection = meow_pkg::MaterializeOptions::node_modules();
+            meow_pkg::Materializer::new(&cache, &graph, &temp_dir)
+                .materialize_async(&projection)
+                .await
+                .map_err(|err| format!("{err}"))?;
+            Ok(())
+        })
+    })();
+    if let Err(err) = result {
+        hiss(&format!("meow x: failed to install {}: {err}", args.package));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        return ExitCode::FAILURE;
+    }
+
+    // 6. Look up the binary
+    let bin_name = name.as_str().rsplit('/').next().unwrap_or(name.as_str());
+    let bin_path = {
+        let pkg_json_path = temp_dir.join("node_modules").join(name.as_str()).join("package.json");
+        let bytes = match std::fs::read(&pkg_json_path) {
+            Ok(b) => b,
+            Err(err) => {
+                hiss(&format!(
+                    "meow x: cannot find installed package `{}` (expected at {}): {err}",
+                    name.as_str(),
+                    pkg_json_path.display(),
+                ));
+                let _ = std::fs::remove_dir_all(&temp_dir);
+                return ExitCode::FAILURE;
+            }
+        };
+        let pkg_json: meow_loader::package::PackageJson = match serde_json::from_slice(&bytes) {
+            Ok(pj) => pj,
+            Err(err) => {
+                hiss(&format!(
+                    "meow x: cannot parse manifest for `{}`: {err}",
+                    name.as_str(),
+                ));
+                let _ = std::fs::remove_dir_all(&temp_dir);
+                return ExitCode::FAILURE;
+            }
+        };
+        match pkg_json.bin_entry(bin_name) {
+            Some(entry) => pkg_json_path.parent().unwrap().join(entry),
+            None => {
+                // Fall back to main / index.js
+                hiss(&format!(
+                    "meow x: package `{}` has no bin entry for `{bin_name}`",
+                    name.as_str(),
+                ));
+                let _ = std::fs::remove_dir_all(&temp_dir);
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+
+    // 7. Print the security envelope
+    let hermetic =
+        !args.allow_clock && !args.allow_random && args.allow_env.is_none();
+    if hermetic {
+        u.pounce(&format!(
+            "Executing ephemeral package {} (Hermetic Isolation Active)",
+            args.package,
+        ));
+    } else {
+        u.purr(&format!("Executing ephemeral package {}", args.package));
+    }
+
+    // 8. Construct and run the request
+    let spec = match meow_runtime::ModuleSpecifier::from_file_path(&bin_path) {
+        Ok(s) => s,
+        Err(_) => {
+            hiss(&format!(
+                "meow x: invalid bin path: {}",
+                bin_path.display(),
+            ));
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            return ExitCode::FAILURE;
+        }
+    };
+    let project_dir = temp_dir.clone();
+    let request = NativeRunRequest {
+        project_dir,
+        process_cwd: cwd,
+        spec,
+        main_module: Some(bin_path.to_string_lossy().into_owned()),
+        argv1: Some(bin_path.to_string_lossy().into_owned()),
+        argv: args.argv.clone(),
+    };
+    let flags = RunFlagView {
+        argv: &[],
+        allow_clock: args.allow_clock,
+        allow_random: args.allow_random,
+        allow_env: &args.allow_env,
+        max_old_space_size: args.max_old_space_size,
+        no_snapshot: args.no_snapshot,
+    };
+
+    let code = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => match rt.block_on(run_native_request(
+            &request,
+            flags,
+            host_env_map(
+                flags.allow_env,
+                meow_runtime::node::NodeMode::Enabled,
+            ),
+        )) {
+            Ok(code) => code,
+            Err(err) => {
+                hiss(&format!("meow x: execution failed: {err}"));
+                let _ = std::fs::remove_dir_all(&temp_dir);
+                return ExitCode::FAILURE;
+            }
+        },
+        Err(err) => {
+            hiss(&format!("meow x: cannot start V8 runtime: {err}"));
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // 9. Clean up after the process exits
+    if let Err(err) = std::fs::remove_dir_all(&temp_dir) {
+        u.out(&u.stdout_caps().muted(&format!(
+            "meow x: could not clean up temp workspace {}: {err}",
+            temp_dir.display(),
+        )));
+    }
+
+    code
+}
+
+/// Resolve a version requirement from the registry, defaulting to `latest`.
+async fn resolve_dependency_req(
+    registry: &NpmRegistry,
+    name: &meow_pkg::PackageName,
+    maybe_req: Option<&str>,
+) -> Result<meow_pkg::VersionReq, String> {
+    match maybe_req {
+        Some(req) => resolve_requested_requirement(registry, name, req).await,
+        None => dist_tag_requirement(registry, name, "latest").await,
+    }
 }
 
 /// `meow doctor` — environment, config, and lockfile health as a panel.

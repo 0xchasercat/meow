@@ -44,6 +44,10 @@ meow-obs = { path = "../obs" }
 serde_json = { workspace = true }
 # === /OBS-001 ===
 
+# === ADR-5 === parse tsc diagnostic output for meow-ui rendering
+regex = { workspace = true }
+# === /ADR-5 ===
+
 deno_error = { workspace = true }
 deno_node = { workspace = true }
 deno_permissions = { workspace = true }

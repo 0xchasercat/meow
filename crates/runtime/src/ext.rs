@@ -18,6 +18,7 @@ use deno_core::{op2, OpState};
 
 use crate::fs_events::{op_meow_fs_events_close, op_meow_fs_events_open, op_meow_fs_events_poll};
 pub mod http;
+pub mod test;
 pub mod ui;
 
 /// The print callback `(message, is_err)` — a type alias keeps [`PrintSink`]
@@ -161,6 +162,7 @@ deno_core::extension!(
     esm = [dir "src/js", "bootstrap.js"],
 );
 pub use http::http_extension;
+pub use test::test_extension;
 pub use ui::ui_extension;
 
 /// Build an [`Extension`](deno_core::Extension) that seeds a [`PrintSink`] into

@@ -69,7 +69,7 @@ pub use deno_core::ModuleSpecifier;
 pub use error::{JsExceptionReport, RuntimeError};
 pub use ext::http::ops::HttpError;
 pub use ext::meow_runtime;
-pub use ext::{http_extension, print_sink_extension, ui_extension, PrintSink};
+pub use ext::{http_extension, print_sink_extension, test_extension, ui_extension, PrintSink};
 // === RT-002 ===
 pub use io::{
     io_capability_extension, AllowAll, CapDenied, CapRequest, CapabilityCheck, RuntimeIoError,
@@ -225,6 +225,16 @@ impl Runtime {
         self.js_runtime
             .execute_script(name, src.into())
             .map_err(|err| error::uncaught_from_js(name, &err))
+    }
+
+    /// Read test results stored by the JS test runner via the op seam.
+    /// Returns `None` if no test results were stored (no test file ran).
+    pub fn take_test_results(&mut self) -> Option<String> {
+        let op_state = self.js_runtime.op_state();
+        let state = op_state.borrow();
+        state
+            .try_borrow::<crate::ext::test::TestResults>()
+            .and_then(|results| results.0.borrow_mut().take())
     }
     /// Loads `spec` as the main ESM module via the configured loader, evaluates
     /// it, and drives the event loop to completion — resolving top-level await

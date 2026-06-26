@@ -52,6 +52,7 @@ pub fn native_module_registry() -> Arc<dyn NativeModuleSource> {
 pub fn native_module_source(name: &str) -> Option<&'static str> {
     match name {
         "http" => Some(include_str!("js/meow/http.ts")),
+        "test" => Some(include_str!("js/meow/test.ts")),
         "ui" => Some(include_str!("js/meow/ui.ts")),
         _ => None,
     }
@@ -60,6 +61,7 @@ pub fn native_module_source(name: &str) -> Option<&'static str> {
 pub fn native_module_declaration(name: &str) -> Option<&'static str> {
     match name {
         "http" => Some(include_str!("../types/meow/http.d.ts")),
+        "test" => Some(include_str!("../types/meow/test.d.ts")),
         "ui" => Some(include_str!("../types/meow/ui.d.ts")),
         _ => None,
     }

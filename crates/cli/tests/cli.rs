@@ -46,21 +46,15 @@ fn version_and_help_succeed() {
         .success()
         .stdout(predicate::str::contains("run"));
 }
-const CASES: &[(&[&str], &str)] = &[
-    (&["task", "t"], "task"),
-    (&["test"], "test"),
-    (&["check"], "check"),
-    (&["why-slow"], "why-slow"),
-    (&["why-large"], "why-large"),
-    (&["trace", "x.ts"], "trace"),
-    (&["profile", "x.ts"], "profile"),
-];
+// No stub subcommands remain — all are implemented.
+// If a new stub is added, add it to this list and update the count.
+const CASES: &[(&[&str], &str)] = &[];
 #[test]
 fn every_subcommand_stub_is_honest() {
     assert_eq!(
         CASES.len(),
-        7,
-        "7 stub subcommands (task/test/check/why-slow/why-large/trace/profile); doctor/add/remove/lint/fmt/bundle are real commands"
+        0,
+        "all subcommands are implemented"
     );
     for (argv, verb) in CASES {
         let expected = format!("meow: `{verb}` is not yet implemented");
@@ -164,10 +158,14 @@ fn fmt_rewrites_and_then_check_succeeds() {
 
 #[test]
 fn bundle_entry_is_skeleton_with_pending_wiring_message() {
-    let tmp = load_tmp("bundle-skeleton");
+    let tmp = load_tmp("bundle");
     let entry = tmp.join("entry.ts");
     let dist = tmp.join("dist");
-    std::fs::write(&entry, "export const value = 1;\n").expect("write bundle entry");
+    std::fs::write(
+        &entry,
+        "const value = 1; console.log('bundle ok');\n",
+    )
+    .expect("write bundle entry");
     let out = meow()
         .current_dir(&tmp)
         .arg("bundle")
@@ -178,17 +176,21 @@ fn bundle_entry_is_skeleton_with_pending_wiring_message() {
         .expect("run bundle");
     assert!(
         out.status.success(),
-        "bundle should succeed as skeleton: {out:?}"
+        "bundle should succeed: {out:?}"
     );
     let stdout = String::from_utf8(out.stdout).expect("stdout utf8");
     let stdout_lc = stdout.to_lowercase();
     assert!(
-        stdout_lc.contains("resolver wiring") && stdout_lc.contains("pending"),
-        "bundle should mention pending resolver wiring: {stdout:?}"
+        stdout_lc.contains("wrote"),
+        "bundle success should mention 'wrote': {stdout:?}"
     );
     assert!(
-        stdout_lc.contains("bundle"),
-        "bundle skeleton success should be identifiable: {stdout:?}"
+        stdout_lc.contains("entry.js"),
+        "bundle output should name entry.js: {stdout:?}"
+    );
+    assert!(
+        dist.join("entry.js").is_file(),
+        "bundle should write dist/entry.js"
     );
     std::fs::remove_dir_all(&tmp).ok();
 }
