@@ -927,7 +927,39 @@ fn copy_dir_recursive(source: &Path, dest: &Path) -> Result<u64, MaterializeErro
     Ok(total)
 }
 
+#[cfg(target_os = "macos")]
+fn fast_clone_dir(source: &Path, dest: &Path) -> Result<bool, MaterializeError> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let src_c = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| MaterializeError::invalid_archive("invalid source path for clonefile".to_string()))?;
+    let dest_c = CString::new(dest.as_os_str().as_bytes())
+        .map_err(|_| MaterializeError::invalid_archive("invalid dest path for clonefile".to_string()))?;
+
+    let ret = unsafe { libc::clonefile(src_c.as_ptr(), dest_c.as_ptr(), 0) };
+    if ret == 0 {
+        Ok(true)
+    } else {
+        let err = std::io::Error::last_os_error();
+        let errno = err.raw_os_error().unwrap_or(0);
+        if errno == libc::EXDEV || errno == libc::ENOTSUP {
+            Ok(false)
+        } else {
+            Err(MaterializeError::io(dest, err))
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn fast_clone_dir(_source: &Path, _dest: &Path) -> Result<bool, MaterializeError> {
+    Ok(false)
+}
+
 fn copy_dir_recursive_with_hardlinks(source: &Path, dest: &Path) -> Result<u64, MaterializeError> {
+    if fast_clone_dir(source, dest)? {
+        return Ok(0);
+    }
     ensure_dir(dest)?;
     let mut total = 0;
     let entries = fs::read_dir(source).map_err(|source_err| MaterializeError::io(source, source_err))?;

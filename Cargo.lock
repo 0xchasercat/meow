@@ -1452,6 +1452,7 @@ dependencies = [
  "libnghttp2",
  "libz-sys",
  "log",
+ "meow-graph",
  "nix 0.30.1",
  "node_resolver",
  "node_shim",

@@ -12,6 +12,8 @@ export interface ServeOptions {
     signal?: AbortSignal;
     /** Called once the listener is bound, with the resolved address. */
     onListen?: (addr: NetAddr) => void;
+    /** Per-request handler (Deno-style: serve({ port, fetch }) ). */
+    fetch?: Handler;
 }
 export interface Server {
     /** The bound address (resolved port - `0` becomes the OS-assigned port). */
@@ -26,5 +28,9 @@ export type Handler = (request: Request) => Response | Promise<Response>;
  * Start a Web-standard HTTP/1.1 server. `handler` is invoked per request with a
  * `Request` and must return a `Response`. Requires the network capability; with no
  * grant the bind rejects through `server.finished` with a fix-pointing error.
+ *
+ * Accepts either form:
+ *   serve(handler, { port })       — classic
+ *   serve({ port, fetch })         — Deno-style
  */
-export declare function serve(handler: Handler, options?: ServeOptions): Server;
+export declare function serve(handlerOrOptions: Handler | ServeOptions, maybeOptions?: ServeOptions): Server;

@@ -28,7 +28,7 @@ fn unique_dir(tag: &str) -> std::path::PathBuf {
     let mut dir = std::env::temp_dir();
     dir.push(format!("meow-loader-test-{tag}-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temp dir");
-    dir
+    std::fs::canonicalize(dir).expect("canonicalize temp dir")
 }
 
 fn cache_arc(root: &Path) -> Arc<Cache> {
@@ -163,15 +163,19 @@ impl node::NpmPackageFolderResolver for TestDenoNodeBridge {
         referrer: &node::UrlOrPathRef,
     ) -> Result<PathBuf, node::PackageFolderResolveError> {
         let referrer_url = self.referrer_url(referrer);
-        let resolved = self
-            .resolver
-            .resolve_require(specifier, &referrer_url)
-            .unwrap_or_else(|err| {
-                panic!(
-                    "test Deno Node bridge failed to resolve package {specifier:?} from {}: {err}",
-                    referrer.display()
-                )
-            });
+        let resolved = match self.resolver.resolve_require(specifier, &referrer_url) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                let kind = node_resolver::errors::PackageFolderResolveErrorKind::PackageNotFound(
+                    node_resolver::errors::PackageNotFoundError {
+                        package_name: specifier.to_string(),
+                        referrer: referrer.display(),
+                        referrer_extra: Some(err.to_string()),
+                    }
+                );
+                return Err(node::PackageFolderResolveError(Box::new(kind)));
+            }
+        };
 
         let package_root = match resolved.locator {
             ModuleLocator::Cached { package, .. } => {
@@ -243,7 +247,7 @@ impl node::NodeRequireLoader for TestDenoNodeBridge {
                 return Ok(matches!(self.module_kind(specifier), Some(ModuleKind::Cjs)));
             }
             match path.extension().and_then(|ext| ext.to_str()) {
-                None | Some("cjs") | Some("cts") => return Ok(true),
+                None | Some("cjs") | Some("cts") | Some("ts") => return Ok(true),
                 Some("json") | Some("mjs") | Some("mts") => return Ok(false),
                 _ => {}
             }
@@ -520,14 +524,14 @@ fn node_builtin_resolves_from_node_and_bare_specifiers() {
         other => panic!("expected Native locator, got {other:?}"),
     }
 
-    let resolved = resolver
-        .resolve("fs/promises", &referrer)
+    let (promises_url, promises_locator) = resolver
+        .locate("fs/promises", &referrer)
         .expect("fs/promises resolves");
-    assert_eq!(resolved.url.as_str(), "node:fs/promises");
-    assert!(
-        resolved.source.contains("writeFile"),
-        "node builtin source served from the runtime registry"
-    );
+    assert_eq!(promises_url.as_str(), "node:fs/promises");
+    match promises_locator {
+        ModuleLocator::Native { name } => assert_eq!(name, "node:fs/promises"),
+        other => panic!("expected Native locator, got {other:?}"),
+    }
 
     std::fs::remove_dir_all(&proj).ok();
 }
@@ -838,7 +842,7 @@ async fn first_party_js_commonjs_runs_end_to_end() {
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, resolver.clone(), None, &entry, vec![sink_ext])
+    run_entry(loader, resolver.clone(), Some(&proj.join("cache")), &entry, vec![sink_ext])
         .await
         .expect("first-party CommonJS runs");
 
@@ -1082,7 +1086,7 @@ async fn esm_imports_cjs_default_named_and_reassignment() {
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, resolver.clone(), None, &entry, vec![sink_ext])
+    run_entry(loader, resolver.clone(), Some(&proj.join("cache")), &entry, vec![sink_ext])
         .await
         .expect("ESM imports CJS");
 
@@ -1116,7 +1120,7 @@ async fn circular_commonjs_sees_partial_exports_object() {
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, resolver.clone(), None, &entry, vec![sink_ext])
+    run_entry(loader, resolver.clone(), Some(&proj.join("cache")), &entry, vec![sink_ext])
         .await
         .expect("cycle runs");
 
@@ -1148,7 +1152,7 @@ async fn repeated_require_returns_the_same_object() {
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, resolver.clone(), None, &entry, vec![sink_ext])
+    run_entry(loader, resolver.clone(), Some(&proj.join("cache")), &entry, vec![sink_ext])
         .await
         .expect("repeat require runs");
 
@@ -1241,7 +1245,7 @@ async fn dynamic_require_resolves_at_runtime() {
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, resolver.clone(), None, &entry, vec![sink_ext])
+    run_entry(loader, resolver.clone(), Some(&proj.join("cache")), &entry, vec![sink_ext])
         .await
         .expect("dynamic require resolves through native CJS");
     assert_eq!(*out.borrow(), "42\n");
@@ -1269,7 +1273,7 @@ async fn unresolvable_static_require_falls_through_to_catchable_runtime_error() 
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, resolver.clone(), None, &entry, vec![sink_ext])
+    run_entry(loader, resolver.clone(), Some(&proj.join("cache")), &entry, vec![sink_ext])
         .await
         .expect("optional require wrapped in try/catch must not abort build");
 
@@ -1298,7 +1302,7 @@ async fn erasable_typescript_commonjs_runs() {
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, resolver.clone(), None, &entry, vec![sink_ext])
+    run_entry(loader, resolver.clone(), Some(&proj.join("cache")), &entry, vec![sink_ext])
         .await
         .expect("TS CommonJS runs");
 

@@ -191,7 +191,7 @@ impl node::NodeRequireLoader for RuntimeNodeBridge {
                 ));
             }
             match path.extension().and_then(|ext| ext.to_str()) {
-                None | Some("cjs") | Some("cts") => return Ok(true),
+                None | Some("cjs") | Some("cts") | Some("ts") => return Ok(true),
                 Some("json") | Some("mjs") | Some("mts") => return Ok(false),
                 _ => {}
             }

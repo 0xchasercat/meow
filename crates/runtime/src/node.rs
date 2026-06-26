@@ -158,6 +158,9 @@ pub fn extensions(opts: NodeOptions) -> Vec<Extension> {
             if state.try_borrow::<DenoPermissionsContainer>().is_none() {
                 state.put::<DenoPermissionsContainer>(node_permissions.clone());
             }
+            if state.try_borrow::<node_bridge::DenoNodeSys>().is_none() {
+                state.put::<node_bridge::DenoNodeSys>(sys_traits::impls::RealSys);
+            }
         })),
         ..Default::default()
     };
@@ -174,9 +177,13 @@ pub fn extensions(opts: NodeOptions) -> Vec<Extension> {
     exts.push(crate::web::meow_web::init());
     exts.push(node_bootstrap_state_extension(argv, main_module, cwd, env));
     exts.push(node_globals::init());
-    if matches!(mode, NodeMode::StrictWeb) {
-        exts.push(meow_strict_web_withdraw::init());
-    }
+    let mut withdraw_ext = meow_strict_web_withdraw::init();
+    withdraw_ext.op_state_fn = Some(Box::new(move |state: &mut OpState| {
+        if matches!(mode, NodeMode::StrictWeb) {
+            state.put(StrictWebMarker);
+        }
+    }));
+    exts.push(withdraw_ext);
     exts.push(node_permissions_ext);
 
     exts
@@ -356,8 +363,16 @@ deno_core::extension!(
 // ERR_STRICT_WEB_WITHDRAWN at use time and the ambient `process` global is
 // removed. Pushed ONLY in NodeMode::StrictWeb, after node_globals, so it tears
 // down the Node host surface the rest of the stack just wired up.
+struct StrictWebMarker;
+
+#[op2(fast)]
+fn op_is_strict_web(state: &mut OpState) -> bool {
+    state.has::<StrictWebMarker>()
+}
+
 deno_core::extension!(
     meow_strict_web_withdraw,
+    ops = [op_is_strict_web],
     esm_entry_point = "ext:meow_strict_web_withdraw/strict_web_withdraw.js",
     esm = [dir "src/js", "strict_web_withdraw.js"],
 );

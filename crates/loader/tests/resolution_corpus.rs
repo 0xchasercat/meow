@@ -533,8 +533,8 @@ fn projected_pnpm_referrer_recovers_cached_owner_for_package_imports() {
     );
     let projected_root = proj
         .join("node_modules")
-        .join(".pnpm")
-        .join("@astrojs+starlight@0.39.3_astro@6.4.8")
+        .join(".meow")
+        .join("@astrojs+starlight@0.39.3")
         .join("node_modules")
         .join("@astrojs")
         .join("starlight");
@@ -611,7 +611,7 @@ fn projected_path_prefers_exact_pnpm_entry_over_stale_top_level_alias() {
 
     let pnpm_root = proj
         .join("node_modules")
-        .join(".pnpm")
+        .join(".meow")
         .join("workerd@1.20260623.1")
         .join("node_modules")
         .join("workerd");

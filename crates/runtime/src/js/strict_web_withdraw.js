@@ -5,6 +5,7 @@
 // (throwing ERR_STRICT_WEB_WITHDRAWN) and the ambient `process` global is
 // removed, so a strict-web program sees the Stateless-Edge surface only. CJS
 // still instantiates because node:module / NodeRequireLoader stay intact.
+import { core } from "ext:core/mod.js";
 import Module from "node:module";
 import * as nodeFs from "node:fs";
 import * as nodeProcess from "node:process";
@@ -84,51 +85,53 @@ function withdrawEnv(target) {
   }
 }
 
-let requireFn;
-try {
-  requireFn = Module.createRequire("/meow-strict-web.js");
-} catch {
-  requireFn = undefined;
-}
-
-const fsTargets = new Set();
-if (nodeFs && typeof nodeFs === "object") {
-  if (nodeFs.default) {
-    fsTargets.add(nodeFs.default);
-  }
-  fsTargets.add(nodeFs);
-}
-if (requireFn !== undefined) {
+if (typeof core.ops.op_is_strict_web === "function" && core.ops.op_is_strict_web()) {
+  let requireFn;
   try {
-    fsTargets.add(requireFn("fs"));
+    requireFn = Module.createRequire("/meow-strict-web.js");
   } catch {
-    // The namespace targets still cover the import view.
+    requireFn = undefined;
   }
-}
-for (const target of fsTargets) {
-  withdrawFunctions(target, "node:fs");
-}
 
-withdrawEnv(nodeProcess && nodeProcess.default ? nodeProcess.default : nodeProcess);
-if (requireFn !== undefined) {
+  const fsTargets = new Set();
+  if (nodeFs && typeof nodeFs === "object") {
+    if (nodeFs.default) {
+      fsTargets.add(nodeFs.default);
+    }
+    fsTargets.add(nodeFs);
+  }
+  if (requireFn !== undefined) {
+    try {
+      fsTargets.add(requireFn("fs"));
+    } catch {
+      // The namespace targets still cover the import view.
+    }
+  }
+  for (const target of fsTargets) {
+    withdrawFunctions(target, "node:fs");
+  }
+
+  withdrawEnv(nodeProcess && nodeProcess.default ? nodeProcess.default : nodeProcess);
+  if (requireFn !== undefined) {
+    try {
+      withdrawEnv(requireFn("process"));
+    } catch {
+      // Builtin require unavailable; import view already handled.
+    }
+  }
+
   try {
-    withdrawEnv(requireFn("process"));
+    delete globalThis.process;
   } catch {
-    // Builtin require unavailable; import view already handled.
+    // Fall through to redefining as undefined.
   }
-}
-
-try {
-  delete globalThis.process;
-} catch {
-  // Fall through to redefining as undefined.
-}
-try {
-  Object.defineProperty(globalThis, "process", {
-    value: undefined,
-    writable: true,
-    configurable: true,
-  });
-} catch {
-  // If the global cannot be redefined, the delete above stands.
+  try {
+    Object.defineProperty(globalThis, "process", {
+      value: undefined,
+      writable: true,
+      configurable: true,
+    });
+  } catch {
+    // If the global cannot be redefined, the delete above stands.
+  }
 }

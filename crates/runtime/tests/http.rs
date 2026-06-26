@@ -278,6 +278,7 @@ async fn node_http_create_server_handles_basic_get() {
 
         let server;
         server = http.createServer((req, res) => {
+          req.resume();
           req.on("end", () => {
             if (req.url === "/__shutdown") {
               res.writeHead(200, { "x-shutdown": "yes" });

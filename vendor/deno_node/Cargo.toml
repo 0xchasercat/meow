@@ -102,6 +102,9 @@ default-features = false
 [dependencies.deno_path_util]
 version = "=0.6.4"
 
+[dependencies.meow-graph]
+path = "../../crates/graph"
+
 [dependencies.deno_permissions]
 version = "0.109.0"
 

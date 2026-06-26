@@ -63,6 +63,14 @@ pub enum TypegenError {
     Drift { files: String },
 }
 
+fn check_tsc_works(path: &Path) -> bool {
+    Command::new(path)
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
 pub fn locate_tsc(env: &TypegenEnv<'_>) -> Result<PathBuf, TypegenError> {
     if let Some(raw) = env.meow_tsc {
         let path = PathBuf::from(raw);
@@ -77,7 +85,7 @@ pub fn locate_tsc(env: &TypegenEnv<'_>) -> Result<PathBuf, TypegenError> {
         .join("node_modules")
         .join(".bin")
         .join("tsc");
-    if project_tsc.is_file() {
+    if project_tsc.is_file() && check_tsc_works(&project_tsc) {
         return Ok(project_tsc);
     }
 
@@ -86,7 +94,7 @@ pub fn locate_tsc(env: &TypegenEnv<'_>) -> Result<PathBuf, TypegenError> {
         let mut candidates = entries
             .filter_map(Result::ok)
             .map(|entry| entry.path().join("node_modules").join(".bin").join("tsc"))
-            .filter(|path| path.is_file())
+            .filter(|path| path.is_file() && check_tsc_works(path))
             .collect::<Vec<_>>();
         candidates.sort();
         if let Some(path) = candidates.into_iter().next() {

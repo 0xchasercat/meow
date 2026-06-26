@@ -618,7 +618,7 @@ fn load_tmp(tag: &str) -> std::path::PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("meow-load-{tag}-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
-    dir
+    std::fs::canonicalize(dir).expect("canonicalize temp dir")
 }
 
 #[test]
@@ -1239,6 +1239,8 @@ fn run_is_intl_deterministic_across_tz_and_locale() {
     // identical regardless of the host timezone + locale (pin_deterministic_intl
     // pins TZ=UTC + a fixed default locale before the isolate is created).
     let tmp = load_tmp("intl");
+    std::fs::write(tmp.join("meow.config.json"), br#"{ "mode": "strict-web" }"#)
+        .expect("write strict-web config");
     let entry = tmp.join("intl.ts");
     std::fs::write(
         &entry,

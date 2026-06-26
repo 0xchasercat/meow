@@ -499,6 +499,69 @@ pub fn op_require_path_basename(
   }
 }
 
+fn legacy_resolve_file(path: &Path) -> Option<PathBuf> {
+  if path.is_file() {
+    return Some(path.to_path_buf());
+  }
+  for ext in &[".js", ".json", ".node"] {
+    let mut candidate = path.to_path_buf();
+    if let Some(file_name) = path.file_name() {
+      let mut new_name = file_name.to_owned();
+      new_name.push(ext);
+      candidate.set_file_name(new_name);
+      if candidate.is_file() {
+        return Some(candidate);
+      }
+    }
+  }
+  None
+}
+
+fn legacy_resolve_dir<TSys: crate::ExtNodeSys + 'static>(
+  path: &Path,
+  pkg_json_resolver: &crate::PackageJsonResolverRc<TSys>,
+) -> Option<PathBuf> {
+  if !path.is_dir() {
+    return None;
+  }
+  let pkg_json_path = path.join("package.json");
+  if pkg_json_path.is_file() {
+    if let Ok(Some(pkg)) = pkg_json_resolver.load_package_json(&pkg_json_path) {
+      if let Some(main) = &pkg.main {
+        let main_path = path.join(main);
+        if let Some(resolved) = legacy_resolve_file(&main_path) {
+          return Some(resolved);
+        }
+        if let Some(resolved) = legacy_resolve_dir(&main_path, pkg_json_resolver) {
+          return Some(resolved);
+        }
+      }
+    }
+  }
+  for index in &["index.js", "index.json", "index.node"] {
+    let candidate = path.join(index);
+    if candidate.is_file() {
+      return Some(candidate);
+    }
+  }
+  None
+}
+
+fn legacy_resolve_subpath<TSys: crate::ExtNodeSys + 'static>(
+  pkg_path: &Path,
+  subpath: &str,
+  pkg_json_resolver: &crate::PackageJsonResolverRc<TSys>,
+) -> Option<PathBuf> {
+  let joined = pkg_path.join(subpath);
+  if let Some(resolved) = legacy_resolve_file(&joined) {
+    return Some(resolved);
+  }
+  if let Some(resolved) = legacy_resolve_dir(&joined, pkg_json_resolver) {
+    return Some(resolved);
+  }
+  None
+}
+
 #[op2(stack_trace)]
 #[string]
 pub fn op_require_try_self<
@@ -510,9 +573,19 @@ pub fn op_require_try_self<
   #[string] parent_path: &str,
   #[string] request: &str,
 ) -> Result<Option<String>, RequireError> {
+  let parent_path_parsed = if let Ok(url) = Url::parse(parent_path) {
+    if url.scheme() == "file" {
+      url_to_file_path(&url).unwrap_or_else(|_| PathBuf::from(parent_path))
+    } else {
+      PathBuf::from(parent_path)
+    }
+  } else {
+    PathBuf::from(parent_path)
+  };
+
   let pkg_json_resolver = state.borrow::<PackageJsonResolverRc<TSys>>();
   let pkg = pkg_json_resolver
-    .get_closest_package_json(Path::new(parent_path))
+    .get_closest_package_json(&parent_path_parsed)
     .ok()
     .flatten();
   let Some(pkg) = pkg else {
@@ -554,8 +627,18 @@ pub fn op_require_try_self<
       ResolutionMode::Require,
       node_resolver.require_conditions(),
       NodeResolutionKind::Execution,
-    )?;
-    Ok(Some(url_or_path_to_string(r)?))
+    );
+    match r {
+      Ok(resolved_url_or_path) => Ok(Some(url_or_path_to_string(resolved_url_or_path)?)),
+      Err(err) => {
+        let legacy_res = legacy_resolve_subpath(pkg.path.parent().unwrap(), &expansion, &pkg_json_resolver);
+        if let Some(resolved_path) = legacy_res {
+          Ok(Some(url_or_path_to_string(UrlOrPath::Path(resolved_path))?))
+        } else {
+          Err(err.into())
+        }
+      }
+    }
   } else {
     Ok(None)
   }
@@ -576,16 +659,31 @@ pub fn op_require_read_file<TSys: ExtNodeSys + 'static>(
       .load_text_file_lossy(&file_path)
       .map_err(|e| RequireErrorKind::ReadModule(e).into_box())?
   };
+  let is_ts = file_path.extension().and_then(|ext| ext.to_str()).map(|ext| {
+    ext == "ts" || ext == "cts" || ext == "mts" || ext == "tsx"
+  }).unwrap_or(false);
+
+  let final_code = if is_ts {
+    let mut db = meow_graph::GraphDb::new();
+    let fid = db.set_file(file_path, std::sync::Arc::from(code.as_str()));
+    match db.runtime_ir(fid) {
+      Some(Ok(ir)) => FastString::from(ir.code.to_string()),
+      _ => code,
+    }
+  } else {
+    code
+  };
+
   // Apply load-time security mitigations for known React Server Components
   // CVEs to required (CommonJS) source. Opt in via `DENO_PATCH_REACT_CVE`.
   let sys = state.borrow::<TSys>();
   if deno_resolver::is_react_cve_patch_enabled(sys) {
-    match deno_resolver::patch_react_cves(file_path_str, code.as_str().into()) {
-      Cow::Borrowed(_) => Ok(code),
+    match deno_resolver::patch_react_cves(file_path_str, final_code.as_str().into()) {
+      Cow::Borrowed(_) => Ok(final_code),
       Cow::Owned(s) => Ok(s.into()),
     }
   } else {
-    Ok(code)
+    Ok(final_code)
   }
 }
 

@@ -13,8 +13,8 @@
 //!   and verified tarballs are stored by content hash.
 //! - [`ResolutionGraph`] — the validated resolved tree consumed by runtime,
 //!   materialization, and editor tooling. [`UnpackedStore`] supplies stable real
-//!   package directories; the standard `node_modules` projection is a strict
-//!   symlink tree into that global unpacked store.
+//!   package directories; packages are real directories containing hardlinks/clones,
+//!   and only dependency edges use symlinks.
 //!
 //! All hashes/specifiers are newtypes ([`ContentHash`], [`PackageName`],
 //! [`Version`], [`VersionReq`]) and every reachable failure is a typed

@@ -232,7 +232,7 @@ pub enum Command {
     NodeEval(NodeEvalArgs),
     /// Shorthand for `meow run dev`.
     Dev(RunScriptArgs),
-    /// Install dependencies into the active projection (default: symlinked node_modules).
+    /// Install dependencies into the active projection (default: hardlinked / copy-on-write node_modules).
     #[command(alias = "i")]
     Install(InstallArgs),
     /// Add a dependency + update the lockfile.
@@ -341,7 +341,7 @@ pub struct InstallArgs {
     #[arg(long, value_enum, default_value_t = InstallMode::Materialize)]
     pub mode: InstallMode,
     // === PKG-004 ===
-    /// Write a symlinked `node_modules/` projection (default behavior). §24.4.
+    /// Write a hardlinked / copy-on-write `node_modules/` projection (default behavior). §24.4.
     #[arg(long, conflicts_with_all = ["mode", "vendor"])]
     pub materialize: bool,
     /// Write a self-contained vendor/ copy (air-gapped deploys). §12.2.
@@ -373,7 +373,7 @@ pub struct TypesArgs {
 
 #[derive(Debug, Clone, ValueEnum)]
 pub enum InstallMode {
-    /// Default: strict symlinked node_modules backed by the global unpacked store.
+    /// Default: strict hardlinked / copy-on-write node_modules backed by the global unpacked store.
     Materialize,
     /// Copy-based vendor/ projection for air-gapped deploys.
     Vendor,
@@ -1746,13 +1746,11 @@ fn cmd_node_eval(args: NodeEvalArgs) -> ExitCode {
         }
     };
     let project_dir = find_project_root(&cwd);
+    static EVAL_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let eval_path = std::env::temp_dir().join(format!(
         "meow-node-eval-{}-{}.mjs",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0)
+        EVAL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     if let Err(err) = std::fs::write(&eval_path, source) {
         hiss(&format!(
@@ -1792,7 +1790,7 @@ fn cmd_node_eval(args: NodeEvalArgs) -> ExitCode {
         .enable_all()
         .build()
     {
-        Ok(rt) => match rt.block_on(run_native_request(&request, flags, host_env_map())) {
+        Ok(rt) => match rt.block_on(run_native_request(&request, flags, host_env_map(flags.allow_env))) {
             Ok(code) => code,
             Err(err) => {
                 hiss(&format!("node: {err}"));
@@ -1849,7 +1847,7 @@ fn cmd_run_result(target: &str, flags: RunFlagView<'_>) -> Result<ExitCode, RunC
         }
 
         let request = prepare_direct_file_run(&cwd, target, flags.argv)?;
-        run_native_request(&request, flags, host_env_map()).await
+        run_native_request(&request, flags, host_env_map(flags.allow_env)).await
     })
 }
 
@@ -1895,7 +1893,7 @@ async fn execute_script_body(
     cli_argv: &[String],
     flags: RunFlagView<'_>,
 ) -> Result<ExitCode, RunCommandError> {
-    let env = lifecycle_env(event, script, &ctx.project_dir, init_cwd)?;
+    let env = lifecycle_env(event, script, &ctx.project_dir, init_cwd, flags.allow_env)?;
     match plan_script(ctx, script, cli_argv)? {
         PlannedScript::Native(request) => run_native_request(&request, flags, env).await,
         PlannedScript::Shell { script, argv } => {
@@ -2136,8 +2134,46 @@ impl NodeRequireLoader for RuntimeNodeBridge {
     }
 }
 
-fn host_env_map() -> BTreeMap<String, String> {
-    std::env::vars().collect()
+fn host_env_map(allow_env: &Option<String>) -> BTreeMap<String, String> {
+    let all_vars: BTreeMap<String, String> = std::env::vars().collect();
+    match allow_env {
+        None => {
+            let mut env = BTreeMap::new();
+            for key in &[
+                "HOME",
+                "PATH",
+                "MEOW_NODE_PLATFORM",
+                "MEOW_NODE_ARCH",
+                "MEOW_EXEC_PATH",
+                "USER",
+                "LOGNAME",
+                "SHELL",
+                "TMPDIR",
+                "TEMP",
+                "TMP",
+            ] {
+                if let Some(val) = all_vars.get(*key) {
+                    env.insert((*key).to_string(), val.clone());
+                }
+            }
+            env
+        }
+        Some(names) if names.is_empty() => all_vars,
+        Some(names) => {
+            let mut env = BTreeMap::new();
+            let allowed_keys: std::collections::HashSet<&str> = names
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            for key in allowed_keys {
+                if let Some(val) = all_vars.get(key) {
+                    env.insert(key.to_string(), val.clone());
+                }
+            }
+            env
+        }
+    }
 }
 
 async fn run_native_request(
@@ -2624,8 +2660,9 @@ fn lifecycle_env(
     script: &str,
     project_dir: &Path,
     init_cwd: &Path,
+    allow_env: &Option<String>,
 ) -> Result<BTreeMap<String, String>, RunCommandError> {
-    let mut env = host_env_map();
+    let mut env = host_env_map(allow_env);
     env.insert(
         "INIT_CWD".to_owned(),
         init_cwd.to_string_lossy().into_owned(),
