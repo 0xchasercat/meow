@@ -107,7 +107,12 @@ meow check                   # typecheck via tsc/tsgo over shadow tsconfig
 meow lint [--fix]            # lint over the shared Oxc graph
 meow fmt [--check]           # format via Oxc codegen
 meow bundle <entries>        # bundle over the shared module graph
+meow task <name>             # run a typed task from meow.tasks.ts
+meow x <pkg>                 # ephemeral package execution (npx/bunx equivalent)
 meow why-dep <pkg>           # trace dependency ancestry through the lockfile
+meow why-slow                # cold-start timing breakdown
+meow why-large               # largest modules and duplicate packages
+meow doctor                  # environment, config, and lockfile health
 meow sync                    # regenerate shadow TypeScript config
 meow types [--emit|--check]  # regenerate or verify meow:* type declarations
 ```
@@ -128,7 +133,6 @@ meow run --frozen                        # refuse lockfile or graph changes
 Trust is the only currency that matters for a runtime. Here is what meow **cannot** do today:
 
 - **Native C++ addons (.node):** The N-API bridge is incomplete. Packages that rely on precompiled C++ binaries (like older `bcrypt`) will fail. WASM-based alternatives work.
-- **The bundler is a starter:** It walks the module graph and emits valid output, but tree-shaking is basic and minification is limited. Not a production-grade replacement for esbuild yet.
 - **The linter is minimal:** It catches `debugger` statements and `console.log` calls. Full rule sets are on the roadmap.
 
 We'd rather tell you now than have you find out in production.
