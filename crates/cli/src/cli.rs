@@ -1790,7 +1790,7 @@ fn cmd_node_eval(args: NodeEvalArgs) -> ExitCode {
         .enable_all()
         .build()
     {
-        Ok(rt) => match rt.block_on(run_native_request(&request, flags, host_env_map(flags.allow_env))) {
+        Ok(rt) => match rt.block_on(run_native_request(&request, flags, host_env_map(flags.allow_env, meow_runtime::node::NodeMode::Enabled))) {
             Ok(code) => code,
             Err(err) => {
                 hiss(&format!("node: {err}"));
@@ -1847,7 +1847,7 @@ fn cmd_run_result(target: &str, flags: RunFlagView<'_>) -> Result<ExitCode, RunC
         }
 
         let request = prepare_direct_file_run(&cwd, target, flags.argv)?;
-        run_native_request(&request, flags, host_env_map(flags.allow_env)).await
+        run_native_request(&request, flags, host_env_map(flags.allow_env, meow_runtime::node::NodeMode::Enabled)).await
     })
 }
 
@@ -2134,9 +2134,13 @@ impl NodeRequireLoader for RuntimeNodeBridge {
     }
 }
 
-fn host_env_map(allow_env: &Option<String>) -> BTreeMap<String, String> {
+fn host_env_map(
+    allow_env: &Option<String>,
+    node_mode: meow_runtime::node::NodeMode,
+) -> BTreeMap<String, String> {
     let all_vars: BTreeMap<String, String> = std::env::vars().collect();
     match allow_env {
+        None if matches!(node_mode, meow_runtime::node::NodeMode::Enabled) => all_vars,
         None => {
             let mut env = BTreeMap::new();
             for key in &[
@@ -2662,7 +2666,7 @@ fn lifecycle_env(
     init_cwd: &Path,
     allow_env: &Option<String>,
 ) -> Result<BTreeMap<String, String>, RunCommandError> {
-    let mut env = host_env_map(allow_env);
+    let mut env = host_env_map(allow_env, meow_runtime::node::NodeMode::Enabled);
     env.insert(
         "INIT_CWD".to_owned(),
         init_cwd.to_string_lossy().into_owned(),
