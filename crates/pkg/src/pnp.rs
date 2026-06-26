@@ -4,8 +4,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::{
-    resolve_roots, Cache, ContentHash, LockError, Lockfile, PackageName, RootResolveError, Version,
-    VersionReq,
+    resolve_roots, Cache, ContentHash, DepSpec, LockError, Lockfile, PackageName, RootResolveError,
+    Version,
 };
 
 /// The install-mode-independent, fully-pinned resolved dependency tree.
@@ -122,7 +122,7 @@ impl ResolutionGraph {
 
     pub fn from_project(
         project_root: &Path,
-        direct: &BTreeMap<PackageName, VersionReq>,
+        direct: &BTreeMap<PackageName, DepSpec>,
     ) -> Result<ResolutionGraph, PnpError> {
         let lock_path = project_root.join("meow.lock.jsonl");
         let lockfile = match Lockfile::read(&lock_path) {

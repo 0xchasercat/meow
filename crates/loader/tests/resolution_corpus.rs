@@ -786,6 +786,54 @@ fn legacy_package_module_field_is_import_only_entrypoint() {
 }
 
 #[test]
+fn legacy_module_field_does_not_mark_commonjs_main_directory_as_esm() {
+    let proj = unique_dir("legacy-module-field-cjs-main-dir");
+    let cache = Arc::new(Cache::with_root(proj.join("cache")));
+    let package_hash = cache
+        .store(&archive(&[
+            (
+                "package.json",
+                br#"{"name":"magic-like","version":"1.0.0","type":"commonjs","main":"./dist/index.cjs.js","module":"./dist/index.es.mjs","exports":{".":{"import":"./dist/index.es.mjs","require":"./dist/index.cjs.js"}}}"#,
+            ),
+            ("dist/index.cjs.js", b"module.exports = function MagicLike() {};
+"),
+            ("dist/index.es.mjs", b"export default class MagicLike {};
+"),
+        ]))
+        .expect("store magic-like package");
+
+    let mut lockfile = Lockfile::new();
+    lockfile.upsert(lock_entry("magic-like", "1.0.0", package_hash.clone(), &[]));
+    let resolver = resolver_with(
+        &proj,
+        cache,
+        lockfile,
+        root_deps(&[("magic-like", "1.0.0")]),
+    );
+    let referrer = Url::from_file_path(proj.join("main.cjs")).expect("referrer URL");
+
+    let required = resolver
+        .resolve_require("magic-like", &referrer)
+        .expect("require resolves");
+    assert_eq!(
+        required.url,
+        cache_url(&proj, &package_hash, "dist/index.cjs.js")
+    );
+    assert_eq!(required.kind, ModuleKind::Cjs);
+
+    let imported = resolver
+        .resolve("magic-like", &referrer)
+        .expect("import resolves");
+    assert_eq!(
+        imported.url,
+        cache_url(&proj, &package_hash, "dist/index.es.mjs")
+    );
+    assert_eq!(imported.kind, ModuleKind::Esm);
+
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[test]
 fn malformed_archives_manifests_and_integrity_mismatches_are_typed() {
     let proj = unique_dir("robustness");
     let cache = Arc::new(Cache::with_root(proj.join("cache")));

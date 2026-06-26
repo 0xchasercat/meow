@@ -281,10 +281,11 @@ impl Runtime {
     pub fn refresh_node_bootstrap(
         &mut self,
         argv: Vec<String>,
+        main_module: Option<String>,
         cwd: std::path::PathBuf,
         env: std::collections::BTreeMap<String, String>,
     ) -> Result<(), RuntimeError> {
-        crate::node::refresh_bootstrap_state(&mut self.js_runtime, argv, cwd, env)
+        crate::node::refresh_bootstrap_state(&mut self.js_runtime, argv, main_module, cwd, env)
     }
 
     /// The canonical deno_core dance: kick off evaluation, pump the event

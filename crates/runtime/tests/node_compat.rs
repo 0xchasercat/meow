@@ -263,6 +263,7 @@ fn node_runtime(
     extensions.extend(node::extensions(node::NodeOptions {
         mode,
         argv,
+        main_module: None,
         cwd: cwd.to_path_buf(),
         env: BTreeMap::new(),
         deno_node_services: Some(deno_node_services),

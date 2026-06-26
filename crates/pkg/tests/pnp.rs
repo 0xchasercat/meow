@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use meow_pkg::{
-    Cache, CacheError, ContentHash, LockEntry, Lockfile, PackageName, PnpError, RegistryProvenance,
-    ResolutionGraph, Version, VersionReq,
+    Cache, CacheError, ContentHash, DepSpec, LockEntry, Lockfile, PackageName, PnpError,
+    RegistryProvenance, ResolutionGraph, Version, VersionReq,
 };
 
 fn tmp_dir(tag: &str) -> PathBuf {
@@ -276,7 +276,7 @@ fn from_project_pins_roots_and_handles_empty_or_missing_lockfiles() {
         .write_canonical(&project.join("meow.lock.jsonl"))
         .expect("write canonical lockfile");
 
-    let direct = BTreeMap::from([(PackageName::new("a"), req("^1.0.0"))]);
+    let direct = BTreeMap::from([(PackageName::new("a"), DepSpec::Range(req("^1.0.0")))]);
     let graph = ResolutionGraph::from_project(&project, &direct).expect("graph from project");
     assert_eq!(
         graph.root_deps().get(&PackageName::new("a")),

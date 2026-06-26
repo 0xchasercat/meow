@@ -6,7 +6,7 @@
 //! add/remove/install-with-package actions.
 
 use crate::ConfigError;
-use meow_pkg::{PackageName, VersionReq};
+use meow_pkg::{DepSpec, PackageName};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -64,14 +64,14 @@ impl PackageJson {
         parse_package_json_bytes(&path, &bytes)
     }
 
-    pub fn direct_dependencies(&self) -> Result<BTreeMap<PackageName, VersionReq>, ConfigError> {
+    pub fn direct_dependencies(&self) -> Result<BTreeMap<PackageName, DepSpec>, ConfigError> {
         let mut merged = BTreeMap::new();
         merge_dependency_section(&mut merged, &self.dependencies)?;
         merge_dev_dependency_section(&mut merged, &self.dev_dependencies)?;
         Ok(merged)
     }
 
-    pub fn package_overrides(&self) -> Result<BTreeMap<PackageName, VersionReq>, ConfigError> {
+    pub fn package_overrides(&self) -> Result<BTreeMap<PackageName, DepSpec>, ConfigError> {
         let mut overrides = BTreeMap::new();
         merge_dependency_section(&mut overrides, &self.overrides)?;
         Ok(overrides)
@@ -116,40 +116,43 @@ pub(crate) fn render_package_json_value(
     Ok(contents)
 }
 
+fn dep_spec_to_string(spec: &DepSpec) -> String {
+    match spec {
+        DepSpec::Range(req) => req.to_string(),
+        DepSpec::Tag(tag) => tag.clone(),
+        DepSpec::Alias { package, spec } => {
+            let inner = dep_spec_to_string(spec);
+            if inner == "latest" {
+                format!("npm:{package}")
+            } else {
+                format!("npm:{package}@{inner}")
+            }
+        }
+    }
+}
+
 fn merge_dependency_section(
-    merged: &mut BTreeMap<PackageName, VersionReq>,
+    merged: &mut BTreeMap<PackageName, DepSpec>,
     deps: &BTreeMap<PackageName, String>,
 ) -> Result<(), ConfigError> {
     for (name, spec) in deps {
-        let parsed = VersionReq::parse(spec).map_err(|source| {
-            ConfigError::UnsupportedDependencySpecifier {
-                name: name.to_string(),
-                spec: spec.clone(),
-                source,
-            }
-        })?;
+        let parsed = DepSpec::parse(spec);
         merged.insert(name.clone(), parsed);
     }
     Ok(())
 }
 
 fn merge_dev_dependency_section(
-    merged: &mut BTreeMap<PackageName, VersionReq>,
+    merged: &mut BTreeMap<PackageName, DepSpec>,
     dev_deps: &BTreeMap<PackageName, String>,
 ) -> Result<(), ConfigError> {
     for (name, spec) in dev_deps {
-        let parsed = VersionReq::parse(spec).map_err(|source| {
-            ConfigError::UnsupportedDependencySpecifier {
-                name: name.to_string(),
-                spec: spec.clone(),
-                source,
-            }
-        })?;
+        let parsed = DepSpec::parse(spec);
         if let Some(existing) = merged.get(name) {
             if existing != &parsed {
                 return Err(ConfigError::ConflictingDependencySpecifier {
                     name: name.to_string(),
-                    dependencies_spec: existing.to_string(),
+                    dependencies_spec: dep_spec_to_string(existing),
                     dev_dependencies_spec: spec.clone(),
                 });
             }
@@ -279,34 +282,43 @@ mod tests {
             .direct_dependencies()
             .expect("merge direct deps");
         assert_eq!(
-            direct.get(&PackageName::new("dep")).map(VersionReq::as_str),
-            Some("^1.2.3")
+            direct.get(&PackageName::new("dep")).map(dep_spec_to_string),
+            Some("^1.2.3".to_owned())
         );
         assert_eq!(
             direct
                 .get(&PackageName::new("star"))
-                .map(VersionReq::as_str),
-            Some("*")
+                .map(dep_spec_to_string),
+            Some("*".to_owned())
         );
     }
 
     #[test]
-    fn direct_dependencies_reject_non_semver_specifiers() {
+    fn direct_dependencies_accept_dist_tags_and_npm_aliases() {
         let package_json = PackageJson {
-            dependencies: BTreeMap::from([(PackageName::new("dep"), "latest".to_owned())]),
+            dependencies: BTreeMap::from([
+                (PackageName::new("dep"), "latest".to_owned()),
+                (
+                    PackageName::new("alias"),
+                    "npm:@types/webpack-sources@0.1.5".to_owned(),
+                ),
+            ]),
             ..PackageJson::default()
         };
 
-        let err = package_json
+        let direct = package_json
             .direct_dependencies()
-            .expect_err("latest must be rejected");
-        match err {
-            ConfigError::UnsupportedDependencySpecifier { name, spec, .. } => {
-                assert_eq!(name, "dep");
-                assert_eq!(spec, "latest");
-            }
-            other => panic!("got {other:?}, want UnsupportedDependencySpecifier"),
-        }
+            .expect("parse dependencies");
+        assert_eq!(
+            direct.get(&PackageName::new("dep")).map(dep_spec_to_string),
+            Some("latest".to_owned())
+        );
+        assert_eq!(
+            direct
+                .get(&PackageName::new("alias"))
+                .map(dep_spec_to_string),
+            Some("npm:@types/webpack-sources@0.1.5".to_owned())
+        );
     }
 
     #[test]
@@ -345,8 +357,8 @@ mod tests {
         assert_eq!(
             overrides
                 .get(&PackageName::new("vite"))
-                .map(VersionReq::as_str),
-            Some("^7")
+                .map(dep_spec_to_string),
+            Some("^7".to_owned())
         );
     }
 

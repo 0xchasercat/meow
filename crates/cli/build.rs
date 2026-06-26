@@ -15,6 +15,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=../runtime/src/js");
+    println!("cargo:rerun-if-changed=../runtime/src/js/node_globals.js");
     deno_napi::print_linker_flags("meow");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
 
@@ -105,6 +108,7 @@ fn build_full_extension_set() -> Vec<deno_core::Extension> {
     let node_opts = meow_runtime::node::NodeOptions {
         mode: meow_runtime::node::NodeMode::Enabled,
         argv: vec!["meow".to_string(), "snapshot-placeholder".to_string()],
+        main_module: None,
         cwd: PathBuf::from("/"),
         env: BTreeMap::from([("MEOW_SNAPSHOT_BUILD".to_string(), "1".to_string())]),
         deno_node_services: None,

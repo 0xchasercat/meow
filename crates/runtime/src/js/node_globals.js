@@ -205,7 +205,6 @@ if (globalThis.Deno) {
       denoNs.mainModule = bootstrapInfo.mainModule;
     }
 
-
     if (core.build !== undefined) {
       denoNs.build = core.build;
     }
@@ -505,8 +504,7 @@ if (globalThis.Deno) {
   if (
     processValue &&
     typeof processValue === "object" &&
-    typeof denoNs.execPath === "function" &&
-    (!processValue.execPath || processValue.execPath.length === 0)
+    typeof denoNs.execPath === "function"
   ) {
     processValue.execPath = denoNs.execPath();
   }
@@ -681,6 +679,9 @@ function meowApplyDenoNamespace(info) {
       }
     }
   }
+  if (info.execPath && processValue && typeof processValue === "object") {
+    processValue.execPath = String(info.execPath);
+  }
   if (info.env && typeof info.env === "object" && processValue && processValue.env) {
     for (const key of Object.keys(info.env)) {
       try {
@@ -715,6 +716,37 @@ function meowRunNodeBootstrap(info, warmup) {
 
 // Invoked by the host (meow-runtime refresh_bootstrap_state) at runtime when booting
 // from a snapshot: re-read the real bootstrap state and run the genuine Node bootstrap.
+function meowApplyProcessBootstrapOverrides(info) {
+  if (!processValue || typeof processValue !== "object") return;
+  if (Array.isArray(info.argv)) {
+    processValue.argv = info.argv.map((arg) => String(arg));
+  }
+  if (info.execPath) {
+    processValue.execPath = String(info.execPath);
+  }
+  if (info.cwd) {
+    let processCwd = info.cwd;
+    processValue.cwd = () => processCwd;
+    processValue.chdir = (nextCwd) => {
+      processCwd = String(nextCwd);
+    };
+  }
+}
+
+function meowSetupChildIpc() {
+  if (
+    processValue?.env?.NODE_CHANNEL_FD === undefined ||
+    (processValue?.env?.MEOW_IPC_PARENT_TO_CHILD && processValue?.env?.MEOW_IPC_CHILD_TO_PARENT) ||
+    typeof processValue.send === "function"
+  ) {
+    return;
+  }
+  core.loadExtScript("ext:deno_node/child_process.ts");
+  if (typeof internals.__setupChildProcessIpcChannel === "function") {
+    internals.__setupChildProcessIpcChannel();
+  }
+}
+
 globalThis.__meowRuntimeBootstrap = function () {
   const info = typeof core.ops.op_meow_node_bootstrap_info === "function"
     ? core.ops.op_meow_node_bootstrap_info()
@@ -722,32 +754,12 @@ globalThis.__meowRuntimeBootstrap = function () {
   if (!info) return;
   meowApplyDenoNamespace(info);
   meowRunNodeBootstrap(info, false);
+  meowApplyProcessBootstrapOverrides(info);
+  meowSetupChildIpc();
 };
 
   meowRunNodeBootstrap(bootstrapInfo, bootstrapInfo.env?.MEOW_SNAPSHOT_BUILD === "1");
-
-
-if (
-  processValue &&
-  typeof processValue === "object" &&
-  Array.isArray(processValue.argv) &&
-  typeof bootstrapInfo.argv?.[0] === "string" &&
-  bootstrapInfo.argv[0].length > 0
-) {
-  processValue.argv[0] = bootstrapInfo.argv[0];
-}
-
-if (
-  processValue &&
-  typeof processValue === "object" &&
-  bootstrapInfo.cwd
-) {
-  let processCwd = bootstrapInfo.cwd;
-  processValue.cwd = () => processCwd;
-  processValue.chdir = (nextCwd) => {
-    processCwd = String(nextCwd);
-  };
-}
+  meowApplyProcessBootstrapOverrides(bootstrapInfo);
 
 
 for (const target of [nodeFsModule.default]) {
@@ -804,22 +816,7 @@ for (const target of [nodeFsModule.default]) {
 
 // __meowWatchKickPatch removed: real fs events now flow via Deno.watchFs (op_meow_fs_events_*).
 
-if (
-  processValue?.env?.NODE_CHANNEL_FD !== undefined &&
-  !(
-    processValue?.env?.MEOW_IPC_PARENT_TO_CHILD &&
-    processValue?.env?.MEOW_IPC_CHILD_TO_PARENT
-  )
-) {
-  try {
-    core.loadExtScript("ext:deno_node/child_process.ts");
-    if (typeof internals.__setupChildProcessIpcChannel === "function") {
-      internals.__setupChildProcessIpcChannel();
-    }
-  } catch {
-    // Child IPC is optional outside forked child processes.
-  }
-}
+meowSetupChildIpc();
 
 const netModule = nodeNet.default ?? nodeNet;
 const serverPrototype = netModule.Server?.prototype;

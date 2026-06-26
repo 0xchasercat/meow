@@ -153,6 +153,13 @@ struct PlannedNode {
     version_meta: crate::VersionMetadata,
 }
 
+#[derive(Debug, Clone)]
+struct PendingRoot {
+    name: PackageName,
+    registry_name: PackageName,
+    selection_spec: DepSpec,
+}
+
 /// Resolve a project's declared dependencies into a complete pinned graph.
 pub struct Installer<'a> {
     source: Arc<dyn RegistrySource>,
@@ -163,21 +170,37 @@ pub struct Installer<'a> {
     overrides: BTreeMap<PackageName, DepSpec>,
 }
 
+/// Phase of the install pipeline — used by the UI to pick an informative label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressPhase {
+    Metadata,
+    Tarball,
+    Cache,
+}
+
+/// Every variant carries `(cached, resolved_total)` — two counters that ONLY
+/// ever increase.  The UI computes its fraction as `cached / resolved_total`,
+/// which is strictly monotonic.  `phase` hints at the current pipeline stage
+/// for label generation.
 #[derive(Debug, Clone)]
 pub enum InstallProgress {
     MetadataFetched {
         package: PackageName,
-        fetched: usize,
+        cached: usize,
+        resolved_total: usize,
+        phase: ProgressPhase,
     },
     PackageDownloaded {
         package: PackageName,
-        downloaded: usize,
-        total: usize,
+        cached: usize,
+        resolved_total: usize,
+        phase: ProgressPhase,
     },
     PackageCached {
         package: PackageName,
         cached: usize,
-        pending: usize,
+        resolved_total: usize,
+        phase: ProgressPhase,
     },
 }
 
@@ -263,403 +286,211 @@ impl<'a> Installer<'a> {
         F: FnMut(InstallProgress),
     {
         let mut metadata = BTreeMap::new();
-        let mut queue = VecDeque::new();
+        let mut metadata_inflight = BTreeSet::new();
+        let mut metadata_set = tokio::task::JoinSet::new();
+        let mut tarball_set = tokio::task::JoinSet::new();
+        let mut pending_tarballs = VecDeque::new();
+        let mut root_waiters: BTreeMap<PackageName, Vec<PendingRoot>> = BTreeMap::new();
+        let mut exact_waiters: BTreeMap<PackageName, Vec<QueueNode>> = BTreeMap::new();
+        let mut ready_exact = VecDeque::new();
+        let mut blocked_plans = Vec::new();
         let mut selected: BTreeMap<PackageName, BTreeSet<Version>> = BTreeMap::new();
-        let host = HostPlatform::current();
         let mut done = BTreeSet::new();
-        let mut jobs = Vec::new();
+        let mut lockfile = Lockfile::new();
+        let host = HostPlatform::current();
+        let mut resolved_total = 0usize;
+        let mut cached = 0usize;
 
-        let mut direct_fetch = Vec::new();
-        let mut direct_names = BTreeSet::new();
         for (name, spec) in direct {
             let effective_spec = self.effective_spec(name, spec);
-            let registry_name = effective_spec.registry_package(name).clone();
-            if self.resolve_locked_node(
-                name,
-                effective_spec,
-                &mut selected,
-                &mut queue,
-                &mut done,
-                &mut jobs,
-            )? {
+            if let Some(entry) = self.cached_spec_lock_entry(name, effective_spec) {
+                let package = entry.name.clone();
+                if self.accept_reusable_lock_entry(
+                    entry,
+                    &mut selected,
+                    &mut done,
+                    &mut ready_exact,
+                    &mut lockfile,
+                ) {
+                    resolved_total += 1;
+                    cached += 1;
+                    on_progress(InstallProgress::PackageCached {
+                        package,
+                        cached,
+                        resolved_total,
+                        phase: ProgressPhase::Cache,
+                    });
+                }
                 continue;
             }
-            direct_names.insert(registry_name.clone());
-            direct_fetch.push((
-                name.clone(),
-                registry_name,
-                effective_spec.selection_spec().clone(),
-            ));
-        }
-        self.prefetch_metadata_parallel(&mut metadata, direct_names, &mut on_progress)
-            .await?;
-        for (name, registry_name, selection_spec) in direct_fetch {
-            let meta = metadata.get(&registry_name).cloned().ok_or_else(|| {
-                InstallError::Registry(RegistryError::Metadata {
-                    name: registry_name.to_string(),
-                    reason: "metadata missing after prefetch".to_owned(),
-                })
-            })?;
-            let version = select_version(&registry_name, &meta, &selection_spec)?;
-            selected
-                .entry(name.clone())
+
+            let registry_name = effective_spec.registry_package(name).clone();
+            root_waiters
+                .entry(registry_name.clone())
                 .or_default()
-                .insert(version.clone());
-            queue.push_back(QueueNode {
-                name,
+                .push(PendingRoot {
+                    name: name.clone(),
+                    registry_name: registry_name.clone(),
+                    selection_spec: effective_spec.selection_spec().clone(),
+                });
+            spawn_metadata_fetch(
+                &self.source,
                 registry_name,
-                version,
-            });
+                &metadata,
+                &mut metadata_inflight,
+                &mut metadata_set,
+            );
         }
 
-        while !queue.is_empty() {
-            let batch: Vec<QueueNode> = queue.drain(..).collect();
-            let mut fetch_batch = Vec::new();
-            let mut batch_names = BTreeSet::new();
-            for node in batch {
-                if done.contains(&(node.name.clone(), node.version.clone())) {
-                    continue;
+        self.drain_ready_resolution(
+            &metadata,
+            &mut metadata_inflight,
+            &mut metadata_set,
+            &mut ready_exact,
+            &mut exact_waiters,
+            &mut blocked_plans,
+            &mut selected,
+            &mut done,
+            &mut lockfile,
+            &mut pending_tarballs,
+            &mut resolved_total,
+            &mut cached,
+            &mut on_progress,
+            host,
+        )?;
+        pump_tarball_downloads(&self.source, &mut pending_tarballs, &mut tarball_set);
+
+        while metadata_set.len() > 0 || tarball_set.len() > 0 || !pending_tarballs.is_empty() {
+            pump_tarball_downloads(&self.source, &mut pending_tarballs, &mut tarball_set);
+
+            if metadata_set.len() > 0 && tarball_set.len() > 0 {
+                tokio::select! {
+                    item = metadata_set.join_next() => {
+                        self.handle_metadata_result(
+                            item,
+                            &mut metadata,
+                            &mut metadata_inflight,
+                            &mut root_waiters,
+                            &mut exact_waiters,
+                            &mut ready_exact,
+                            &mut selected,
+                            cached,
+                            resolved_total,
+                            &mut on_progress,
+                        )?;
+                        self.drain_ready_resolution(
+                            &metadata,
+                            &mut metadata_inflight,
+                            &mut metadata_set,
+                            &mut ready_exact,
+                            &mut exact_waiters,
+                            &mut blocked_plans,
+                            &mut selected,
+                            &mut done,
+                            &mut lockfile,
+                            &mut pending_tarballs,
+                            &mut resolved_total,
+                            &mut cached,
+                            &mut on_progress,
+                            host,
+                        )?;
+                        pump_tarball_downloads(&self.source, &mut pending_tarballs, &mut tarball_set);
+                    }
+                    item = tarball_set.join_next() => {
+                        self.handle_tarball_result(
+                            item,
+                            &mut lockfile,
+                            &mut cached,
+                            resolved_total,
+                            &mut on_progress,
+                        )?;
+                        pump_tarball_downloads(&self.source, &mut pending_tarballs, &mut tarball_set);
+                    }
                 }
-                if self.resolve_locked_exact_node(
-                    &node.name,
-                    &node.version,
+            } else if metadata_set.len() > 0 {
+                let item = metadata_set.join_next().await;
+                self.handle_metadata_result(
+                    item,
+                    &mut metadata,
+                    &mut metadata_inflight,
+                    &mut root_waiters,
+                    &mut exact_waiters,
+                    &mut ready_exact,
                     &mut selected,
-                    &mut queue,
-                    &mut done,
-                    &mut jobs,
-                )? {
-                    continue;
-                }
-                batch_names.insert(node.registry_name.clone());
-                fetch_batch.push(node);
-            }
-            self.prefetch_metadata_parallel(&mut metadata, batch_names, &mut on_progress)
-                .await?;
-
-            let mut planned = Vec::new();
-            let mut dep_names = BTreeSet::new();
-
-            for node in fetch_batch {
-                if done.contains(&(node.name.clone(), node.version.clone())) {
-                    continue;
-                }
-                let meta = metadata.get(&node.registry_name).ok_or_else(|| {
-                    InstallError::Registry(RegistryError::Metadata {
-                        name: node.registry_name.to_string(),
-                        reason: "metadata missing after prefetch".to_owned(),
-                    })
-                })?;
-                let version_meta = meta.versions.get(&node.version).cloned().ok_or_else(|| {
-                    InstallError::MissingVersion {
-                        name: node.registry_name.to_string(),
-                        version: node.version.to_string(),
-                    }
-                })?;
-                dep_names.extend(
-                    version_meta
-                        .dependencies
-                        .iter()
-                        .filter_map(|(dep, raw_req)| {
-                            let dep_spec = DepSpec::parse(raw_req);
-                            let effective_spec = self.effective_spec(dep, &dep_spec);
-                            self.cached_locked_entry_for_spec(dep, &effective_spec)
-                                .is_none()
-                                .then(|| effective_spec.registry_package(dep).clone())
-                        }),
-                );
-                dep_names.extend(version_meta.optional_dependencies.iter().filter_map(
-                    |(dep, raw_req)| {
-                        let dep_spec = DepSpec::parse(raw_req);
-                        let effective_spec = self.effective_spec(dep, &dep_spec);
-                        let dep_registry_name = effective_spec.registry_package(dep);
-                        if !package_name_is_next_swc_for_host(dep_registry_name, host) {
-                            return None;
-                        }
-                        self.cached_locked_entry_for_spec(dep, &effective_spec)
-                            .is_none()
-                            .then(|| dep_registry_name.clone())
-                    },
-                ));
-                dep_names.extend(version_meta.peer_dependencies.iter().filter_map(
-                    |(dep, raw_req)| {
-                        if version_meta
-                            .peer_dependencies_meta
-                            .get(dep)
-                            .map(|m| m.optional)
-                            .unwrap_or(false)
-                        {
-                            return None;
-                        }
-                        let dep_spec = DepSpec::parse(raw_req);
-                        let effective_spec = self.effective_spec(dep, &dep_spec);
-                        self.cached_locked_entry_for_spec(dep, &effective_spec)
-                            .is_none()
-                            .then(|| effective_spec.registry_package(dep).clone())
-                    },
-                ));
-                planned.push(PlannedNode {
-                    name: node.name,
-                    version: node.version,
-                    version_meta,
-                });
-            }
-
-            self.prefetch_metadata_parallel(&mut metadata, dep_names, &mut on_progress)
-                .await?;
-
-            for node in planned {
-                let mut dependencies = BTreeMap::new();
-                for (dep, raw_req) in &node.version_meta.dependencies {
-                    let dep_spec = DepSpec::parse(raw_req);
-                    let effective_spec = self.effective_spec(dep, &dep_spec);
-                    let dep_registry_name = effective_spec.registry_package(dep).clone();
-                    if let Some(entry) =
-                        self.locked_entry_for_spec(dep, effective_spec.selection_spec())
-                    {
-                        dependencies.insert(dep.clone(), entry.version.clone());
-                        queue.push_back(QueueNode {
-                            name: dep.clone(),
-                            registry_name: dep_registry_name,
-                            version: entry.version.clone(),
-                        });
-                        continue;
-                    }
-                    let dep_meta = metadata.get(&dep_registry_name).ok_or_else(|| {
-                        InstallError::Registry(RegistryError::Metadata {
-                            name: dep_registry_name.to_string(),
-                            reason: "metadata missing after prefetch".to_owned(),
-                        })
-                    })?;
-                    let dep_version = select_version(
-                        &dep_registry_name,
-                        dep_meta,
-                        effective_spec.selection_spec(),
-                    )?;
-                    dependencies.insert(dep.clone(), dep_version.clone());
-                    queue.push_back(QueueNode {
-                        name: dep.clone(),
-                        registry_name: dep_registry_name,
-                        version: dep_version,
-                    });
-                }
-                for (dep, raw_req) in &node.version_meta.optional_dependencies {
-                    let dep_spec = DepSpec::parse(raw_req);
-                    let effective_spec = self.effective_spec(dep, &dep_spec);
-                    let dep_registry_name = effective_spec.registry_package(dep).clone();
-                    if !package_name_is_next_swc_for_host(&dep_registry_name, host) {
-                        continue;
-                    }
-                    if let Some(entry) =
-                        self.locked_entry_for_spec(dep, effective_spec.selection_spec())
-                    {
-                        dependencies.insert(dep.clone(), entry.version.clone());
-                        queue.push_back(QueueNode {
-                            name: dep.clone(),
-                            registry_name: dep_registry_name,
-                            version: entry.version.clone(),
-                        });
-                        continue;
-                    }
-                    let dep_meta = metadata.get(&dep_registry_name).ok_or_else(|| {
-                        InstallError::Registry(RegistryError::Metadata {
-                            name: dep_registry_name.to_string(),
-                            reason: "metadata missing after prefetch".to_owned(),
-                        })
-                    })?;
-                    let dep_version = select_version(
-                        &dep_registry_name,
-                        dep_meta,
-                        effective_spec.selection_spec(),
-                    )?;
-                    let dep_locked_meta = dep_meta.versions.get(&dep_version).ok_or_else(|| {
-                        InstallError::MissingVersion {
-                            name: dep_registry_name.to_string(),
-                            version: dep_version.to_string(),
-                        }
-                    })?;
-                    if !is_compatible_optional_dependency(&dep_registry_name, dep_locked_meta, host)
-                    {
-                        continue;
-                    }
-                    dependencies.insert(dep.clone(), dep_version.clone());
-                    queue.push_back(QueueNode {
-                        name: dep.clone(),
-                        registry_name: dep_registry_name,
-                        version: dep_version,
-                    });
-                }
-
-                for (dep_name, dep_version) in &dependencies {
-                    selected
-                        .entry(dep_name.clone())
-                        .or_default()
-                        .insert(dep_version.clone());
-                }
-                for (peer, raw_req) in &node.version_meta.peer_dependencies {
-                    if node
-                        .version_meta
-                        .peer_dependencies_meta
-                        .get(peer)
-                        .map(|m| m.optional)
-                        .unwrap_or(false)
-                    {
-                        continue;
-                    }
-                    if dependencies.contains_key(peer) {
-                        continue;
-                    }
-                    let dep_spec = DepSpec::parse(raw_req);
-                    let effective_spec = self.effective_spec(peer, &dep_spec);
-                    if let Some(existing) = selected.get(peer).and_then(|set| {
-                        max_selected_satisfying(set, effective_spec.selection_spec())
-                    }) {
-                        dependencies.insert(peer.clone(), existing);
-                        continue;
-                    }
-                    let dep_registry_name = effective_spec.registry_package(peer).clone();
-                    if let Some(entry) =
-                        self.locked_entry_for_spec(peer, effective_spec.selection_spec())
-                    {
-                        dependencies.insert(peer.clone(), entry.version.clone());
-                        selected
-                            .entry(peer.clone())
-                            .or_default()
-                            .insert(entry.version.clone());
-                        queue.push_back(QueueNode {
-                            name: peer.clone(),
-                            registry_name: dep_registry_name,
-                            version: entry.version.clone(),
-                        });
-                        continue;
-                    }
-                    let Some(dep_meta) = metadata.get(&dep_registry_name) else {
-                        continue;
-                    };
-                    let Ok(dep_version) = select_version(
-                        &dep_registry_name,
-                        dep_meta,
-                        effective_spec.selection_spec(),
-                    ) else {
-                        continue;
-                    };
-                    dependencies.insert(peer.clone(), dep_version.clone());
-                    selected
-                        .entry(peer.clone())
-                        .or_default()
-                        .insert(dep_version.clone());
-                    queue.push_back(QueueNode {
-                        name: peer.clone(),
-                        registry_name: dep_registry_name,
-                        version: dep_version,
-                    });
-                }
-                jobs.push(ResolvedNode {
-                    name: node.name.clone(),
-                    version: node.version.clone(),
-                    tarball: node.version_meta.dist.tarball,
-                    integrity: node.version_meta.dist.integrity,
-                    dependencies,
-                });
-                done.insert((node.name, node.version));
-            }
-        }
-
-        let total = jobs.len();
-        let mut lockfile = Lockfile::new();
-        let mut cached = 0usize;
-        let mut downloads = Vec::new();
-
-        for node in jobs {
-            if let Some(entry) = self.reusable_lock_entry(&node)? {
-                lockfile.upsert(entry);
-                cached += 1;
-                on_progress(InstallProgress::PackageCached {
-                    package: node.name,
                     cached,
-                    pending: total.saturating_sub(cached),
-                });
+                    resolved_total,
+                    &mut on_progress,
+                )?;
+                self.drain_ready_resolution(
+                    &metadata,
+                    &mut metadata_inflight,
+                    &mut metadata_set,
+                    &mut ready_exact,
+                    &mut exact_waiters,
+                    &mut blocked_plans,
+                    &mut selected,
+                    &mut done,
+                    &mut lockfile,
+                    &mut pending_tarballs,
+                    &mut resolved_total,
+                    &mut cached,
+                    &mut on_progress,
+                    host,
+                )?;
+                pump_tarball_downloads(&self.source, &mut pending_tarballs, &mut tarball_set);
             } else {
-                downloads.push(node);
+                let item = tarball_set.join_next().await;
+                self.handle_tarball_result(
+                    item,
+                    &mut lockfile,
+                    &mut cached,
+                    resolved_total,
+                    &mut on_progress,
+                )?;
+                pump_tarball_downloads(&self.source, &mut pending_tarballs, &mut tarball_set);
             }
         }
 
-        let downloaded = self
-            .fetch_tarballs_parallel(downloads, &mut on_progress)
-            .await?;
-        for downloaded in downloaded {
-            let integrity = self.cache.store(&downloaded.bytes)?;
-            let node = downloaded.node;
-            lockfile.upsert(LockEntry {
-                name: node.name.clone(),
-                version: node.version.clone(),
-                integrity,
-                dependencies: node.dependencies,
-                registry: RegistryProvenance::new(&self.registry_url),
-                capabilities: vec![],
-                wasm: vec![],
-                meow: self.meow_req.clone(),
-            });
-            cached += 1;
-            on_progress(InstallProgress::PackageCached {
-                package: node.name,
-                cached,
-                pending: total.saturating_sub(cached),
-            });
+        if !root_waiters.is_empty() || !exact_waiters.is_empty() || !blocked_plans.is_empty() {
+            return Err(InstallError::Registry(RegistryError::Fetch {
+                target: "resolver pipeline".to_owned(),
+                reason: "metadata pipeline drained before every waiting package was resolved"
+                    .to_owned(),
+            }));
         }
 
         Ok(lockfile)
     }
 
-    fn resolve_locked_node(
-        &self,
-        name: &PackageName,
-        spec: &DepSpec,
-        selected: &mut BTreeMap<PackageName, BTreeSet<Version>>,
-        queue: &mut VecDeque<QueueNode>,
-        done: &mut BTreeSet<(PackageName, Version)>,
-        jobs: &mut Vec<ResolvedNode>,
-    ) -> Result<bool, InstallError> {
-        let Some(entry) = self.locked_entry_for_spec(name, spec) else {
-            return Ok(false);
-        };
-        self.resolve_locked_entry(entry, selected, queue, done, jobs)
+    fn cached_spec_lock_entry(&self, name: &PackageName, spec: &DepSpec) -> Option<LockEntry> {
+        let entry = self.locked_entry_for_spec(name, spec)?;
+        self.lock_entry_is_reusable(entry).then(|| entry.clone())
     }
 
-    fn resolve_locked_exact_node(
-        &self,
-        name: &PackageName,
-        version: &Version,
-        selected: &mut BTreeMap<PackageName, BTreeSet<Version>>,
-        queue: &mut VecDeque<QueueNode>,
-        done: &mut BTreeSet<(PackageName, Version)>,
-        jobs: &mut Vec<ResolvedNode>,
-    ) -> Result<bool, InstallError> {
-        let Some(entry) = self
+    fn cached_exact_lock_entry(&self, name: &PackageName, version: &Version) -> Option<LockEntry> {
+        let entry = self
             .reuse_lockfile
             .as_ref()
-            .and_then(|lockfile| lockfile.get(name, version))
-        else {
-            return Ok(false);
-        };
-        self.resolve_locked_entry(entry, selected, queue, done, jobs)
+            .and_then(|lockfile| lockfile.get(name, version))?;
+        self.lock_entry_is_reusable(entry).then(|| entry.clone())
     }
 
-    fn resolve_locked_entry(
+    fn lock_entry_is_reusable(&self, entry: &LockEntry) -> bool {
+        entry.registry.registry == self.registry_url
+            && entry.meow == self.meow_req
+            && self.cache.contains(&entry.integrity)
+    }
+
+    fn accept_reusable_lock_entry(
         &self,
-        entry: &LockEntry,
+        entry: LockEntry,
         selected: &mut BTreeMap<PackageName, BTreeSet<Version>>,
-        queue: &mut VecDeque<QueueNode>,
         done: &mut BTreeSet<(PackageName, Version)>,
-        jobs: &mut Vec<ResolvedNode>,
-    ) -> Result<bool, InstallError> {
-        if entry.registry.registry != self.registry_url || entry.meow != self.meow_req {
-            return Ok(false);
-        }
-        if !self.cache.contains(&entry.integrity) {
-            return Ok(false);
-        }
+        ready_exact: &mut VecDeque<QueueNode>,
+        lockfile: &mut Lockfile,
+    ) -> bool {
         if !done.insert((entry.name.clone(), entry.version.clone())) {
-            return Ok(true);
+            return false;
         }
         selected
             .entry(entry.name.clone())
@@ -670,20 +501,14 @@ impl<'a> Installer<'a> {
                 .entry(dep_name.clone())
                 .or_default()
                 .insert(dep_version.clone());
-            queue.push_back(QueueNode {
+            ready_exact.push_back(QueueNode {
                 name: dep_name.clone(),
                 registry_name: dep_name.clone(),
                 version: dep_version.clone(),
             });
         }
-        jobs.push(ResolvedNode {
-            name: entry.name.clone(),
-            version: entry.version.clone(),
-            tarball: String::new(),
-            integrity: String::new(),
-            dependencies: entry.dependencies.clone(),
-        });
-        Ok(true)
+        lockfile.upsert(entry);
+        true
     }
 
     fn locked_entry_for_spec(&self, name: &PackageName, spec: &DepSpec) -> Option<&LockEntry> {
@@ -716,15 +541,6 @@ impl<'a> Installer<'a> {
         selected.map(|(_, entry)| entry)
     }
 
-    fn cached_locked_entry_for_spec(
-        &self,
-        name: &PackageName,
-        spec: &DepSpec,
-    ) -> Option<&LockEntry> {
-        let entry = self.locked_entry_for_spec(name, spec)?;
-        self.cache.contains(&entry.integrity).then_some(entry)
-    }
-
     fn reusable_lock_entry(&self, node: &ResolvedNode) -> Result<Option<LockEntry>, InstallError> {
         let Some(entry) = self
             .reuse_lockfile
@@ -747,111 +563,495 @@ impl<'a> Installer<'a> {
         }
     }
 
-    async fn fetch_tarballs_parallel<F>(
+    fn drain_ready_resolution<F>(
         &self,
-        jobs: Vec<ResolvedNode>,
+        metadata: &BTreeMap<PackageName, PackageMetadata>,
+        metadata_inflight: &mut BTreeSet<PackageName>,
+        metadata_set: &mut tokio::task::JoinSet<
+            Result<(PackageName, PackageMetadata), RegistryError>,
+        >,
+        ready_exact: &mut VecDeque<QueueNode>,
+        exact_waiters: &mut BTreeMap<PackageName, Vec<QueueNode>>,
+        blocked_plans: &mut Vec<PlannedNode>,
+        selected: &mut BTreeMap<PackageName, BTreeSet<Version>>,
+        done: &mut BTreeSet<(PackageName, Version)>,
+        lockfile: &mut Lockfile,
+        pending_tarballs: &mut VecDeque<ResolvedNode>,
+        resolved_total: &mut usize,
+        cached: &mut usize,
         on_progress: &mut F,
-    ) -> Result<Vec<DownloadedNode>, InstallError>
+        host: HostPlatform,
+    ) -> Result<(), InstallError>
     where
         F: FnMut(InstallProgress),
     {
-        if jobs.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let total = jobs.len();
-        let mut pending = VecDeque::from(jobs);
-        let mut set = tokio::task::JoinSet::new();
-        let mut out = Vec::with_capacity(total);
-
-        while !pending.is_empty() || !set.is_empty() {
-            while set.len() < INSTALL_HTTP_CONCURRENCY {
-                let Some(node) = pending.pop_front() else {
-                    break;
+        loop {
+            let mut advanced = false;
+            while let Some(node) = ready_exact.pop_front() {
+                advanced = true;
+                if done.contains(&(node.name.clone(), node.version.clone())) {
+                    continue;
+                }
+                if let Some(entry) = self.cached_exact_lock_entry(&node.name, &node.version) {
+                    let package = entry.name.clone();
+                    if self.accept_reusable_lock_entry(entry, selected, done, ready_exact, lockfile)
+                    {
+                        *resolved_total += 1;
+                        *cached += 1;
+                        on_progress(InstallProgress::PackageCached {
+                            package,
+                            cached: *cached,
+                            resolved_total: *resolved_total,
+                            phase: ProgressPhase::Cache,
+                        });
+                    }
+                    continue;
+                }
+                let Some(meta) = metadata.get(&node.registry_name) else {
+                    exact_waiters
+                        .entry(node.registry_name.clone())
+                        .or_default()
+                        .push(node.clone());
+                    spawn_metadata_fetch(
+                        &self.source,
+                        node.registry_name,
+                        metadata,
+                        metadata_inflight,
+                        metadata_set,
+                    );
+                    continue;
                 };
-                let source = Arc::clone(&self.source);
-                set.spawn(async move {
-                    let bytes = source.fetch_tarball(&node.tarball).await?;
-                    verify_npm_integrity(&node.name, &node.version, &node.integrity, &bytes)?;
-                    Ok::<DownloadedNode, InstallError>(DownloadedNode { node, bytes })
+                let version_meta = meta.versions.get(&node.version).cloned().ok_or_else(|| {
+                    InstallError::MissingVersion {
+                        name: node.registry_name.to_string(),
+                        version: node.version.to_string(),
+                    }
+                })?;
+                blocked_plans.push(PlannedNode {
+                    name: node.name,
+                    version: node.version,
+                    version_meta,
                 });
             }
 
-            let Some(item) = set.join_next().await else {
-                break;
-            };
-            match item.map_err(worker_join_error)? {
-                Ok(done) => {
-                    let package = done.node.name.clone();
-                    out.push(done);
-                    let downloaded = out.len();
-                    on_progress(InstallProgress::PackageDownloaded {
-                        package,
-                        downloaded,
-                        total,
-                    });
+            let mut still_blocked = Vec::new();
+            for node in blocked_plans.drain(..) {
+                let missing =
+                    self.missing_metadata_for_planned_node(&node, host, selected, metadata);
+                if !missing.is_empty() {
+                    for name in missing {
+                        spawn_metadata_fetch(
+                            &self.source,
+                            name,
+                            metadata,
+                            metadata_inflight,
+                            metadata_set,
+                        );
+                    }
+                    still_blocked.push(node);
+                    continue;
                 }
-                Err(err) => {
-                    set.abort_all();
-                    return Err(err);
+                advanced = true;
+                let resolved =
+                    self.finish_planned_node(node, host, selected, metadata, ready_exact)?;
+                done.insert((resolved.name.clone(), resolved.version.clone()));
+                *resolved_total += 1;
+                if let Some(entry) = self.reusable_lock_entry(&resolved)? {
+                    let package = entry.name.clone();
+                    lockfile.upsert(entry);
+                    *cached += 1;
+                    on_progress(InstallProgress::PackageCached {
+                        package,
+                        cached: *cached,
+                        resolved_total: *resolved_total,
+                        phase: ProgressPhase::Cache,
+                    });
+                } else {
+                    pending_tarballs.push_back(resolved);
                 }
             }
-        }
+            *blocked_plans = still_blocked;
 
-        Ok(out)
+            if !advanced {
+                break;
+            }
+        }
+        Ok(())
     }
 
-    async fn prefetch_metadata_parallel<F>(
+    fn handle_metadata_result<F>(
         &self,
-        memo: &mut BTreeMap<PackageName, PackageMetadata>,
-        names: BTreeSet<PackageName>,
+        item: Option<
+            Result<Result<(PackageName, PackageMetadata), RegistryError>, tokio::task::JoinError>,
+        >,
+        metadata: &mut BTreeMap<PackageName, PackageMetadata>,
+        metadata_inflight: &mut BTreeSet<PackageName>,
+        root_waiters: &mut BTreeMap<PackageName, Vec<PendingRoot>>,
+        exact_waiters: &mut BTreeMap<PackageName, Vec<QueueNode>>,
+        ready_exact: &mut VecDeque<QueueNode>,
+        selected: &mut BTreeMap<PackageName, BTreeSet<Version>>,
+        cached: usize,
+        resolved_total: usize,
         on_progress: &mut F,
     ) -> Result<(), InstallError>
     where
         F: FnMut(InstallProgress),
     {
-        let mut pending = names
-            .into_iter()
-            .filter(|name| !memo.contains_key(name))
-            .collect::<VecDeque<_>>();
-        if pending.is_empty() {
+        let Some(item) = item else {
             return Ok(());
-        }
+        };
+        let (name, fetched) = item
+            .map_err(worker_join_error)?
+            .map_err(InstallError::Registry)?;
+        metadata_inflight.remove(&name);
+        metadata.insert(name.clone(), fetched);
+        on_progress(InstallProgress::MetadataFetched {
+            package: name.clone(),
+            cached,
+            resolved_total,
+            phase: ProgressPhase::Metadata,
+        });
 
-        let mut set = tokio::task::JoinSet::new();
-        while !pending.is_empty() || !set.is_empty() {
-            while set.len() < INSTALL_HTTP_CONCURRENCY {
-                let Some(name) = pending.pop_front() else {
-                    break;
-                };
-                let source = Arc::clone(&self.source);
-                set.spawn(async move {
-                    source
-                        .fetch_metadata(&name)
-                        .await
-                        .map(|metadata| (name, metadata))
+        if let Some(waiters) = root_waiters.remove(&name) {
+            let meta = metadata.get(&name).ok_or_else(|| {
+                InstallError::Registry(RegistryError::Metadata {
+                    name: name.to_string(),
+                    reason: "metadata missing after fetch completion".to_owned(),
+                })
+            })?;
+            for root in waiters {
+                let version = select_version(&root.registry_name, meta, &root.selection_spec)?;
+                selected
+                    .entry(root.name.clone())
+                    .or_default()
+                    .insert(version.clone());
+                ready_exact.push_back(QueueNode {
+                    name: root.name,
+                    registry_name: root.registry_name,
+                    version,
                 });
             }
+        }
+        if let Some(waiters) = exact_waiters.remove(&name) {
+            ready_exact.extend(waiters);
+        }
+        Ok(())
+    }
 
-            let Some(item) = set.join_next().await else {
-                break;
-            };
-            match item.map_err(worker_join_error)? {
-                Ok((name, fetched)) => {
-                    memo.insert(name.clone(), fetched);
-                    on_progress(InstallProgress::MetadataFetched {
-                        package: name,
-                        fetched: memo.len(),
-                    });
-                }
-                Err(err) => {
-                    set.abort_all();
-                    return Err(InstallError::Registry(err));
-                }
+    fn handle_tarball_result<F>(
+        &self,
+        item: Option<Result<Result<DownloadedNode, InstallError>, tokio::task::JoinError>>,
+        lockfile: &mut Lockfile,
+        cached: &mut usize,
+        resolved_total: usize,
+        on_progress: &mut F,
+    ) -> Result<(), InstallError>
+    where
+        F: FnMut(InstallProgress),
+    {
+        let Some(item) = item else {
+            return Ok(());
+        };
+        let done = item.map_err(worker_join_error)??;
+        let package = done.node.name.clone();
+        on_progress(InstallProgress::PackageDownloaded {
+            package: package.clone(),
+            cached: *cached,
+            resolved_total,
+            phase: ProgressPhase::Tarball,
+        });
+        let integrity = self.cache.store(&done.bytes)?;
+        let node = done.node;
+        lockfile.upsert(LockEntry {
+            name: node.name.clone(),
+            version: node.version.clone(),
+            integrity,
+            dependencies: node.dependencies,
+            registry: RegistryProvenance::new(&self.registry_url),
+            capabilities: vec![],
+            wasm: vec![],
+            meow: self.meow_req.clone(),
+        });
+        *cached += 1;
+        on_progress(InstallProgress::PackageCached {
+            package,
+            cached: *cached,
+            resolved_total,
+            phase: ProgressPhase::Cache,
+        });
+        Ok(())
+    }
+
+    fn missing_metadata_for_planned_node(
+        &self,
+        node: &PlannedNode,
+        host: HostPlatform,
+        selected: &BTreeMap<PackageName, BTreeSet<Version>>,
+        metadata: &BTreeMap<PackageName, PackageMetadata>,
+    ) -> BTreeSet<PackageName> {
+        let mut missing = BTreeSet::new();
+        for (dep, raw_req) in &node.version_meta.dependencies {
+            let dep_spec = DepSpec::parse(raw_req);
+            let effective_spec = self.effective_spec(dep, &dep_spec);
+            let dep_registry_name = effective_spec.registry_package(dep);
+            if self
+                .locked_entry_for_spec(dep, effective_spec.selection_spec())
+                .is_none()
+                && !metadata.contains_key(dep_registry_name)
+            {
+                missing.insert(dep_registry_name.clone());
             }
         }
+        for (dep, raw_req) in &node.version_meta.optional_dependencies {
+            let dep_spec = DepSpec::parse(raw_req);
+            let effective_spec = self.effective_spec(dep, &dep_spec);
+            let dep_registry_name = effective_spec.registry_package(dep);
+            if !package_name_is_next_swc_for_host(dep_registry_name, host) {
+                continue;
+            }
+            if self
+                .locked_entry_for_spec(dep, effective_spec.selection_spec())
+                .is_none()
+                && !metadata.contains_key(dep_registry_name)
+            {
+                missing.insert(dep_registry_name.clone());
+            }
+        }
+        for (peer, raw_req) in &node.version_meta.peer_dependencies {
+            if node
+                .version_meta
+                .peer_dependencies_meta
+                .get(peer)
+                .map(|m| m.optional)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let dep_spec = DepSpec::parse(raw_req);
+            let effective_spec = self.effective_spec(peer, &dep_spec);
+            if selected
+                .get(peer)
+                .and_then(|set| max_selected_satisfying(set, effective_spec.selection_spec()))
+                .is_some()
+            {
+                continue;
+            }
+            let dep_registry_name = effective_spec.registry_package(peer);
+            if self
+                .locked_entry_for_spec(peer, effective_spec.selection_spec())
+                .is_none()
+                && !metadata.contains_key(dep_registry_name)
+            {
+                missing.insert(dep_registry_name.clone());
+            }
+        }
+        missing
+    }
 
-        Ok(())
+    fn finish_planned_node(
+        &self,
+        node: PlannedNode,
+        host: HostPlatform,
+        selected: &mut BTreeMap<PackageName, BTreeSet<Version>>,
+        metadata: &BTreeMap<PackageName, PackageMetadata>,
+        ready_exact: &mut VecDeque<QueueNode>,
+    ) -> Result<ResolvedNode, InstallError> {
+        let mut dependencies = BTreeMap::new();
+        for (dep, raw_req) in &node.version_meta.dependencies {
+            let dep_spec = DepSpec::parse(raw_req);
+            let effective_spec = self.effective_spec(dep, &dep_spec);
+            let dep_registry_name = effective_spec.registry_package(dep).clone();
+            if let Some(entry) = self.locked_entry_for_spec(dep, effective_spec.selection_spec()) {
+                dependencies.insert(dep.clone(), entry.version.clone());
+                ready_exact.push_back(QueueNode {
+                    name: dep.clone(),
+                    registry_name: dep_registry_name,
+                    version: entry.version.clone(),
+                });
+                continue;
+            }
+            let dep_meta = metadata.get(&dep_registry_name).ok_or_else(|| {
+                InstallError::Registry(RegistryError::Metadata {
+                    name: dep_registry_name.to_string(),
+                    reason: "metadata missing after pipeline fetch".to_owned(),
+                })
+            })?;
+            let dep_version = select_version(
+                &dep_registry_name,
+                dep_meta,
+                effective_spec.selection_spec(),
+            )?;
+            dependencies.insert(dep.clone(), dep_version.clone());
+            ready_exact.push_back(QueueNode {
+                name: dep.clone(),
+                registry_name: dep_registry_name,
+                version: dep_version,
+            });
+        }
+        for (dep, raw_req) in &node.version_meta.optional_dependencies {
+            let dep_spec = DepSpec::parse(raw_req);
+            let effective_spec = self.effective_spec(dep, &dep_spec);
+            let dep_registry_name = effective_spec.registry_package(dep).clone();
+            if !package_name_is_next_swc_for_host(&dep_registry_name, host) {
+                continue;
+            }
+            if let Some(entry) = self.locked_entry_for_spec(dep, effective_spec.selection_spec()) {
+                dependencies.insert(dep.clone(), entry.version.clone());
+                ready_exact.push_back(QueueNode {
+                    name: dep.clone(),
+                    registry_name: dep_registry_name,
+                    version: entry.version.clone(),
+                });
+                continue;
+            }
+            let dep_meta = metadata.get(&dep_registry_name).ok_or_else(|| {
+                InstallError::Registry(RegistryError::Metadata {
+                    name: dep_registry_name.to_string(),
+                    reason: "metadata missing after pipeline fetch".to_owned(),
+                })
+            })?;
+            let dep_version = select_version(
+                &dep_registry_name,
+                dep_meta,
+                effective_spec.selection_spec(),
+            )?;
+            let dep_locked_meta = dep_meta.versions.get(&dep_version).ok_or_else(|| {
+                InstallError::MissingVersion {
+                    name: dep_registry_name.to_string(),
+                    version: dep_version.to_string(),
+                }
+            })?;
+            if !is_compatible_optional_dependency(&dep_registry_name, dep_locked_meta, host) {
+                continue;
+            }
+            dependencies.insert(dep.clone(), dep_version.clone());
+            ready_exact.push_back(QueueNode {
+                name: dep.clone(),
+                registry_name: dep_registry_name,
+                version: dep_version,
+            });
+        }
+
+        for (dep_name, dep_version) in &dependencies {
+            selected
+                .entry(dep_name.clone())
+                .or_default()
+                .insert(dep_version.clone());
+        }
+        for (peer, raw_req) in &node.version_meta.peer_dependencies {
+            if node
+                .version_meta
+                .peer_dependencies_meta
+                .get(peer)
+                .map(|m| m.optional)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if dependencies.contains_key(peer) {
+                continue;
+            }
+            let dep_spec = DepSpec::parse(raw_req);
+            let effective_spec = self.effective_spec(peer, &dep_spec);
+            if let Some(existing) = selected
+                .get(peer)
+                .and_then(|set| max_selected_satisfying(set, effective_spec.selection_spec()))
+            {
+                dependencies.insert(peer.clone(), existing);
+                continue;
+            }
+            let dep_registry_name = effective_spec.registry_package(peer).clone();
+            if let Some(entry) = self.locked_entry_for_spec(peer, effective_spec.selection_spec()) {
+                dependencies.insert(peer.clone(), entry.version.clone());
+                selected
+                    .entry(peer.clone())
+                    .or_default()
+                    .insert(entry.version.clone());
+                ready_exact.push_back(QueueNode {
+                    name: peer.clone(),
+                    registry_name: dep_registry_name,
+                    version: entry.version.clone(),
+                });
+                continue;
+            }
+            let Some(dep_meta) = metadata.get(&dep_registry_name) else {
+                continue;
+            };
+            let Ok(dep_version) = select_version(
+                &dep_registry_name,
+                dep_meta,
+                effective_spec.selection_spec(),
+            ) else {
+                continue;
+            };
+            dependencies.insert(peer.clone(), dep_version.clone());
+            selected
+                .entry(peer.clone())
+                .or_default()
+                .insert(dep_version.clone());
+            ready_exact.push_back(QueueNode {
+                name: peer.clone(),
+                registry_name: dep_registry_name,
+                version: dep_version,
+            });
+        }
+
+        Ok(ResolvedNode {
+            name: node.name,
+            version: node.version,
+            tarball: node.version_meta.dist.tarball,
+            integrity: node.version_meta.dist.integrity,
+            dependencies,
+        })
+    }
+}
+
+fn spawn_metadata_fetch(
+    source: &Arc<dyn RegistrySource>,
+    name: PackageName,
+    metadata: &BTreeMap<PackageName, PackageMetadata>,
+    metadata_inflight: &mut BTreeSet<PackageName>,
+    set: &mut tokio::task::JoinSet<Result<(PackageName, PackageMetadata), RegistryError>>,
+) {
+    if metadata.contains_key(&name) || !metadata_inflight.insert(name.clone()) {
+        return;
+    }
+    let source = Arc::clone(source);
+    set.spawn(async move {
+        source
+            .fetch_metadata(&name)
+            .await
+            .map(|metadata| (name, metadata))
+    });
+}
+
+fn pump_tarball_downloads(
+    source: &Arc<dyn RegistrySource>,
+    pending: &mut VecDeque<ResolvedNode>,
+    set: &mut tokio::task::JoinSet<Result<DownloadedNode, InstallError>>,
+) {
+    while set.len() < INSTALL_HTTP_CONCURRENCY {
+        let Some(node) = pending.pop_front() else {
+            break;
+        };
+        let source = Arc::clone(source);
+        set.spawn(async move {
+            let bytes = source.fetch_tarball(&node.tarball).await?;
+            let name = node.name.clone();
+            let version = node.version.clone();
+            let integrity = node.integrity.clone();
+            let (bytes, result) = tokio::task::spawn_blocking(move || {
+                let result = verify_npm_integrity(&name, &version, &integrity, &bytes);
+                (bytes, result)
+            })
+            .await
+            .map_err(|e| InstallError::Registry(RegistryError::Fetch {
+                target: "integrity worker".to_owned(),
+                reason: e.to_string(),
+            }))?;
+            result?;
+            Ok::<DownloadedNode, InstallError>(DownloadedNode { node, bytes })
+        });
     }
 }
 
@@ -896,39 +1096,13 @@ pub enum InstallError {
 
 /// Re-derive root dependency pins for the runtime from declared package.json deps + lockfile.
 pub fn resolve_roots(
-    declared: &BTreeMap<PackageName, VersionReq>,
+    declared: &BTreeMap<PackageName, DepSpec>,
     lockfile: &Lockfile,
 ) -> Result<BTreeMap<PackageName, Version>, RootResolveError> {
     let mut roots = BTreeMap::new();
 
-    for (name, req) in declared {
-        let req_arms = req
-            .disjunctions()
-            .map_err(|_| RootResolveError::UnsupportedRange {
-                name: name.to_string(),
-                req: req.to_string(),
-            })?;
-
-        let mut selected: Option<(semver::Version, Version)> = None;
-        for entry in lockfile.iter() {
-            if &entry.name != name {
-                continue;
-            }
-            let version = semver::Version::parse(entry.version.as_str()).map_err(|_| {
-                RootResolveError::NotInLockfile {
-                    name: name.to_string(),
-                }
-            })?;
-            if !req_arms.iter().any(|arm| arm.matches(&version)) {
-                continue;
-            }
-            match &selected {
-                Some((best, _)) if version <= *best => {}
-                _ => selected = Some((version, entry.version.clone())),
-            }
-        }
-
-        let Some((_, version)) = selected else {
+    for (name, spec) in declared {
+        let Some(version) = max_locked_satisfying(name, spec.selection_spec(), lockfile)? else {
             return Err(RootResolveError::NotInLockfile {
                 name: name.to_string(),
             });
@@ -937,6 +1111,50 @@ pub fn resolve_roots(
     }
 
     Ok(roots)
+}
+
+fn max_locked_satisfying(
+    name: &PackageName,
+    spec: &DepSpec,
+    lockfile: &Lockfile,
+) -> Result<Option<Version>, RootResolveError> {
+    let req = match spec {
+        DepSpec::Range(req) => req,
+        DepSpec::Tag(tag) => {
+            return Err(RootResolveError::UnsupportedRange {
+                name: name.to_string(),
+                req: tag.clone(),
+            });
+        }
+        DepSpec::Alias { spec, .. } => return max_locked_satisfying(name, spec, lockfile),
+    };
+    let req_arms = req
+        .disjunctions()
+        .map_err(|_| RootResolveError::UnsupportedRange {
+            name: name.to_string(),
+            req: req.to_string(),
+        })?;
+
+    let mut selected: Option<(semver::Version, Version)> = None;
+    for entry in lockfile.iter() {
+        if &entry.name != name {
+            continue;
+        }
+        let version = semver::Version::parse(entry.version.as_str()).map_err(|_| {
+            RootResolveError::NotInLockfile {
+                name: name.to_string(),
+            }
+        })?;
+        if !req_arms.iter().any(|arm| arm.matches(&version)) {
+            continue;
+        }
+        match &selected {
+            Some((best, _)) if version <= *best => {}
+            _ => selected = Some((version, entry.version.clone())),
+        }
+    }
+
+    Ok(selected.map(|(_, version)| version))
 }
 
 #[derive(thiserror::Error, Debug)]

@@ -1,11 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(target_os = "macos")]
-use std::ffi::CString;
 use std::fs;
 use std::io::{self, ErrorKind, Read, Write};
-#[cfg(target_os = "macos")]
-use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
@@ -440,7 +436,8 @@ impl<'a> Materializer<'a> {
                     LinkStrategy::Symlink => {
                         let store = unpacked_store.as_ref().expect("unpacked store");
                         let source = store.ensure(integrity)?;
-                        bytes_written += project_package_tree(&source, &abs)?;
+                        ensure_dir(abs.parent().unwrap_or(&tmp_root))?;
+                        bytes_written += copy_dir_recursive_with_hardlinks(&source, &abs)?;
                     }
                     LinkStrategy::Auto => unreachable!("effective link policy resolves auto"),
                 }
@@ -659,7 +656,8 @@ impl<'a> Materializer<'a> {
                             let source = store.dir_for(&integrity);
                             let package_dest = abs;
                             tokio::task::spawn_blocking(move || {
-                                project_package_tree(&source, &package_dest)
+                                ensure_dir(package_dest.parent().unwrap_or(&package_dest))?;
+                                copy_dir_recursive_with_hardlinks(&source, &package_dest)
                             })
                             .await
                             .map_err(|err| {
@@ -899,92 +897,7 @@ fn copy_edge_tree_deep(
     Ok(total)
 }
 
-fn project_package_tree(source: &Path, dest: &Path) -> Result<u64, MaterializeError> {
-    #[cfg(target_os = "macos")]
-    {
-        match clone_dir(source, dest) {
-            Ok(CloneOutcome::Cloned) => return Ok(0),
-            Ok(CloneOutcome::Unsupported) => cleanup_best_effort(dest),
-            Err(err) => return Err(err),
-        }
-    }
-    hardlink_dir_recursive(source, dest)
-}
 
-#[cfg(target_os = "macos")]
-enum CloneOutcome {
-    Cloned,
-    Unsupported,
-}
-
-#[cfg(target_os = "macos")]
-fn clone_dir(source: &Path, dest: &Path) -> Result<CloneOutcome, MaterializeError> {
-    unsafe extern "C" {
-        fn clonefile(
-            src: *const std::os::raw::c_char,
-            dst: *const std::os::raw::c_char,
-            flags: u32,
-        ) -> std::os::raw::c_int;
-    }
-
-    if let Some(parent) = dest.parent() {
-        ensure_dir_fast(parent)?;
-    }
-    let src = CString::new(source.as_os_str().as_bytes())
-        .map_err(|err| MaterializeError::invalid_archive(err.to_string()))?;
-    let dst = CString::new(dest.as_os_str().as_bytes())
-        .map_err(|err| MaterializeError::invalid_archive(err.to_string()))?;
-    let rc = unsafe { clonefile(src.as_ptr(), dst.as_ptr(), 0) };
-    if rc == 0 {
-        return Ok(CloneOutcome::Cloned);
-    }
-
-    let err = io::Error::last_os_error();
-    match err.raw_os_error() {
-        Some(libc::EXDEV) | Some(libc::ENOTSUP) => Ok(CloneOutcome::Unsupported),
-        _ => Err(MaterializeError::io(dest, err)),
-    }
-}
-
-fn hardlink_dir_recursive(source: &Path, dest: &Path) -> Result<u64, MaterializeError> {
-    ensure_dir_fast(dest)?;
-    let mut total = 0;
-    let entries =
-        fs::read_dir(source).map_err(|source_err| MaterializeError::io(source, source_err))?;
-    for entry in entries {
-        let entry = entry.map_err(|source_err| MaterializeError::io(source, source_err))?;
-        let entry_path = entry.path();
-        let file_type = entry
-            .file_type()
-            .map_err(|source_err| MaterializeError::io(&entry_path, source_err))?;
-        let dest_path = dest.join(entry.file_name());
-        if file_type.is_dir() {
-            total += hardlink_dir_recursive(&entry_path, &dest_path)?;
-            continue;
-        }
-        if file_type.is_file() {
-            total += hardlink_file_or_copy(&entry_path, &dest_path)?;
-            continue;
-        }
-        return Err(MaterializeError::invalid_archive(format!(
-            "unsupported hardlinked member {:?}",
-            entry_path
-        )));
-    }
-    Ok(total)
-}
-
-fn hardlink_file_or_copy(source: &Path, dest: &Path) -> Result<u64, MaterializeError> {
-    if let Some(parent) = dest.parent() {
-        ensure_dir(parent)?;
-    }
-    match fs::hard_link(source, dest) {
-        Ok(()) => Ok(fs::metadata(source)
-            .map_err(|source_err| MaterializeError::io(source, source_err))?
-            .len()),
-        Err(_) => copy_file(source, dest),
-    }
-}
 
 fn copy_dir_recursive(source: &Path, dest: &Path) -> Result<u64, MaterializeError> {
     ensure_dir(dest)?;
@@ -1010,6 +923,31 @@ fn copy_dir_recursive(source: &Path, dest: &Path) -> Result<u64, MaterializeErro
             "unsupported copied member {:?}",
             entry_path
         )));
+    }
+    Ok(total)
+}
+
+fn copy_dir_recursive_with_hardlinks(source: &Path, dest: &Path) -> Result<u64, MaterializeError> {
+    ensure_dir(dest)?;
+    let mut total = 0;
+    let entries = fs::read_dir(source).map_err(|source_err| MaterializeError::io(source, source_err))?;
+    for entry in entries {
+        let entry = entry.map_err(|source_err| MaterializeError::io(source, source_err))?;
+        let entry_path = entry.path();
+        let file_type = entry.file_type().map_err(|source_err| MaterializeError::io(&entry_path, source_err))?;
+        let dest_path = dest.join(entry.file_name());
+
+        if file_type.is_dir() {
+            total += copy_dir_recursive_with_hardlinks(&entry_path, &dest_path)?;
+            continue;
+        }
+        if file_type.is_file() {
+            if let Some(parent) = dest_path.parent() { ensure_dir(parent)?; }
+            if std::fs::hard_link(&entry_path, &dest_path).is_err() {
+                total += copy_file(&entry_path, &dest_path)?;
+            }
+            continue;
+        }
     }
     Ok(total)
 }

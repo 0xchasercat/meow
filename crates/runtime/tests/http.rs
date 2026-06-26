@@ -155,6 +155,7 @@ fn spawn_runtime(source: &str, policy: Policy) -> RuntimeThread {
                         "meow".to_owned(),
                         join_root.join("main.ts").to_string_lossy().into_owned(),
                     ],
+                    main_module: None,
                     cwd: join_root.clone(),
                     env: BTreeMap::new(),
                     deno_node_services: None,

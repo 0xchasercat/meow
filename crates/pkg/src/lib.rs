@@ -41,7 +41,9 @@ use std::path::{Path, PathBuf};
 pub use cache::Cache;
 pub use error::{CacheError, LockError, ParseHashError, ParseVersionError};
 pub use hash::{ContentHash, HashAlgo, PackageName, Version, VersionReq};
-pub use install::{resolve_roots, InstallError, InstallProgress, Installer, RootResolveError};
+pub use install::{
+    resolve_roots, InstallError, InstallProgress, Installer, ProgressPhase, RootResolveError,
+};
 // === PKG-003 ===
 pub use pnp::{PnpError, ResolutionGraph, ResolvedPackage};
 // === /PKG-003 ===

@@ -31,8 +31,8 @@ fn dep(name: &str, spec: DepSpec) -> BTreeMap<PackageName, DepSpec> {
     BTreeMap::from([(PackageName::new(name), spec)])
 }
 
-fn declared(name: &str, spec: &str) -> BTreeMap<PackageName, VersionReq> {
-    BTreeMap::from([(PackageName::new(name), req(spec))])
+fn declared(name: &str, spec: &str) -> BTreeMap<PackageName, DepSpec> {
+    BTreeMap::from([(PackageName::new(name), DepSpec::Range(req(spec)))])
 }
 
 fn installer<'a, R>(registry: &R, cache: &'a Cache) -> Installer<'a>
@@ -598,6 +598,34 @@ fn resolve_roots_supports_disjunction_ranges() {
     let roots = resolve_roots(&declared("a", "^4.0.2 || ^5.0 || ^6.0"), &lockfile)
         .expect("disjunction root resolves");
     assert_eq!(roots.get(&PackageName::new("a")), Some(&ver("6.3.0")));
+}
+
+#[test]
+fn resolve_roots_supports_alias_ranges_after_install() {
+    let mut lockfile = Lockfile::new();
+    lockfile.upsert(entry("alias", "1.0.0"));
+    lockfile.upsert(entry("alias", "1.2.0"));
+    lockfile.upsert(entry("alias", "2.0.0"));
+
+    let declared = BTreeMap::from([(
+        PackageName::new("alias"),
+        DepSpec::Alias {
+            package: PackageName::new("real-package"),
+            spec: Box::new(DepSpec::Range(req("^1.0.0"))),
+        },
+    )]);
+    let roots = resolve_roots(&declared, &lockfile).expect("alias root resolves");
+    assert_eq!(roots.get(&PackageName::new("alias")), Some(&ver("1.2.0")));
+}
+
+#[test]
+fn resolve_roots_reports_unresolved_dist_tags() {
+    let mut lockfile = Lockfile::new();
+    lockfile.upsert(entry("a", "1.0.0"));
+
+    let declared = BTreeMap::from([(PackageName::new("a"), DepSpec::Tag("latest".to_owned()))]);
+    let err = resolve_roots(&declared, &lockfile).expect_err("dist tag cannot be re-derived");
+    assert!(matches!(err, RootResolveError::UnsupportedRange { .. }));
 }
 
 #[test]

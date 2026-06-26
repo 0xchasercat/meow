@@ -36,6 +36,7 @@ pub enum NodeMode {
 pub struct NodeOptions {
     pub mode: NodeMode,
     pub argv: Vec<String>,
+    pub main_module: Option<String>,
     pub cwd: PathBuf,
     // === RUN-001 ===
     pub env: BTreeMap<String, String>,
@@ -53,6 +54,7 @@ impl NodeOptions {
         Self {
             mode: NodeMode::Enabled,
             argv,
+            main_module: None,
             cwd,
             // === RUN-001 ===
             env: BTreeMap::new(),
@@ -67,6 +69,7 @@ impl NodeOptions {
         Self {
             mode: NodeMode::StrictWeb,
             argv,
+            main_module: None,
             cwd,
             // === RUN-001 ===
             env: BTreeMap::new(),
@@ -82,6 +85,7 @@ pub fn extensions(opts: NodeOptions) -> Vec<Extension> {
     let NodeOptions {
         mode,
         argv,
+        main_module,
         cwd,
         env,
         deno_node_services,
@@ -168,7 +172,7 @@ pub fn extensions(opts: NodeOptions) -> Vec<Extension> {
         ..Default::default()
     });
     exts.push(crate::web::meow_web::init());
-    exts.push(node_bootstrap_state_extension(argv, cwd, env));
+    exts.push(node_bootstrap_state_extension(argv, main_module, cwd, env));
     exts.push(node_globals::init());
     if matches!(mode, NodeMode::StrictWeb) {
         exts.push(meow_strict_web_withdraw::init());
@@ -204,6 +208,7 @@ fn process_exit_state_extension(env: &BTreeMap<String, String>) -> Extension {
 #[derive(Clone)]
 struct NodeBootstrapState {
     argv: Vec<String>,
+    main_module: Option<String>,
     cwd: PathBuf,
     env: BTreeMap<String, String>,
 }
@@ -215,6 +220,7 @@ struct NodeBootstrapInfo {
     argv: Vec<String>,
     cwd: String,
     main_module: Option<String>,
+    exec_path: Option<String>,
     env: BTreeMap<String, String>,
     pid: u32,
     ppid: u32,
@@ -239,23 +245,16 @@ fn parent_process_id() -> u32 {
 #[serde]
 fn op_meow_node_bootstrap_info(state: &mut OpState) -> NodeBootstrapInfo {
     let bootstrap = state.borrow::<NodeBootstrapState>();
-    let main_module = bootstrap.argv.get(1).and_then(|arg| {
-        let path = PathBuf::from(arg);
-        let path = if path.is_absolute() {
-            path
-        } else {
-            bootstrap.cwd.join(path)
-        };
-        deno_core::ModuleSpecifier::from_file_path(path)
-            .ok()
-            .map(|specifier| specifier.to_string())
-    });
-
     NodeBootstrapInfo {
-        args: bootstrap.argv.iter().skip(2).cloned().collect(),
+        args: bootstrap.argv.iter().skip(1).cloned().collect(),
         argv: bootstrap.argv.clone(),
         cwd: bootstrap.cwd.to_string_lossy().into_owned(),
-        main_module,
+        main_module: bootstrap.main_module.clone(),
+        exec_path: bootstrap
+            .env
+            .get("NODE")
+            .or_else(|| bootstrap.env.get("npm_node_execpath"))
+            .cloned(),
         env: bootstrap.env.clone(),
         pid: std::process::id(),
         ppid: parent_process_id(),
@@ -264,6 +263,7 @@ fn op_meow_node_bootstrap_info(state: &mut OpState) -> NodeBootstrapInfo {
 
 fn node_bootstrap_state_extension(
     argv: Vec<String>,
+    main_module: Option<String>,
     cwd: PathBuf,
     env: BTreeMap<String, String>,
 ) -> Extension {
@@ -271,6 +271,7 @@ fn node_bootstrap_state_extension(
     ext.op_state_fn = Some(Box::new(move |state: &mut OpState| {
         state.put(NodeBootstrapState {
             argv: argv.clone(),
+            main_module: main_module.clone(),
             cwd: cwd.clone(),
             env: env.clone(),
         });
@@ -303,6 +304,7 @@ pub fn take_process_exit_code(js_runtime: &JsRuntime) -> Option<i32> {
 pub fn refresh_bootstrap_state(
     js_runtime: &mut deno_core::JsRuntime,
     argv: Vec<String>,
+    main_module: Option<String>,
     cwd: PathBuf,
     env: BTreeMap<String, String>,
 ) -> Result<(), crate::RuntimeError> {
@@ -311,7 +313,16 @@ pub fn refresh_bootstrap_state(
     {
         let op_state = js_runtime.op_state();
         let mut state = op_state.borrow_mut();
-        state.put(NodeBootstrapState { argv, cwd, env });
+        let child_pipe = child_pipe_from_env(&env);
+        state.put(NodeBootstrapState {
+            argv,
+            main_module,
+            cwd,
+            env,
+        });
+        if let Some(child_pipe) = child_pipe {
+            state.put(child_pipe);
+        }
     }
     // The snapshot's module bodies ran at snapshot-build time with placeholder
     // argv/cwd/env and only WARMED the Node bootstrap (warmup:true), leaving
