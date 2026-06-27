@@ -3293,14 +3293,35 @@ fn mode_label(mode: meow_runtime::node::NodeMode) -> &'static str {
     }
 }
 
-/// On-brand clap help styling (magenta headers + literals). clap honors NO_COLOR.
+/// On-brand clap help styling using the meow-ui palette (truecolor when supported,
+/// graceful ANSI fallback otherwise). clap honors NO_COLOR.
 fn meow_help_styles() -> clap::builder::Styles {
     use clap::builder::styling::{AnsiColor, Styles};
+    use meow_ui::palette::Rgb;
+    // Map brand RGB → ANSI for terminals that don't support truecolor
+    fn ansi(rgb: Rgb) -> AnsiColor {
+        // Approximate the brand palette to the closest standard ANSI color
+        if rgb == Rgb::FLOSS || rgb == Rgb::MAGENTA {
+            AnsiColor::BrightMagenta
+        } else if rgb == Rgb::VIOLET {
+            AnsiColor::Magenta
+        } else if rgb == Rgb::SKY {
+            AnsiColor::Cyan
+        } else if rgb == Rgb::HONEY {
+            AnsiColor::BrightYellow
+        } else if rgb == Rgb::CATNIP {
+            AnsiColor::BrightGreen
+        } else {
+            AnsiColor::White
+        }
+    }
     Styles::styled()
-        .header(AnsiColor::Magenta.on_default().bold())
-        .usage(AnsiColor::Magenta.on_default().bold())
-        .literal(AnsiColor::BrightMagenta.on_default())
-        .placeholder(AnsiColor::Cyan.on_default())
+        .header(ansi(Rgb::VIOLET).on_default().bold())
+        .usage(ansi(Rgb::VIOLET).on_default().bold())
+        .literal(ansi(Rgb::FLOSS).on_default())
+        .placeholder(ansi(Rgb::SKY).on_default())
+        .error(ansi(Rgb::HISS).on_default().bold())
+        .valid(ansi(Rgb::CATNIP).on_default())
 }
 
 /// The no-args landing screen: wordmark, tagline, grouped commands, then system
