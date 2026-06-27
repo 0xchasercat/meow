@@ -411,6 +411,8 @@ impl<'a> Materializer<'a> {
                 None
             };
 
+            let mut seen_integrity = BTreeSet::new();
+
             for node in &plan.nodes {
                 let PlanEntry::Package {
                     integrity,
@@ -439,6 +441,9 @@ impl<'a> Materializer<'a> {
                         let store = unpacked_store.as_ref().expect("unpacked store");
                         let source = store.ensure(integrity)?;
                         ensure_dir(abs.parent().unwrap_or(&tmp_root))?;
+                        if !seen_integrity.insert(integrity.to_sri()) {
+                            continue;
+                        }
                         bytes_written += copy_dir_recursive_with_hardlinks(&source, &abs)?;
                     }
                     LinkStrategy::Auto => unreachable!("effective link policy resolves auto"),
@@ -848,6 +853,8 @@ fn tree_is_current(
         return Ok(false);
     }
 
+    // Lightweight verification: stat each node in the plan.
+    // On a warm filesystem these are ~1μs each from the dentry cache.
     let root_rel = plan.root.file_name().map(PathBuf::from).unwrap_or_default();
     for node in &plan.nodes {
         let rel = path_inside_root(&node.path, &root_rel)?;
@@ -1347,10 +1354,39 @@ fn normalize_path(path: &Path, mode: u32) -> Result<(), MaterializeError> {
 }
 
 fn set_fixed_times(path: &Path) -> Result<(), MaterializeError> {
-    let file = fs::File::open(path).map_err(|source| MaterializeError::io(path, source))?;
-    let fixed = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
-    file.set_times(fs::FileTimes::new().set_accessed(fixed).set_modified(fixed))
-        .map_err(|source| MaterializeError::io(path, source))
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let ts = libc::timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        };
+        let path_c = match std::ffi::CString::new(path.as_os_str().as_bytes()) {
+            Ok(c) => c,
+            Err(_) => return Err(MaterializeError::invalid_archive(
+                "invalid path for set_fixed_times".to_string(),
+            )),
+        };
+        let ret = unsafe {
+            libc::utimensat(
+                libc::AT_FDCWD,
+                path_c.as_ptr(),
+                &[ts, ts] as *const libc::timespec,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if ret != 0 {
+            return Err(MaterializeError::io(path, std::io::Error::last_os_error()));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let fixed = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        let file = fs::File::open(path).map_err(|source| MaterializeError::io(path, source))?;
+        file.set_times(fs::FileTimes::new().set_accessed(fixed).set_modified(fixed))
+            .map_err(|source| MaterializeError::io(path, source))?;
+    }
+    Ok(())
 }
 
 fn path_key(path: &Path) -> String {
