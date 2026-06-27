@@ -278,7 +278,7 @@ pub enum Command {
     NodeEval(NodeEvalArgs),
     /// Shorthand for `meow run dev`.
     Dev(RunScriptArgs),
-    /// Install dependencies into the active projection (default: hardlinked / copy-on-write node_modules).
+    /// Install dependencies from the lockfile.
     #[command(alias = "i")]
     Install(InstallArgs),
     /// Add a dependency + update the lockfile.
@@ -290,11 +290,11 @@ pub enum Command {
     Task(TaskArgs),
     /// Isolate-backed test runner.
     Test(TestArgs),
-    /// Typecheck — delegated to the tsc/tsgo daemon (ADR-5).
+    /// Typecheck via TypeScript.
     Check(PathArgs),
-    /// Lint over the shared pipeline.
+    /// Check for lint errors.
     Lint(PathArgs),
-    /// Format over the shared pipeline.
+    /// Format source files.
     Fmt(FmtArgs),
     /// Bundle via Rolldown over the module graph.
     Bundle(BundleArgs),
@@ -309,9 +309,9 @@ pub enum Command {
     WhyDep(WhyDepArgs),
     /// Environment / config / lockfile health.
     Doctor,
-    /// Regenerate shadow configs (.meow/tsconfig.json + root tsconfig.json shim).
+    /// Regenerate TypeScript configuration and type declarations.
     Sync,
-    /// Regenerate or verify the committed `meow:*` declarations (RT-005 / types-fresh).
+    /// Regenerate bundled type declarations.
     Types(TypesArgs),
     /// List active dev servers and processes.
     Ls,
@@ -518,20 +518,20 @@ pub struct XArgs {
 
 #[derive(Debug, Args)]
 pub struct InstallArgs {
-    /// Install projection mode (CANON §18; PKG owns the final flag surface).
+    /// How to lay out installed packages on disk.
     #[arg(long, value_enum, default_value_t = InstallMode::Materialize)]
     pub mode: InstallMode,
     // === PKG-004 ===
-    /// Write a hardlinked / copy-on-write `node_modules/` projection (default behavior). §24.4.
+    /// Install into node_modules/ (default).
     #[arg(long, conflicts_with_all = ["mode", "vendor"])]
     pub materialize: bool,
-    /// Write a self-contained vendor/ copy (air-gapped deploys). §12.2.
+    /// Copy packages into a vendor/ directory instead of node_modules/.
     #[arg(long, conflicts_with_all = ["mode", "materialize"])]
     pub vendor: bool,
-    /// Vendor directory (default "vendor"); meaningful only for vendor projection.
+    /// Target directory for --vendor (default: vendor).
     #[arg(long, default_value = "vendor")]
     pub vendor_dir: PathBuf,
-    /// Remove any existing projection tree before writing.
+    /// Remove existing node_modules/ or vendor/ before writing.
     #[arg(long)]
     pub clean: bool,
     // === /PKG-004 ===
@@ -544,7 +544,7 @@ pub struct InstallArgs {
 
 #[derive(Debug, Args)]
 pub struct TypesArgs {
-    /// Regenerate `crates/runtime/types/meow/*.d.ts`.
+    /// Regenerate bundled type declarations.
     #[arg(long, conflicts_with = "check")]
     pub emit: bool,
     /// Verify the committed declarations are fresh (default).
@@ -554,9 +554,9 @@ pub struct TypesArgs {
 
 #[derive(Debug, Clone, ValueEnum)]
 pub enum InstallMode {
-    /// Default: strict hardlinked / copy-on-write node_modules backed by the global unpacked store.
+    /// Install into node_modules/ with hardlinks (default).
     Materialize,
-    /// Copy-based vendor/ projection for air-gapped deploys.
+    /// Copy all packages into a vendor/ directory.
     Vendor,
 }
 
@@ -1702,7 +1702,7 @@ fn cmd_install(args: &InstallArgs) -> ExitCode {
                 ("lockfile".to_owned(), lock_name.to_owned()),
             ]));
             if report.skipped {
-                lines.push(u.stdout_caps().muted("projection skipped"));
+                lines.push(u.stdout_caps().muted("node_modules/ skipped (already up to date)"));
             }
             u.panel("meow install", &lines);
             ExitCode::SUCCESS
@@ -3455,7 +3455,7 @@ fn command_catalog() -> Vec<meow_ui::CommandGroup<'static>> {
                 ("why-slow", "Module-load timeline (cold-start)"),
                 ("why-large", "Largest modules and duplicates"),
                 ("doctor", "Environment, config and lockfile health"),
-                ("sync", "Regenerate shadow tsconfig and types"),
+                ("sync", "Regenerate TypeScript configuration and types"),
                 ("ls", "List active dev servers and processes"),
             ],
         },
