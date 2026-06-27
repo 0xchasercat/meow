@@ -483,13 +483,11 @@ fn cmd_ls() -> ExitCode {
 
 // === EPHEMERAL-X ===
 /// Arguments for `meow x <package> [-- <args>]`.
+/// Arguments for `meow x [flags] <package> [args...]`.
+/// Flags come BEFORE the package name; everything after the package is treated
+/// as trailing arguments (no `--` separator required).
 #[derive(Debug, Args)]
 pub struct XArgs {
-    /// Package to download + execute ephemerally (e.g. `create-vite@latest`).
-    pub package: String,
-    /// Arguments forwarded to the package's binary.
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    pub argv: Vec<String>,
     // === RT-006 ===
     /// Expose the real system clock + monotonic time.
     #[arg(long)]
@@ -502,7 +500,6 @@ pub struct XArgs {
     pub allow_env: Option<String>,
     // === /RT-006 ===
     /// Explicitly grant full host access (clock, entropy, environment).
-    /// Shorthand for `--allow-clock --allow-random --allow-env`.
     #[arg(long)]
     pub trust: bool,
     /// Set the V8 heap limit in MiB.
@@ -511,6 +508,11 @@ pub struct XArgs {
     /// Disable the V8 startup snapshot.
     #[arg(long, hide = true)]
     pub no_snapshot: bool,
+    /// Package to download + execute ephemerally (e.g. `create-vite@latest`).
+    pub package: String,
+    /// Arguments forwarded to the package's binary (everything after the package name).
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub argv: Vec<String>,
 }
 // === /EPHEMERAL-X ===
 
@@ -4064,7 +4066,56 @@ fn cmd_x(args: &XArgs) -> ExitCode {
         }
     };
 
-    // 1. Parse the package spec
+    // 1. Parse the package spec, handling flags that might be trailing in argv.
+    //    This lets users put --trust at the end like `meow x wrangler deploy --trust`.
+    //    Also checks MEOW_DANGEROUSLY_DISABLE_SECURITY env var for persistent opt-out.
+    let env_trust = std::env::var("MEOW_DANGEROUSLY_DISABLE_SECURITY").is_ok_and(|v| v == "1");
+    let mut trust = args.trust || env_trust;
+    let mut allow_clock = args.allow_clock || env_trust;
+    let mut allow_random = args.allow_random || env_trust;
+    let mut allow_env = if env_trust {
+        Some(String::new())
+    } else {
+        args.allow_env.clone()
+    };
+    let mut package_argv: Vec<String> = Vec::with_capacity(args.argv.len());
+    {
+        let mut i = 0;
+        while i < args.argv.len() {
+            let arg = &args.argv[i];
+            match arg.as_str() {
+                "--trust" => {
+                    trust = true;
+                    i += 1;
+                    continue;
+                }
+                "--allow-clock" => {
+                    allow_clock = true;
+                    i += 1;
+                    continue;
+                }
+                "--allow-random" => {
+                    allow_random = true;
+                    i += 1;
+                    continue;
+                }
+                "--allow-env" => {
+                    allow_env = Some(String::new());
+                    i += 1;
+                    continue;
+                }
+                a if a.starts_with("--allow-env=") => {
+                    allow_env = Some(a.strip_prefix("--allow-env=").unwrap_or("").to_string());
+                    i += 1;
+                    continue;
+                }
+                _ => {}
+            }
+            package_argv.push(args.argv[i].clone());
+            i += 1;
+        }
+    }
+
     let (name, maybe_req) = match split_package_arg(&args.package) {
         Ok(tuple) => tuple,
         Err(err) => {
@@ -4107,6 +4158,7 @@ fn cmd_x(args: &XArgs) -> ExitCode {
             meow_config::add_dependency(&temp_dir, name.clone(), req)
                 .map_err(|err| err.to_string())?;
             // 5. Install into the temp dir
+            u.note(&format!("resolving {}...", name.as_str()));
             let dep_map: BTreeMap<meow_pkg::PackageName, meow_pkg::DepSpec> = {
                 let pj = load_install_package_json(&temp_dir)?;
                 pj.direct_dependencies().map_err(|e| format!("{e}"))?
@@ -4125,7 +4177,22 @@ fn cmd_x(args: &XArgs) -> ExitCode {
                 meow_req,
             )
             .with_overrides(overrides);
-            let lockfile = installer.resolve_with_progress_async(&dep_map, |_| {}).await.map_err(|err| format!("{err}"))?;
+            let lockfile = installer.resolve_with_progress_async(&dep_map, |progress| {
+                let label = match progress {
+                    meow_pkg::InstallProgress::MetadataFetched { package, .. } => {
+                        format!("resolving {package}")
+                    }
+                    meow_pkg::InstallProgress::PackageDownloaded { package, .. } => {
+                        format!("downloading {package}")
+                    }
+                    meow_pkg::InstallProgress::PackageCached { package, .. } => {
+                        format!("linking {package}")
+                    }
+                };
+                // Quick feedback via stderr — no spinner needed for ephemeral installs
+                eprint!("\r  \u{1b}[2m{label}\u{1b}[0m");
+            }).await.map_err(|err| format!("{err}"))?;
+            eprint!("\r\u{1b}[2K"); // clear the progress line
             let lock_path = temp_dir.join("meow.lock.jsonl");
             lockfile.write_canonical(&lock_path).map_err(|err| format!("{err}"))?;
 
@@ -4188,19 +4255,19 @@ fn cmd_x(args: &XArgs) -> ExitCode {
     };
 
     // 7. Print the security envelope
-    if args.trust {
+    if trust {
         u.warn(&format!(
             "Executing {} with full host access (--trust).",
             args.package,
         ));
-    } else if args.allow_clock || args.allow_random || args.allow_env.is_some() {
+    } else if allow_clock || allow_random || allow_env.is_some() {
         u.purr(&format!(
             "Executing ephemeral package {} with partial host access.",
             args.package,
         ));
     } else {
         u.pounce(&format!(
-            "Executing {} in strict isolation. Append --trust to bypass.",
+            "Executing {} in strict isolation. Set MEOW_DANGEROUSLY_DISABLE_SECURITY=1 or pass --trust to bypass.",
             args.package,
         ));
     }
@@ -4227,11 +4294,11 @@ fn cmd_x(args: &XArgs) -> ExitCode {
         argv: args.argv.clone(),
     };
     let flags = RunFlagView {
-        argv: &[],
-        allow_clock: args.allow_clock || args.trust,
-        allow_random: args.allow_random || args.trust,
-        allow_env: &args.allow_env,
-        trust: args.trust,
+        argv: &package_argv,
+        allow_clock,
+        allow_random,
+        allow_env: &allow_env,
+        trust,
         max_old_space_size: args.max_old_space_size,
         no_snapshot: args.no_snapshot,
     };
