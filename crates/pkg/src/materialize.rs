@@ -7,6 +7,8 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use rayon::prelude::*;
+
 use crate::archive;
 use crate::{tmp_path, Cache, ContentHash, PackageName, ResolutionGraph, UnpackedStore, Version};
 
@@ -956,32 +958,80 @@ fn fast_clone_dir(_source: &Path, _dest: &Path) -> Result<bool, MaterializeError
     Ok(false)
 }
 
+/// Linux `FICLONE` ioctl for file-level Copy-on-Write (reflink).
+/// Returns `Ok(true)` on success, `Ok(false)` if CoW is unsupported,
+/// and `Err` for actual I/O errors.
+#[cfg(target_os = "linux")]
+fn fast_clone_file(source: &Path, dest: &Path) -> Result<bool, std::io::Error> {
+    use std::os::unix::io::AsRawFd;
+    const FICLONE: libc::c_ulong = 0x40049409;
+    let src_file = std::fs::File::open(source)?;
+    let dest_file = std::fs::File::create(dest)?;
+    let res = unsafe { libc::ioctl(dest_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) };
+    if res == 0 { Ok(true) } else { Ok(false) }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn fast_clone_file(_source: &Path, _dest: &Path) -> Result<bool, std::io::Error> { Ok(false) }
+
 fn copy_dir_recursive_with_hardlinks(source: &Path, dest: &Path) -> Result<u64, MaterializeError> {
+    // 1. Try the platform-specific directory clone (macOS APFS clonefile)
     if fast_clone_dir(source, dest)? {
         return Ok(0);
     }
-    ensure_dir(dest)?;
-    let mut total = 0;
-    let entries = fs::read_dir(source).map_err(|source_err| MaterializeError::io(source, source_err))?;
-    for entry in entries {
-        let entry = entry.map_err(|source_err| MaterializeError::io(source, source_err))?;
-        let entry_path = entry.path();
-        let file_type = entry.file_type().map_err(|source_err| MaterializeError::io(&entry_path, source_err))?;
-        let dest_path = dest.join(entry.file_name());
 
-        if file_type.is_dir() {
-            total += copy_dir_recursive_with_hardlinks(&entry_path, &dest_path)?;
-            continue;
-        }
-        if file_type.is_file() {
-            if let Some(parent) = dest_path.parent() { ensure_dir(parent)?; }
-            if std::fs::hard_link(&entry_path, &dest_path).is_err() {
-                total += copy_file(&entry_path, &dest_path)?;
+    // 2. Recursively walk source: collect all (file_path, dest_path) pairs and dirs.
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut files: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut walk_stack = vec![source.to_path_buf()];
+    while let Some(dir) = walk_stack.pop() {
+        let entries = fs::read_dir(&dir)
+            .map_err(|e| MaterializeError::io(&dir, e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| MaterializeError::io(&dir, e))?;
+            let entry_path = entry.path();
+            let rel = entry_path.strip_prefix(source)
+                .expect("walked path must be under source");
+            let dest_path = dest.join(rel);
+            if entry.file_type().map_err(|e| MaterializeError::io(&entry_path, e))?.is_dir() {
+                dirs.push(dest_path.clone());
+                walk_stack.push(entry_path);
+            } else {
+                files.push((entry_path, dest_path));
             }
-            continue;
         }
     }
-    Ok(total)
+
+    // 3. Sort directories so parents come before children, then create them sequentially.
+    dirs.sort_by_key(|d| d.components().count());
+    for d in &dirs {
+        ensure_dir(d)?;
+    }
+    ensure_dir(dest)?; // just in case the root wasn't covered by the walk
+
+    // 4. Parallel: link / clone / copy every file.
+    //    priority: fast_clone_file → hard_link → copy_file
+    let bytes: Vec<u64> = files
+        .par_iter()
+        .map(|(src, dst)| -> Result<u64, MaterializeError> {
+            // FICLONE (Linux reflink CoW)
+            if fast_clone_file(src, dst).unwrap_or(false) {
+                // bytes don't really matter for CoW — report size from metadata
+                return Ok(std::fs::metadata(src)
+                    .map(|m| m.len())
+                    .unwrap_or(0));
+            }
+            // Hard link (cross-device may fail)
+            if std::fs::hard_link(src, dst).is_ok() {
+                // hard links share inodes, 0 "new" bytes by convention
+                return Ok(0);
+            }
+            // Fallback: full copy
+            copy_file(src, dst)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(bytes.iter().sum())
 }
 
 fn copy_file(source: &Path, dest: &Path) -> Result<u64, MaterializeError> {
