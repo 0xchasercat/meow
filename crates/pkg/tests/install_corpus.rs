@@ -267,9 +267,7 @@ fn darwin_arm64_optional_dependencies_are_filtered_by_platform_support() {
         "compatible optional dependency package is pinned"
     );
     assert!(
-        next.dependencies
-            .get(&PackageName::new("@next/swc-linux-x64-gnu"))
-            .is_none(),
+        !next.dependencies.contains_key(&PackageName::new("@next/swc-linux-x64-gnu")),
         "linux/x64 optional dependency is not in the graph"
     );
     assert!(

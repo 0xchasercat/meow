@@ -1246,7 +1246,7 @@ async fn commonjs_require_fs_create_write_stream_round_trip() {
     let target = proj.join("trace.txt");
     std::fs::write(
         &entry,
-        &format!(
+        format!(
             r#"
 const fs = require('fs');
 const file = {file};

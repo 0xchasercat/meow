@@ -330,7 +330,7 @@ impl Resolver {
         let mut components = rel.components();
         let host = components.next()?.as_os_str().to_str()?;
         let package = ContentHash::from_url_host(host).ok()?;
-        if self.by_integrity.get(&package).is_none() {
+        if !self.by_integrity.contains_key(&package) {
             return None;
         }
         let member = components.as_path().to_string_lossy().replace('\\', "/");
@@ -1494,13 +1494,10 @@ fn read_cached_manifest(root: &Path, dir: &Path) -> Result<Option<PackageJson>, 
 fn package_member_start(components: &[Component<'_>], index: usize) -> Option<usize> {
     let first = components.get(index)?.as_os_str().to_str()?;
     if first == ".pnpm" {
-        let Some(node_modules_index) = components[index + 1..]
+        let node_modules_index = components[index + 1..]
             .iter()
             .position(|component| component.as_os_str() == "node_modules")
-            .map(|offset| index + 1 + offset)
-        else {
-            return None;
-        };
+            .map(|offset| index + 1 + offset)?;
         return package_member_start(components, node_modules_index + 1);
     }
     if first == "node_modules" {

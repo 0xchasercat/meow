@@ -1,10 +1,5 @@
-//! The `meow` command tree (DIST-001).
-//!
-//! Most verbs stay as *honest stubs* and still print a structured,
-//! machine-greppable "not yet implemented" line to stderr with [`EXIT_UNIMPLEMENTED`].
-//! Some verbs are now wired to concrete implementations; `--version`/`--help` remain clap-real.
-//! The exhaustive `match` in [`Command::landing`] keeps command surfaces coherent by forcing each
-//! verb into either a real arm or a stub arm.
+//! The `meow` command tree (DIST-001). Every parsed verb dispatches to a concrete
+//! implementation — no stubs remain.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -25,11 +20,6 @@ use meow_runtime::node::{
     Version as DenoVersion,
 };
 use node_resolver::errors::{PackageFolderResolveErrorKind, PackageNotFoundError};
-
-/// Reserved exit code: command recognized, but its implementation has not landed
-/// yet. Distinct from 0 (success), 1 (generic failure), and clap's 2 (usage error)
-/// so a harness can tell "not built yet" from "you held it wrong".
-pub const EXIT_UNIMPLEMENTED: u8 = 3;
 
 /// (lazy JS, lazy ESM) residual sources re-fed to deno_core under a snapshot.
 type ResidualLazySources = (
@@ -470,31 +460,6 @@ pub struct WhyDepArgs {
     // === /OBS-001 ===
 }
 
-impl Command {
-    pub const fn landing(&self) -> &'static str {
-        match self {
-            Command::Run(_)
-            | Command::NodeEval(_)
-            | Command::Dev(_)
-            | Command::Install(_)
-            | Command::Types(_)
-            | Command::Sync
-            | Command::WhyDep(_)
-            | Command::Fmt(_)
-            | Command::Lint(_)
-            | Command::Bundle(_)
-            | Command::Check(_)
-            | Command::Test(_)
-            | Command::X(_)
-            | Command::Task(_)
-            | Command::WhyLarge(_)
-            | Command::WhySlow(_) => "",
-            Command::Add(_) => "add",
-            Command::Remove(_) => "remove",
-            Command::Doctor => "doctor",
-        }
-    }
-}
 impl Cli {
     pub fn run(self) -> ExitCode {
         let Some(command) = self.command else {
@@ -546,11 +511,6 @@ impl Cli {
             Command::X(args) => cmd_x(&args),
             // === /EPHEMERAL-X ===
             Command::Doctor => cmd_doctor(),
-            other => {
-                let verb = other.landing();
-                ui().warn(&format!("meow: `{verb}` is not yet implemented"));
-                ExitCode::from(EXIT_UNIMPLEMENTED)
-            }
         }
     }
 }
@@ -3055,268 +3015,6 @@ fn fallback_root_deps_from_lockfile(
 // === /CFG-003 ===
 // === /LOAD-001 ===
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A fresh, unique temp dir (pid + monotonic counter — no rand/clock, P16).
-    fn unit_tmp(tag: &str) -> PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("meow-cli-unit-{tag}-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        dir
-    }
-
-    #[test]
-    fn find_project_root_walks_up_to_the_nearest_project_marker() {
-        // A project root is now identified by either lockfile or package.json.
-        let root = unit_tmp("root");
-        std::fs::write(root.join("package.json"), "{}").expect("write package.json");
-        let nested = root.join("src").join("inner");
-        std::fs::create_dir_all(&nested).expect("nested dirs");
-
-        let found = find_project_root(&nested);
-        assert_eq!(
-            std::fs::canonicalize(&found).expect("canon found"),
-            std::fs::canonicalize(&root).expect("canon root"),
-        );
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn install_materialize_flag_parses_as_default_projection() {
-        let cli = Cli::try_parse_from(["meow", "install", "--materialize"]).expect("parse cli");
-        let Some(Command::Install(args)) = cli.command else {
-            panic!("expected install command");
-        };
-        assert!(args.materialize);
-        assert!(matches!(args.mode, InstallMode::Materialize));
-        assert!(!args.vendor);
-    }
-
-    #[test]
-    fn install_default_mode_is_materialize() {
-        let cli = Cli::try_parse_from(["meow", "install"]).expect("parse cli");
-        let Some(Command::Install(args)) = cli.command else {
-            panic!("expected install command");
-        };
-        assert!(!args.materialize);
-        assert!(matches!(args.mode, InstallMode::Materialize));
-        assert!(!args.vendor);
-        let opts = install_projection(&args).expect("projection selection");
-        assert!(matches!(opts.projection, meow_pkg::Projection::NodeModules));
-        assert!(matches!(opts.link, meow_pkg::LinkStrategy::Symlink));
-    }
-
-    #[test]
-    fn dev_shorthand_parses_trailing_args() {
-        let cli = Cli::try_parse_from(["meow", "dev", "--", "watch"]).expect("parse cli");
-        let Some(Command::Dev(args)) = cli.command else {
-            panic!("expected dev command");
-        };
-        assert_eq!(args.argv, vec!["watch".to_string()]);
-    }
-
-    #[test]
-    fn normalize_argv_injects_run_for_entry_path() {
-        let argv = normalize_argv(vec![
-            OsString::from("meow"),
-            OsString::from("/Users/me/.meow/cache/unpacked/sha512-abc/dist/server/start-server.js"),
-            OsString::from("--flag"),
-        ]);
-        assert_eq!(
-            argv,
-            vec![
-                OsString::from("meow"),
-                OsString::from("run"),
-                OsString::from(
-                    "/Users/me/.meow/cache/unpacked/sha512-abc/dist/server/start-server.js"
-                ),
-                OsString::from("--flag"),
-            ]
-        );
-    }
-
-    #[test]
-    fn normalize_argv_maps_translated_node_run_script_to_run_command() {
-        let argv = normalize_argv(vec![
-            OsString::from("/Users/me/.meow/bin/node"),
-            OsString::from("run"),
-            OsString::from("/Users/me/project/script.js"),
-            OsString::from("alpha"),
-        ]);
-        assert_eq!(
-            argv,
-            vec![
-                OsString::from("/Users/me/.meow/bin/node"),
-                OsString::from("run"),
-                OsString::from("/Users/me/project/script.js"),
-                OsString::from("--"),
-                OsString::from("alpha"),
-            ]
-        );
-    }
-
-    #[test]
-    fn normalize_argv_maps_translated_meow_run_eval_to_internal_eval_command() {
-        let argv = normalize_argv(vec![
-            OsString::from("/Users/me/.meow/bin/node"),
-            OsString::from("run"),
-            OsString::from("-e"),
-            OsString::from("console.log(123)"),
-        ]);
-        assert_eq!(
-            argv,
-            vec![
-                OsString::from("/Users/me/.meow/bin/node"),
-                OsString::from("node-eval"),
-                OsString::from("-e"),
-                OsString::from("console.log(123)"),
-            ]
-        );
-    }
-
-    #[test]
-    fn normalize_argv_maps_meow_eval_to_internal_eval_command() {
-        let argv = normalize_argv(vec![
-            OsString::from("/Users/me/meow/target/debug/meow"),
-            OsString::from("-e"),
-            OsString::from("console.log(123)"),
-        ]);
-        assert_eq!(
-            argv,
-            vec![
-                OsString::from("/Users/me/meow/target/debug/meow"),
-                OsString::from("node-eval"),
-                OsString::from("-e"),
-                OsString::from("console.log(123)"),
-            ]
-        );
-    }
-
-    #[test]
-    fn normalize_argv_maps_node_eval_to_internal_eval_command() {
-        let argv = normalize_argv(vec![
-            OsString::from("/Users/me/.meow/bin/node"),
-            OsString::from("-e"),
-            OsString::from("console.log(123)"),
-        ]);
-        assert_eq!(
-            argv,
-            vec![
-                OsString::from("/Users/me/.meow/bin/node"),
-                OsString::from("node-eval"),
-                OsString::from("-e"),
-                OsString::from("console.log(123)"),
-            ]
-        );
-    }
-
-    #[test]
-    fn normalize_argv_maps_node_shim_script_to_run_with_trailing_args() {
-        let argv = normalize_argv(vec![
-            OsString::from("/Users/me/.meow/bin/node"),
-            OsString::from("/Users/me/project/node_modules/next/dist/compiled/turbopack/worker.js"),
-            OsString::from("56556"),
-        ]);
-        assert_eq!(
-            argv,
-            vec![
-                OsString::from("/Users/me/.meow/bin/node"),
-                OsString::from("run"),
-                OsString::from(
-                    "/Users/me/project/node_modules/next/dist/compiled/turbopack/worker.js"
-                ),
-                OsString::from("--"),
-                OsString::from("56556"),
-            ]
-        );
-    }
-
-    #[test]
-    fn normalize_argv_maps_node_shim_after_preload_flags() {
-        let argv = normalize_argv(vec![
-            OsString::from("node"),
-            OsString::from("--require"),
-            OsString::from("source-map-support/register"),
-            OsString::from("worker.js"),
-            OsString::from("56556"),
-        ]);
-        assert_eq!(
-            argv,
-            vec![
-                OsString::from("node"),
-                OsString::from("run"),
-                OsString::from("worker.js"),
-                OsString::from("--"),
-                OsString::from("56556"),
-            ]
-        );
-    }
-
-    #[test]
-    fn normalize_argv_strips_deno_run_compat_flags() {
-        let argv = normalize_argv(vec![
-            OsString::from("meow"),
-            OsString::from("run"),
-            OsString::from("-A"),
-            OsString::from("--unstable-bare-node-builtins"),
-            OsString::from("/Users/me/.meow/cache/unpacked/sha512-abc/dist/server/start-server.js"),
-        ]);
-        assert_eq!(
-            argv,
-            vec![
-                OsString::from("meow"),
-                OsString::from("run"),
-                OsString::from(
-                    "/Users/me/.meow/cache/unpacked/sha512-abc/dist/server/start-server.js"
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn tokenize_simple_script_rejects_shell_operators() {
-        assert_eq!(
-            tokenize_simple_script("node ./dev.cjs --watch").expect("simple script"),
-            vec!["node", "./dev.cjs", "--watch"]
-        );
-        assert!(tokenize_simple_script("echo hi && echo ok").is_none());
-    }
-
-    #[test]
-    fn find_project_root_ignores_dependency_package_manifests() {
-        let root = unit_tmp("dependency-root");
-        std::fs::write(root.join("package.json"), "{}").expect("write package.json");
-        let dep = root
-            .join("node_modules")
-            .join(".meow")
-            .join("next@15.3.5")
-            .join("node_modules")
-            .join("next");
-        std::fs::create_dir_all(&dep).expect("dependency dirs");
-        std::fs::write(dep.join("package.json"), "{}").expect("dependency package.json");
-        let found = find_project_root(&dep);
-        assert_eq!(
-            std::fs::canonicalize(&found).expect("canon found"),
-            std::fs::canonicalize(&root).expect("canon root"),
-        );
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn find_project_root_falls_back_to_start_without_project_markers() {
-        // No lockfile/package.json anywhere on the way up: a local-only run uses the entry dir.
-        let dir = unit_tmp("nolock");
-        let found = find_project_root(&dir);
-        assert_eq!(found, dir);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-}
-
 // === UX-002 (terminal UX engine wiring) ===
 /// Wall-clock instant captured at process entry, for the cold-start flex on
 /// `meow dev`. Set once from `main` before clap parsing.
@@ -3724,11 +3422,12 @@ async fn run_test_file_inner(root: &Path, file: &Path) -> Result<Vec<serde_json:
         meow_runtime::node::DenoNodeServicesBuilder::new(deno_node_bridge).build();
 
     let caps: meow_runtime::web::NetCaps = std::sync::Arc::new(meow_runtime::AllowAll);
-    let mut extensions = Vec::new();
-    extensions.push(meow_runtime::http_extension());
-    extensions.push(meow_runtime::ui_extension());
-    extensions.push(meow_runtime::test_extension());
-    extensions.push(meow_loader::cjs_resolve_extension(resolver.clone()));
+    let mut extensions = vec![
+        meow_runtime::http_extension(),
+        meow_runtime::ui_extension(),
+        meow_runtime::test_extension(),
+        meow_loader::cjs_resolve_extension(resolver.clone()),
+    ];
 
     // Tests run with full hermetic by default (deterministic).
     let hermetic = meow_runtime::hermetic::HermeticConfig::default();
@@ -3866,7 +3565,7 @@ fn cmd_why_large(_args: &PathArgs) -> ExitCode {
         entries.push((label, size));
     }
 
-    entries.sort_by(|a, b| b.1.cmp(&a.1));
+    entries.sort_by_key(|b| std::cmp::Reverse(b.1));
 
     let total: u64 = entries.iter().map(|(_, s)| s).sum();
     let u = ui();
@@ -4054,7 +3753,7 @@ fn cmd_x(args: &XArgs) -> ExitCode {
                 pj.package_overrides().map_err(|e| format!("{e}"))?
             };
             let cache = std::sync::Arc::new(meow_pkg::Cache::in_home(crate::host::host_home()));
-            let meow_req = runtime_meow_requirement().map_err(|err| err)?;
+            let meow_req = runtime_meow_requirement()?;
 
             let installer = meow_pkg::Installer::new(
                 registry.clone(),
@@ -4281,3 +3980,264 @@ fn doctor_row(u: &Ui, ok: bool, key: &str, value: &str) -> String {
     )
 }
 // === /UX-002 ===
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh, unique temp dir (pid + monotonic counter — no rand/clock, P16).
+    fn unit_tmp(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("meow-cli-unit-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    #[test]
+    fn find_project_root_walks_up_to_the_nearest_project_marker() {
+        // A project root is now identified by either lockfile or package.json.
+        let root = unit_tmp("root");
+        std::fs::write(root.join("package.json"), "{}").expect("write package.json");
+        let nested = root.join("src").join("inner");
+        std::fs::create_dir_all(&nested).expect("nested dirs");
+
+        let found = find_project_root(&nested);
+        assert_eq!(
+            std::fs::canonicalize(&found).expect("canon found"),
+            std::fs::canonicalize(&root).expect("canon root"),
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn install_materialize_flag_parses_as_default_projection() {
+        let cli = Cli::try_parse_from(["meow", "install", "--materialize"]).expect("parse cli");
+        let Some(Command::Install(args)) = cli.command else {
+            panic!("expected install command");
+        };
+        assert!(args.materialize);
+        assert!(matches!(args.mode, InstallMode::Materialize));
+        assert!(!args.vendor);
+    }
+
+    #[test]
+    fn install_default_mode_is_materialize() {
+        let cli = Cli::try_parse_from(["meow", "install"]).expect("parse cli");
+        let Some(Command::Install(args)) = cli.command else {
+            panic!("expected install command");
+        };
+        assert!(!args.materialize);
+        assert!(matches!(args.mode, InstallMode::Materialize));
+        assert!(!args.vendor);
+        let opts = install_projection(&args).expect("projection selection");
+        assert!(matches!(opts.projection, meow_pkg::Projection::NodeModules));
+        assert!(matches!(opts.link, meow_pkg::LinkStrategy::Symlink));
+    }
+
+    #[test]
+    fn dev_shorthand_parses_trailing_args() {
+        let cli = Cli::try_parse_from(["meow", "dev", "--", "watch"]).expect("parse cli");
+        let Some(Command::Dev(args)) = cli.command else {
+            panic!("expected dev command");
+        };
+        assert_eq!(args.argv, vec!["watch".to_string()]);
+    }
+
+    #[test]
+    fn normalize_argv_injects_run_for_entry_path() {
+        let argv = normalize_argv(vec![
+            OsString::from("meow"),
+            OsString::from("/Users/me/.meow/cache/unpacked/sha512-abc/dist/server/start-server.js"),
+            OsString::from("--flag"),
+        ]);
+        assert_eq!(
+            argv,
+            vec![
+                OsString::from("meow"),
+                OsString::from("run"),
+                OsString::from(
+                    "/Users/me/.meow/cache/unpacked/sha512-abc/dist/server/start-server.js"
+                ),
+                OsString::from("--flag"),
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_argv_maps_translated_node_run_script_to_run_command() {
+        let argv = normalize_argv(vec![
+            OsString::from("/Users/me/.meow/bin/node"),
+            OsString::from("run"),
+            OsString::from("/Users/me/project/script.js"),
+            OsString::from("alpha"),
+        ]);
+        assert_eq!(
+            argv,
+            vec![
+                OsString::from("/Users/me/.meow/bin/node"),
+                OsString::from("run"),
+                OsString::from("/Users/me/project/script.js"),
+                OsString::from("--"),
+                OsString::from("alpha"),
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_argv_maps_translated_meow_run_eval_to_internal_eval_command() {
+        let argv = normalize_argv(vec![
+            OsString::from("/Users/me/.meow/bin/node"),
+            OsString::from("run"),
+            OsString::from("-e"),
+            OsString::from("console.log(123)"),
+        ]);
+        assert_eq!(
+            argv,
+            vec![
+                OsString::from("/Users/me/.meow/bin/node"),
+                OsString::from("node-eval"),
+                OsString::from("-e"),
+                OsString::from("console.log(123)"),
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_argv_maps_meow_eval_to_internal_eval_command() {
+        let argv = normalize_argv(vec![
+            OsString::from("/Users/me/meow/target/debug/meow"),
+            OsString::from("-e"),
+            OsString::from("console.log(123)"),
+        ]);
+        assert_eq!(
+            argv,
+            vec![
+                OsString::from("/Users/me/meow/target/debug/meow"),
+                OsString::from("node-eval"),
+                OsString::from("-e"),
+                OsString::from("console.log(123)"),
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_argv_maps_node_eval_to_internal_eval_command() {
+        let argv = normalize_argv(vec![
+            OsString::from("/Users/me/.meow/bin/node"),
+            OsString::from("-e"),
+            OsString::from("console.log(123)"),
+        ]);
+        assert_eq!(
+            argv,
+            vec![
+                OsString::from("/Users/me/.meow/bin/node"),
+                OsString::from("node-eval"),
+                OsString::from("-e"),
+                OsString::from("console.log(123)"),
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_argv_maps_node_shim_script_to_run_with_trailing_args() {
+        let argv = normalize_argv(vec![
+            OsString::from("/Users/me/.meow/bin/node"),
+            OsString::from("/Users/me/project/node_modules/next/dist/compiled/turbopack/worker.js"),
+            OsString::from("56556"),
+        ]);
+        assert_eq!(
+            argv,
+            vec![
+                OsString::from("/Users/me/.meow/bin/node"),
+                OsString::from("run"),
+                OsString::from(
+                    "/Users/me/project/node_modules/next/dist/compiled/turbopack/worker.js"
+                ),
+                OsString::from("--"),
+                OsString::from("56556"),
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_argv_maps_node_shim_after_preload_flags() {
+        let argv = normalize_argv(vec![
+            OsString::from("node"),
+            OsString::from("--require"),
+            OsString::from("source-map-support/register"),
+            OsString::from("worker.js"),
+            OsString::from("56556"),
+        ]);
+        assert_eq!(
+            argv,
+            vec![
+                OsString::from("node"),
+                OsString::from("run"),
+                OsString::from("worker.js"),
+                OsString::from("--"),
+                OsString::from("56556"),
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_argv_strips_deno_run_compat_flags() {
+        let argv = normalize_argv(vec![
+            OsString::from("meow"),
+            OsString::from("run"),
+            OsString::from("-A"),
+            OsString::from("--unstable-bare-node-builtins"),
+            OsString::from("/Users/me/.meow/cache/unpacked/sha512-abc/dist/server/start-server.js"),
+        ]);
+        assert_eq!(
+            argv,
+            vec![
+                OsString::from("meow"),
+                OsString::from("run"),
+                OsString::from(
+                    "/Users/me/.meow/cache/unpacked/sha512-abc/dist/server/start-server.js"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenize_simple_script_rejects_shell_operators() {
+        assert_eq!(
+            tokenize_simple_script("node ./dev.cjs --watch").expect("simple script"),
+            vec!["node", "./dev.cjs", "--watch"]
+        );
+        assert!(tokenize_simple_script("echo hi && echo ok").is_none());
+    }
+
+    #[test]
+    fn find_project_root_ignores_dependency_package_manifests() {
+        let root = unit_tmp("dependency-root");
+        std::fs::write(root.join("package.json"), "{}").expect("write package.json");
+        let dep = root
+            .join("node_modules")
+            .join(".meow")
+            .join("next@15.3.5")
+            .join("node_modules")
+            .join("next");
+        std::fs::create_dir_all(&dep).expect("dependency dirs");
+        std::fs::write(dep.join("package.json"), "{}").expect("dependency package.json");
+        let found = find_project_root(&dep);
+        assert_eq!(
+            std::fs::canonicalize(&found).expect("canon found"),
+            std::fs::canonicalize(&root).expect("canon root"),
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn find_project_root_falls_back_to_start_without_project_markers() {
+        // No lockfile/package.json anywhere on the way up: a local-only run uses the entry dir.
+        let dir = unit_tmp("nolock");
+        let found = find_project_root(&dir);
+        assert_eq!(found, dir);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

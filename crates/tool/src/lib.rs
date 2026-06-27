@@ -188,8 +188,6 @@ pub fn plan_bundle(
 /// A bundled module with its transpiled source and metadata.
 #[derive(Clone, Debug)]
 struct BundleModule {
-    /// Relative module path used as the require key
-    id: String,
     /// Transpiled JavaScript source
     source: String,
 }
@@ -245,7 +243,6 @@ pub fn bundle_entries(
             let source = transpile_for_bundle(&modl)?;
 
             let bundle_mod = BundleModule {
-                id: module_id.clone(),
                 source,
             };
 
@@ -318,8 +315,7 @@ fn discover_imports(modl: &ResolvedModule) -> Vec<String> {
             }
         }
         // dynamic import
-        if trimmed.starts_with("import(") {
-            let after_paren = &trimmed[7..];
+        if let Some(after_paren) = trimmed.strip_prefix("import(") {
             if let Some(end) = after_paren.find(')') {
                 let spec = &after_paren[..end].trim().trim_matches('"').trim_matches('\'');
                 if !spec.is_empty() && !spec.starts_with("node:") && !spec.starts_with("meow:") {
@@ -336,10 +332,10 @@ fn discover_imports(modl: &ResolvedModule) -> Vec<String> {
 /// Extract a string literal from after `from ` keyword.
 fn extract_string_literal(s: &str) -> Option<String> {
     let s = s.trim();
-    if s.starts_with('"') {
-        s[1..].find('"').map(|end| s[1..=end].trim_end_matches('"').to_string())
-    } else if s.starts_with('\'') {
-        s[1..].find('\'').map(|end| s[1..=end].trim_end_matches('\'').to_string())
+    if let Some(inner) = s.strip_prefix('"') {
+        inner.find('"').map(|end| inner[..=end].to_string())
+    } else if let Some(inner) = s.strip_prefix('\'') {
+        inner.find('\'').map(|end| inner[..=end].to_string())
     } else {
         None
     }
@@ -552,7 +548,7 @@ fn esm_to_cjs(source: &str, resolve: impl Fn(&str) -> String) -> String {
                         .split(',')
                         .map(|s| {
                             let s = s.trim();
-                            if let Some(alias) = s.splitn(2, " as ").nth(1) {
+                            if let Some((_, alias)) = s.split_once(" as ") {
                                 alias.trim().to_string()
                             } else {
                                 s.to_string()
@@ -598,7 +594,7 @@ fn esm_to_cjs(source: &str, resolve: impl Fn(&str) -> String) -> String {
             } else {
                 trimmed.strip_prefix("export function ").unwrap_or("")
             };
-            let fn_name = body.split(|c| c == '(' || c == ' ' || c == '<').next().unwrap_or("").trim();
+            let fn_name = body.split(['(', ' ', '<']).next().unwrap_or("").trim();
             let fn_decl = if has_async { "async function " } else { "function " };
             let ws = leading_ws(&line);
 
@@ -638,7 +634,7 @@ fn esm_to_cjs(source: &str, resolve: impl Fn(&str) -> String) -> String {
         // === export class ===
         if trimmed.starts_with("export class ") {
             let body = trimmed.strip_prefix("export class ").unwrap_or("");
-            let class_name = body.split(|c| c == ' ' || c == '{' || c == '<').next().unwrap_or("").trim();
+            let class_name = body.split([' ', '{', '<']).next().unwrap_or("").trim();
             let ws = leading_ws(&line);
             out.push_str(&format!("{ws}class {body}"));
 
@@ -1165,7 +1161,7 @@ Widget();
         dir
     }
 
-    fn jsx_js_file(tmp: &PathBuf) -> PathBuf {
+    fn jsx_js_file(tmp: &Path) -> PathBuf {
         let file = tmp.join("entry.js");
         std::fs::write(&file, JSX_JS_SOURCE).expect("write js fixture");
         file
@@ -1201,7 +1197,7 @@ Widget();
     fn format_paths_supports_js_with_directive_and_jsx() {
         let tmp = tmp_dir("fmt-jsx");
         let file = jsx_js_file(&tmp);
-        let report = format_paths(&tmp, &vec![file.clone()], FormatOptions { check: true })
+        let report = format_paths(&tmp, std::slice::from_ref(&file), FormatOptions { check: true })
             .expect("format_paths should parse jsx js fixture");
 
         assert_no_parser_blocking_diagnostics(&report.diagnostics);
@@ -1213,7 +1209,7 @@ Widget();
         let tmp = tmp_dir("lint-jsx");
         let file = jsx_js_file(&tmp);
         let report =
-            lint_paths(&tmp, &vec![file.clone()]).expect("lint_paths should parse jsx js fixture");
+            lint_paths(&tmp, std::slice::from_ref(&file)).expect("lint_paths should parse jsx js fixture");
 
         assert_no_parser_blocking_diagnostics(&report.diagnostics);
         std::fs::remove_dir_all(&tmp).ok();

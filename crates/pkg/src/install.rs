@@ -360,10 +360,10 @@ impl<'a> Installer<'a> {
         )?;
         pump_tarball_downloads(&self.source, &mut pending_tarballs, &mut tarball_set);
 
-        while metadata_set.len() > 0 || tarball_set.len() > 0 || !pending_tarballs.is_empty() {
+        while !metadata_set.is_empty() || !tarball_set.is_empty() || !pending_tarballs.is_empty() {
             pump_tarball_downloads(&self.source, &mut pending_tarballs, &mut tarball_set);
 
-            if metadata_set.len() > 0 && tarball_set.len() > 0 {
+            if !metadata_set.is_empty() && !tarball_set.is_empty() {
                 tokio::select! {
                     item = metadata_set.join_next() => {
                         self.handle_metadata_result(
@@ -407,7 +407,7 @@ impl<'a> Installer<'a> {
                         pump_tarball_downloads(&self.source, &mut pending_tarballs, &mut tarball_set);
                     }
                 }
-            } else if metadata_set.len() > 0 {
+            } else if !metadata_set.is_empty() {
                 let item = metadata_set.join_next().await;
                 self.handle_metadata_result(
                     item,
@@ -563,6 +563,7 @@ impl<'a> Installer<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn drain_ready_resolution<F>(
         &self,
         metadata: &BTreeMap<PackageName, PackageMetadata>,
@@ -679,6 +680,7 @@ impl<'a> Installer<'a> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn handle_metadata_result<F>(
         &self,
         item: Option<
