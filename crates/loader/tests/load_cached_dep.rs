@@ -337,6 +337,7 @@ async fn run_entry(
         startup_snapshot: None,
         residual_lazy_js_sources: &[],
         residual_lazy_esm_sources: &[],
+        v8_flags: None,
     })
     .expect("runtime initializes");
     let spec = ModuleSpecifier::from_file_path(entry).expect("entry → file URL");
@@ -404,6 +405,7 @@ async fn cached_dep_runs_end_to_end_with_no_node_modules() {
         startup_snapshot: None,
         residual_lazy_js_sources: &[],
         residual_lazy_esm_sources: &[],
+        v8_flags: None,
     })
     .expect("runtime initializes");
     let spec = ModuleSpecifier::from_file_path(&entry).expect("entry → file URL");
@@ -951,6 +953,7 @@ async fn extensionless_cached_commonjs_bin_runs_via_native_cjs_runtime() {
         startup_snapshot: None,
         residual_lazy_js_sources: &[],
         residual_lazy_esm_sources: &[],
+        v8_flags: None,
     })
     .expect("runtime initializes");
     let spec = cache_url(&cache_root, &dep_hash, "dist/bin/next");

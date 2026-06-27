@@ -113,6 +113,11 @@ pub struct RuntimeOptions {
     /// Each entry is `(specifier, source_code)`. Only consulted when
     /// `startup_snapshot` is `Some`.
     pub residual_lazy_esm_sources: &'static [(&'static str, &'static str)],
+    /// Raw V8 flags forwarded to `v8::V8::set_flags_from_command_line` before
+    /// the isolate is created (e.g. `--allow-natives-syntax`, `--trace-opt`).
+    /// Comma- or whitespace-separated. Owned so the caller doesn't have to
+    /// leak or static-promote the input.
+    pub v8_flags: Option<String>,
 }
 /// Default V8 heap size: 4 GiB or 75% of available system memory,
 /// like Next.js dev while staying reasonable for small scripts.
@@ -179,6 +184,19 @@ fn maximize_fd_limit() {
 #[cfg(not(unix))]
 fn maximize_fd_limit() {}
 
+/// Apply raw V8 engine flags before any isolate is created.
+/// Calls `v8::V8::set_flags_from_command_line` which is a process-global
+/// init point — must be invoked before any `JsRuntime` is constructed.
+fn apply_v8_flags(raw: &str) {
+    // Split on both commas and whitespace so users can use either separator:
+    //   --v8-flags=--allow-natives-syntax,--trace-opt
+    //   --v8-flags="--allow-natives-syntax --trace-opt"
+    let joined = raw.replace(',', " ");
+    let mut args: Vec<String> = vec!["meow".to_string()];
+    args.extend(joined.split_whitespace().map(|s| s.to_string()));
+    v8::V8::set_flags_from_command_line(args);
+}
+
 impl Runtime {
     /// Creates the isolate, prepending this crate's `meow_runtime` extension
     /// (ops + `console` bootstrap) to `options.extensions`. No host reads.
@@ -195,6 +213,9 @@ impl Runtime {
     /// a later spec (meow:fs + SEC/P6).
     pub fn new(options: RuntimeOptions) -> Result<Runtime, RuntimeError> {
         maximize_fd_limit();
+        if let Some(raw) = options.v8_flags.as_deref() {
+            apply_v8_flags(raw);
+        }
         let mut extensions = Vec::with_capacity(options.extensions.len() + 1);
         extensions.push(ext::meow_runtime::init());
         extensions.extend(options.extensions);

@@ -174,6 +174,7 @@ fn spawn_runtime(source: &str, policy: Policy) -> RuntimeThread {
                 startup_snapshot: None,
                 residual_lazy_js_sources: &[],
                 residual_lazy_esm_sources: &[],
+        v8_flags: None,
             })
             .map_err(|err| err.to_string())?;
             runtime

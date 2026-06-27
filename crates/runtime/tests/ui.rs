@@ -62,6 +62,7 @@ async fn meow_ui_import_emits_enveloped_lines() {
         startup_snapshot: None,
         residual_lazy_js_sources: &[],
         residual_lazy_esm_sources: &[],
+        v8_flags: None,
     })
     .expect("runtime initializes");
     let spec = ModuleSpecifier::from_file_path(root.join("main.mjs")).expect("main specifier");

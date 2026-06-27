@@ -45,6 +45,7 @@ fn runtime_with(extensions: Vec<deno_core::Extension>) -> Runtime {
         startup_snapshot: None,
         residual_lazy_js_sources: &[],
         residual_lazy_esm_sources: &[],
+        v8_flags: None,
     })
     .expect("runtime initializes")
 }

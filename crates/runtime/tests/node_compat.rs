@@ -286,6 +286,7 @@ fn node_runtime(
         startup_snapshot: None,
         residual_lazy_js_sources: &[],
         residual_lazy_esm_sources: &[],
+        v8_flags: None,
     })
     .expect("runtime initializes");
     (out, runtime)

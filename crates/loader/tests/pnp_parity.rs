@@ -237,6 +237,7 @@ async fn resolution_graph_runs_without_node_modules_and_preserves_multi_version_
         startup_snapshot: None,
         residual_lazy_js_sources: &[],
         residual_lazy_esm_sources: &[],
+        v8_flags: None,
     })
     .expect("runtime initializes");
     let spec = ModuleSpecifier::from_file_path(&entry).expect("entry url");

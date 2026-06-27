@@ -358,6 +358,10 @@ pub struct RunArgs {
     /// Disable the V8 startup snapshot (slower init, useful for debugging).
     #[arg(long, hide = true)]
     pub no_snapshot: bool,
+    /// Pass arbitrary flags directly to the V8 engine
+    /// (e.g. `--v8-flags=--allow-natives-syntax,--trace-opt`).
+    #[arg(long, value_name = "FLAGS")]
+    pub v8_flags: Option<String>,
 }
 
 // === RUN-001 ===
@@ -384,6 +388,10 @@ pub struct RunScriptArgs {
     /// Disable the V8 startup snapshot (slower init, useful for debugging).
     #[arg(long, hide = true)]
     pub no_snapshot: bool,
+    /// Pass arbitrary flags directly to the V8 engine
+    /// (e.g. `--v8-flags=--allow-natives-syntax,--trace-opt`).
+    #[arg(long, value_name = "FLAGS")]
+    pub v8_flags: Option<String>,
 }
 // === /RUN-001 ===
 
@@ -508,6 +516,10 @@ pub struct XArgs {
     /// Disable the V8 startup snapshot.
     #[arg(long, hide = true)]
     pub no_snapshot: bool,
+    /// Pass arbitrary flags directly to the V8 engine
+    /// (e.g. `--v8-flags=--allow-natives-syntax,--trace-opt`).
+    #[arg(long, value_name = "FLAGS")]
+    pub v8_flags: Option<String>,
     /// Package to download + execute ephemerally (e.g. `create-vite@latest`).
     pub package: String,
     /// Arguments forwarded to the package's binary (everything after the package name).
@@ -1844,6 +1856,7 @@ struct RunFlagView<'a> {
     trust: bool,
     max_old_space_size: Option<usize>,
     no_snapshot: bool,
+    v8_flags: Option<&'a str>,
 }
 fn run_flags(args: &RunArgs) -> RunFlagView<'_> {
     RunFlagView {
@@ -1854,6 +1867,7 @@ fn run_flags(args: &RunArgs) -> RunFlagView<'_> {
         trust: args.trust,
         max_old_space_size: args.max_old_space_size.or_else(env_max_old_space_size),
         no_snapshot: args.no_snapshot,
+        v8_flags: args.v8_flags.as_deref(),
     }
 }
 // === RUN-001 ===
@@ -1866,6 +1880,7 @@ fn run_script_flags(args: &RunScriptArgs) -> RunFlagView<'_> {
         trust: args.trust,
         max_old_space_size: args.max_old_space_size.or_else(env_max_old_space_size),
         no_snapshot: args.no_snapshot,
+        v8_flags: args.v8_flags.as_deref(),
     }
 }
 // === /RUN-001 ===
@@ -2091,6 +2106,7 @@ fn cmd_node_eval(args: NodeEvalArgs) -> ExitCode {
         trust: false,
         max_old_space_size: env_max_old_space_size(),
         no_snapshot: false,
+        v8_flags: None,
     };
     let code = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2596,6 +2612,7 @@ async fn run_native_request(
         startup_snapshot,
         residual_lazy_js_sources: residual_lazy_js,
         residual_lazy_esm_sources: residual_lazy_esm,
+        v8_flags: flags.v8_flags.map(|s| s.to_string()),
     })
     .map_err(|err| RunCommandError::Message(err.to_string()))?;
     // Refresh Node bootstrap state if we loaded from a snapshot.
@@ -3681,6 +3698,7 @@ fn cmd_task(args: &TaskArgs) -> ExitCode {
         trust: false,
         max_old_space_size: None,
         no_snapshot: false,
+        v8_flags: None,
     };
     cmd_run_inner("task", &args.name, flags)
 }
@@ -3841,6 +3859,7 @@ async fn run_test_file_inner(root: &Path, file: &Path) -> Result<Vec<serde_json:
         startup_snapshot: Some(crate::SNAPSHOT_BLOB),
         residual_lazy_js_sources: crate::RESIDUAL_LAZY_JS,
         residual_lazy_esm_sources: crate::RESIDUAL_LAZY_ESM,
+        v8_flags: None,
     })
     .map_err(|e| e.to_string())?;
 
@@ -4322,6 +4341,7 @@ fn cmd_x(args: &XArgs) -> ExitCode {
         trust,
         max_old_space_size: args.max_old_space_size,
         no_snapshot: args.no_snapshot,
+        v8_flags: args.v8_flags.as_deref(),
     };
 
     let code = match tokio::runtime::Builder::new_current_thread()

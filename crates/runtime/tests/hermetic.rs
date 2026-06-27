@@ -44,6 +44,7 @@ fn hermetic_runtime(cfg: HermeticConfig) -> (Rc<RefCell<String>>, Runtime) {
         startup_snapshot: None,
         residual_lazy_js_sources: &[],
         residual_lazy_esm_sources: &[],
+        v8_flags: None,
     })
     .expect("runtime initializes with hermetic shadows");
     (out, rt)
@@ -230,6 +231,7 @@ fn web_hermetic_runtime(cfg: HermeticConfig) -> (Rc<RefCell<String>>, Runtime) {
         startup_snapshot: None,
         residual_lazy_js_sources: &[],
         residual_lazy_esm_sources: &[],
+        v8_flags: None,
     })
     .expect("runtime initializes with web + hermetic");
     (out, rt)
