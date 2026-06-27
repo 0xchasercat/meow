@@ -799,21 +799,29 @@ console.log([
     run_file(&mut rt, &entry)
         .await
         .expect("CommonJS non-TTY raw mode fallback shape runs");
-    // In a TTY environment (cargo test inheriting the terminal), stdin is
-    // constructed by node:tty via ReadStream.  In a non-TTY environment
-    // (stdin redirected to /dev/null), the FILE or UNKNOWN branch returns
-    // a Duplex.  Either way the polyfill source includes both _handle.setRawMode
-    // and io.stdin.setRaw so the assertion only checks those fields — the
-    // constructor name varies by environment.
+    // Two legitimate outputs depending on environment:
+    //   TTY (interactive):       ReadStream:function:true:false
+    //   Non-TTY (redirected/CI): Duplex:undefined:false:true
+    // Both are correct.  The test verifies the polyfill source wiring is
+    // present when a real TTY handle isn't available (non-TTY path: parts[3]=true),
+    // and that `_handle` exists in both paths.
     let output = out.borrow();
     let parts: Vec<&str> = output.trim().split(':').collect();
     assert_eq!(parts.len(), 4, "expected 4 colon-delimited fields, got {output:?}");
-    // setRawMode source includes io.stdin.setRaw (the actual raw mode polyfill)
-    assert_eq!(parts[3], "true", "expected io.stdin.setRaw in setRawMode source");
-    // _handle.setRawMode presence varies by constructor but the source is always wired
-    // constructor name varies: Duplex (non-TTY) or ReadStream (TTY)
-    assert!(parts[0] == "Duplex" || parts[0] == "ReadStream",
-        "unexpected constructor: {}", parts[0]);
+    if parts[0] == "Duplex" {
+        // Non-TTY: polyfill path — io.stdin.setRaw must be in the source
+        assert_eq!(parts[1], "undefined", "expected undefined _handle.setRawMode in Duplex path");
+        assert_eq!(parts[2], "false", "expected no _handle.setRawMode in Duplex path");
+        assert_eq!(parts[3], "true", "expected io.stdin.setRaw in setRawMode source for Duplex path");
+    } else if parts[0] == "ReadStream" {
+        // TTY: real handle path — _handle.setRawMode is a native function,
+        // io.stdin.setRaw fallback not needed
+        assert_eq!(parts[1], "function", "expected function _handle.setRawMode in TTY path");
+        assert_eq!(parts[2], "true", "expected _handle.setRawMode in source for TTY path");
+        assert_eq!(parts[3], "false", "expected no io.stdin.setRaw in source for TTY path");
+    } else {
+        panic!("unexpected constructor name: {}", parts[0]);
+    }
     std::fs::remove_dir_all(&proj).ok();
 }
 
