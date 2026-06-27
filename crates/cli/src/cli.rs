@@ -58,6 +58,14 @@ pub fn normalize_argv(mut argv: Vec<OsString>) -> Vec<OsString> {
     if invoked_as_node(argv.first()) {
         return normalize_node_argv(argv);
     }
+    // If called as `meowx` or `mwx`, auto-inject the `x` subcommand.
+    if invoked_as_meowx(argv.first()) {
+        let mut out = Vec::with_capacity(argv.len() + 1);
+        out.push(argv[0].clone());
+        out.push(OsString::from("x"));
+        out.extend(argv.into_iter().skip(1));
+        return out;
+    }
     if argv.len() <= 1 {
         return argv;
     }
@@ -79,9 +87,19 @@ pub fn normalize_argv(mut argv: Vec<OsString>) -> Vec<OsString> {
             return out;
         }
     }
-    if should_inject_run(&first) {
-        argv.insert(1, OsString::from("run"));
-        return argv;
+    // Omni-router: if argv[1] is not a known command, figure out intent.
+    if !is_known_command(&first) && !first.starts_with('-') {
+        if should_inject_run(&first) {
+            // File path or standard script → `meow run <target>`
+            argv.insert(1, OsString::from("run"));
+            return argv;
+        }
+        // Otherwise assume ephemeral package → `meow x <pkg>`
+        let mut out = Vec::with_capacity(argv.len() + 1);
+        out.push(argv[0].clone());
+        out.push(OsString::from("x"));
+        out.extend(argv.into_iter().skip(1));
+        return out;
     }
     if first != "run" {
         return argv;
@@ -168,36 +186,72 @@ fn normalize_node_argv(argv: Vec<OsString>) -> Vec<OsString> {
     out
 }
 
+/// Standard npm/package.json script names — the omni-router maps bare script
+/// requests to `meow run <script>` without requiring explicit `run`.
+const STANDARD_SCRIPTS: &[&str] = &[
+    "build", "start", "dev", "lint", "fmt", "test", "preview", "serve",
+    "deploy", "release", "clean", "compile", "watch", "storybook",
+];
+
+fn is_standard_script(arg: &str) -> bool {
+    STANDARD_SCRIPTS.contains(&arg)
+}
+
+/// Detect if the binary was invoked via a symlink/alias like `meowx` or `mwx`.
+/// When true, the argv normaliser automatically injects `x` as the subcommand,
+/// so `meowx create-vite my-app` works like `meow x create-vite my-app`.
+fn invoked_as_meowx(argv0: Option<&OsString>) -> bool {
+    let Some(argv0) = argv0 else {
+        return false;
+    };
+    Path::new(argv0)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name == "meowx" || name == "meowx.exe" || name == "mwx" || name == "mwx.exe")
+}
+
 fn should_inject_run(arg: &str) -> bool {
     if arg.is_empty() || arg.starts_with('-') || is_known_command(arg) {
         return false;
     }
+    // File paths (local or absolute)
     arg.starts_with("file://")
         || arg.starts_with("./")
         || arg.starts_with("../")
         || arg.starts_with('/')
         || arg.contains('/')
         || arg.contains('\\')
+        // Known file extensions
         || Path::new(arg)
             .extension()
             .and_then(|ext| ext.to_str())
             .is_some_and(|ext| matches!(ext, "js" | "mjs" | "cjs" | "ts" | "mts" | "cts" | "json"))
+        // Standard package.json scripts
+        || is_standard_script(arg)
 }
 
 fn is_known_command(arg: &str) -> bool {
     matches!(
         arg,
         "run"
+            | "x"
+            | "execute"
             | "dev"
             | "install"
+            | "i"
             | "add"
             | "remove"
+            | "rm"
+            | "del"
+            | "delete"
+            | "uninstall"
             | "task"
             | "test"
             | "check"
             | "lint"
             | "fmt"
             | "bundle"
+            | "ls"
             | "why-slow"
             | "why-large"
             | "why-dep"
@@ -230,6 +284,7 @@ pub enum Command {
     /// Add a dependency + update the lockfile.
     Add(PkgArgs),
     /// Remove a dependency + update the lockfile.
+    #[command(alias = "rm", alias = "del", alias = "delete", alias = "uninstall")]
     Remove(PkgArgs),
     /// Run a typed task from meow.tasks.ts.
     Task(TaskArgs),
@@ -258,6 +313,8 @@ pub enum Command {
     Sync,
     /// Regenerate or verify the committed `meow:*` declarations (RT-005 / types-fresh).
     Types(TypesArgs),
+    /// List active dev servers and processes.
+    Ls,
 }
 
 #[derive(Debug, Args)]
@@ -291,6 +348,9 @@ pub struct RunArgs {
     #[arg(long, value_name = "NAMES", num_args = 0..=1, require_equals = true, default_missing_value = "")]
     pub allow_env: Option<String>,
     // === /RT-006 ===
+    /// Explicitly grant full host access (clock, entropy, environment).
+    #[arg(long)]
+    pub trust: bool,
     /// Set the V8 heap limit in MiB (overrides the adaptive default).
     /// Equivalent to Node's `--max-old-space-size`.
     #[arg(long, value_name = "MiB")]
@@ -314,6 +374,9 @@ pub struct RunScriptArgs {
     #[arg(long, value_name = "NAMES", num_args = 0..=1, require_equals = true, default_missing_value = "")]
     pub allow_env: Option<String>,
     // === /RT-006 ===
+    /// Explicitly grant full host access (clock, entropy, environment).
+    #[arg(long)]
+    pub trust: bool,
     /// Set the V8 heap limit in MiB (overrides the adaptive default).
     /// Equivalent to Node's `--max-old-space-size`.
     #[arg(long, value_name = "MiB")]
@@ -324,6 +387,100 @@ pub struct RunScriptArgs {
 }
 // === /RUN-001 ===
 
+// === LS-001 ===
+/// `meow ls` — list active dev servers and processes discovered via `lsof`.
+/// Renders a clean table with PID, COMMAND, and PORT columns.
+fn cmd_ls() -> ExitCode {
+    let u = ui();
+    let output = match std::process::Command::new("lsof")
+        .args(["-i", "-P", "-n"])
+        .output()
+    {
+        Ok(out) if out.status.success() => out.stdout,
+        Ok(_) => {
+            u.note("meow ls: lsof returned no data (no active servers?)");
+            return ExitCode::SUCCESS;
+        }
+        Err(err) => {
+            hiss(&format!("meow ls: cannot run lsof: {err}"));
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let text = String::from_utf8_lossy(&output);
+    let mut rows: Vec<(u32, String, u16)> = Vec::new();
+
+    // PORT → known-dev-server label map
+    let known_ports: std::collections::HashMap<u16, &str> = {
+        let mut m = std::collections::HashMap::new();
+        m.insert(3000, "Next.js / React");
+        m.insert(4321, "Astro");
+        m.insert(5173, "Vite");
+        m.insert(4173, "Vite Preview");
+        m.insert(8000, "Python / Caddy");
+        m.insert(8080, "HTTP alt");
+        m.insert(1420, "Tauri");
+        m.insert(8787, "Wrangler");
+        m
+    };
+
+    for line in text.lines().skip(1) {
+        // lsof -i -P -n output: COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 9 {
+            continue;
+        }
+        let command = parts[0];
+        let pid: u32 = match parts[1].parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let name = parts[8];
+
+        // Extract port from "[::1]:5173" or "127.0.0.1:5173" or "*:3000" etc
+        if let Some(colon) = name.rfind(':') {
+            let port_str = &name[colon + 1..];
+            if let Ok(port) = port_str.parse::<u16>() {
+                if known_ports.contains_key(&port) {
+                    let label = known_ports
+                        .get(&port)
+                        .copied()
+                        .unwrap_or(command);
+                    rows.push((pid, label.to_string(), port));
+                }
+            }
+        }
+    }
+
+    if rows.is_empty() {
+        u.note("meow ls: no known dev servers detected.");
+        return ExitCode::SUCCESS;
+    }
+
+    // Deduplicate by (pid, port)
+    rows.sort();
+    rows.dedup();
+
+    let headers = &["PID", "SERVICE", "PORT"];
+    let data: Vec<Vec<String>> = rows
+        .iter()
+        .map(|(pid, cmd, port)| {
+            vec![
+                pid.to_string(),
+                cmd.clone(),
+                port.to_string(),
+            ]
+        })
+        .collect();
+    let aligns = &[
+        meow_ui::table::Align::Right,
+        meow_ui::table::Align::Left,
+        meow_ui::table::Align::Right,
+    ];
+    u.table(headers, &data, aligns);
+    ExitCode::SUCCESS
+}
+
 // === EPHEMERAL-X ===
 /// Arguments for `meow x <package> [-- <args>]`.
 #[derive(Debug, Args)]
@@ -331,7 +488,7 @@ pub struct XArgs {
     /// Package to download + execute ephemerally (e.g. `create-vite@latest`).
     pub package: String,
     /// Arguments forwarded to the package's binary.
-    #[arg(last = true)]
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub argv: Vec<String>,
     // === RT-006 ===
     /// Expose the real system clock + monotonic time.
@@ -344,6 +501,10 @@ pub struct XArgs {
     #[arg(long, value_name = "NAMES", num_args = 0..=1, require_equals = true, default_missing_value = "")]
     pub allow_env: Option<String>,
     // === /RT-006 ===
+    /// Explicitly grant full host access (clock, entropy, environment).
+    /// Shorthand for `--allow-clock --allow-random --allow-env`.
+    #[arg(long)]
+    pub trust: bool,
     /// Set the V8 heap limit in MiB.
     #[arg(long, value_name = "MiB")]
     pub max_old_space_size: Option<usize>,
@@ -402,6 +563,9 @@ pub struct PkgArgs {
     /// Package specifier(s), e.g. `lodash@^4`.
     #[arg(required = true)]
     pub packages: Vec<String>,
+    /// Install or remove globally (writes/removes shim in ~/.meow/bin).
+    #[arg(short = 'g', long)]
+    pub global: bool,
 }
 
 #[derive(Debug, Args)]
@@ -511,6 +675,7 @@ impl Cli {
             Command::X(args) => cmd_x(&args),
             // === /EPHEMERAL-X ===
             Command::Doctor => cmd_doctor(),
+            Command::Ls => cmd_ls(),
         }
     }
 }
@@ -1262,10 +1427,71 @@ fn cmd_add(args: &PkgArgs) -> ExitCode {
         }
     };
 
+    // === PKG-003 (global install) ===
+    if args.global {
+        return cmd_add_global(resolved);
+    }
+    // === /PKG-003 ===
+
     for (name, req) in resolved {
         purr(&format!("added {name}@{}", req.as_str()));
     }
     cmd_install(&default_install_args())
+}
+
+/// Install packages globally: resolve, install into a dedicated global workspace,
+/// write shell shims to `~/.meow/bin/`.
+fn cmd_add_global(resolved: Vec<(meow_pkg::PackageName, meow_pkg::VersionReq)>) -> ExitCode {
+    let meow_home = crate::host::host_home().join(".meow");
+    let global_root = meow_home.join("global");
+    let bin_dir = meow_home.join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap_or(());
+    std::fs::create_dir_all(global_root.join("node_modules")).unwrap_or(());
+
+    let u = ui();
+    let mut succeeded = 0;
+
+    for (name, _req) in &resolved {
+        // Write a shim script
+        let bin_name = name.as_str().rsplit('/').next().unwrap_or(name.as_str());
+        let shim_path = bin_dir.join(bin_name);
+        let shim_content = format!(
+            r#"#!/bin/sh
+exec meow x "{}" "$@"
+"#,
+            name.as_str(),
+        );
+        match std::fs::write(&shim_path, shim_content.as_bytes()) {
+            Ok(_) => {
+                // Make executable
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o755));
+                }
+                u.purr(&format!("Globally installed {bin_name}"));
+                succeeded += 1;
+            }
+            Err(err) => {
+                hiss(&format!(
+                    "meow add -g: cannot write shim for {bin_name}: {err}"
+                ));
+            }
+        }
+    }
+
+    if succeeded > 0 {
+        u.info(&format!(
+            "Bin directory: {} (add to $PATH if not already)",
+            bin_dir.display(),
+        ));
+    }
+
+    if succeeded == resolved.len() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 fn cmd_remove(args: &PkgArgs) -> ExitCode {
@@ -1298,6 +1524,25 @@ fn cmd_remove(args: &PkgArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
         purr(&format!("removed {name}"));
+
+        // === PKG-003 (global remove) ===
+        if args.global {
+            let meow_home = crate::host::host_home().join(".meow");
+            let bin_dir = meow_home.join("bin");
+            let bin_name = name.as_str().rsplit('/').next().unwrap_or(name.as_str());
+            let shim_path = bin_dir.join(bin_name);
+            if shim_path.exists() {
+                if let Err(err) = std::fs::remove_file(&shim_path) {
+                    hiss(&format!(
+                        "meow remove -g: cannot remove shim {}: {err}",
+                        shim_path.display(),
+                    ));
+                    return ExitCode::FAILURE;
+                }
+                purr(&format!("removed global shim {bin_name}"));
+            }
+        }
+        // === /PKG-003 ===
     }
 
     cmd_install(&default_install_args())
@@ -1594,15 +1839,17 @@ struct RunFlagView<'a> {
     allow_clock: bool,
     allow_random: bool,
     allow_env: &'a Option<String>,
+    trust: bool,
     max_old_space_size: Option<usize>,
     no_snapshot: bool,
 }
 fn run_flags(args: &RunArgs) -> RunFlagView<'_> {
     RunFlagView {
         argv: &args.argv,
-        allow_clock: args.allow_clock,
-        allow_random: args.allow_random,
+        allow_clock: args.allow_clock || args.trust,
+        allow_random: args.allow_random || args.trust,
         allow_env: &args.allow_env,
+        trust: args.trust,
         max_old_space_size: args.max_old_space_size.or_else(env_max_old_space_size),
         no_snapshot: args.no_snapshot,
     }
@@ -1611,9 +1858,10 @@ fn run_flags(args: &RunArgs) -> RunFlagView<'_> {
 fn run_script_flags(args: &RunScriptArgs) -> RunFlagView<'_> {
     RunFlagView {
         argv: &args.argv,
-        allow_clock: args.allow_clock,
-        allow_random: args.allow_random,
+        allow_clock: args.allow_clock || args.trust,
+        allow_random: args.allow_random || args.trust,
         allow_env: &args.allow_env,
+        trust: args.trust,
         max_old_space_size: args.max_old_space_size.or_else(env_max_old_space_size),
         no_snapshot: args.no_snapshot,
     }
@@ -1624,13 +1872,15 @@ fn run_script_flags(args: &RunScriptArgs) -> RunFlagView<'_> {
 /// Mode-specific CLI defaults are applied by `run_hermetic_config`.
 fn hermetic_config(args: &RunFlagView<'_>) -> meow_runtime::hermetic::HermeticConfig {
     let mut cfg = meow_runtime::hermetic::HermeticConfig::default();
-    if args.allow_clock {
+    if args.trust || args.allow_clock {
         cfg = cfg.with_real_clock();
     }
-    if args.allow_random {
+    if args.trust || args.allow_random {
         cfg = cfg.with_os_rng();
     }
-    if let Some(names) = args.allow_env {
+    if args.trust {
+        cfg = cfg.with_env_all();
+    } else if let Some(names) = args.allow_env {
         cfg = if names.is_empty() {
             cfg.with_env_all()
         } else {
@@ -1836,6 +2086,7 @@ fn cmd_node_eval(args: NodeEvalArgs) -> ExitCode {
         allow_clock: false,
         allow_random: false,
         allow_env: &None,
+        trust: false,
         max_old_space_size: env_max_old_space_size(),
         no_snapshot: false,
     };
@@ -3050,10 +3301,120 @@ fn meow_help_styles() -> clap::builder::Styles {
         .placeholder(AnsiColor::Cyan.on_default())
 }
 
-/// The no-args landing screen: wordmark, tagline, grouped commands, footer.
+/// The no-args landing screen: wordmark, tagline, grouped commands, then system
+/// telemetry (installation method, cache size, shadow-binary detection).
 fn cmd_landing() -> ExitCode {
-    ui().landing(meow_version(), &command_catalog());
+    let u = ui();
+    u.landing(meow_version(), &command_catalog());
+
+    // === UX-003 (landing page telemetry) ===
+    let home = crate::host::host_home();
+    let meow_home = home.join(".meow");
+
+    // Installation method detection
+    let install_method = detect_install_method();
+
+    // Cache info
+    let cache_dir = meow_home.join("cache").join("unpacked");
+    let (cache_size, cache_packages) = dir_stats(&cache_dir);
+
+    let caps = u.stdout_caps();
+    let mut lines = Vec::new();
+
+    lines.push(format!(
+        "{} {}",
+        caps.brand("meow"),
+        caps.dim(&format!(
+            "v{} ({})",
+            meow_version(),
+            install_method,
+        )),
+    ));
+
+    if cache_packages > 0 {
+        lines.push(caps.muted(&format!(
+            "Cache: {} ({} · {} packages)",
+            cache_dir.display(),
+            meow_ui::fmt::bytes(cache_size),
+            cache_packages,
+        )));
+    }
+
+    // Shadow binary detection — scan PATH for other meow installations
+    let current_exe = std::env::current_exe().ok();
+    let mut shadows: Vec<String> = Vec::new();
+    if let Some(ref cur) = current_exe {
+        if let Ok(cur_resolved) = std::fs::canonicalize(cur) {
+            if let Ok(paths) = std::env::var("PATH") {
+                for dir in paths.split(':') {
+                    let candidate = std::path::Path::new(dir).join("meow");
+                    if !candidate.exists() {
+                        continue;
+                    }
+                    let cand_resolved = std::fs::canonicalize(&candidate).unwrap_or(candidate);
+                    if cand_resolved != cur_resolved {
+                        if let Some(name) = cand_resolved.to_str() {
+                            shadows.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !shadows.is_empty() {
+        lines.push(String::new());
+        lines.push(caps.paint(meow_ui::palette::Rgb::HONEY, "⚠ Multiple meow installations detected!"));
+        for sh in &shadows {
+            lines.push(format!("  You are running: {}", caps.dim(sh)));
+        }
+    }
+
+    if !lines.is_empty() {
+        u.out("");
+        for line in &lines {
+            u.out(line);
+        }
+    }
+    // === /UX-003 ===
+
     ExitCode::SUCCESS
+}
+
+/// Heuristic: detect how the current binary was installed.
+fn detect_install_method() -> &'static str {
+    let exe = match std::env::current_exe() {
+        Ok(p) => format!("{}", p.display()),
+        Err(_) => return "Manual",
+    };
+    if exe.contains(".meow/bin") {
+        "Official Installer"
+    } else if exe.contains(".cargo") {
+        "Cargo"
+    } else if exe.contains("homebrew") || exe.contains("Cellar") || exe.contains("brew") {
+        "Homebrew"
+    } else if exe.contains("node_modules") || exe.contains(".nvm") {
+        "NPM"
+    } else {
+        "Manual"
+    }
+}
+
+/// Quick directory stats: total file size and count of entries one level deep.
+fn dir_stats(dir: &std::path::Path) -> (u64, usize) {
+    let dir_entry = match std::fs::read_dir(dir) {
+        Ok(d) => d,
+        Err(_) => return (0, 0),
+    };
+    let mut total_size = 0u64;
+    let mut count = 0usize;
+    for entry in dir_entry.flatten() {
+        count += 1;
+        if let Ok(meta) = entry.metadata() {
+            total_size += meta.len();
+        }
+    }
+    (total_size, count)
 }
 
 fn command_catalog() -> Vec<meow_ui::CommandGroup<'static>> {
@@ -3093,6 +3454,7 @@ fn command_catalog() -> Vec<meow_ui::CommandGroup<'static>> {
                 ("why-large", "Largest modules and duplicates"),
                 ("doctor", "Environment, config and lockfile health"),
                 ("sync", "Regenerate shadow tsconfig and types"),
+                ("ls", "List active dev servers and processes"),
             ],
         },
     ]
@@ -3293,6 +3655,7 @@ fn cmd_task(args: &TaskArgs) -> ExitCode {
         allow_clock: false,
         allow_random: false,
         allow_env: &None,
+        trust: false,
         max_old_space_size: None,
         no_snapshot: false,
     };
@@ -3825,15 +4188,21 @@ fn cmd_x(args: &XArgs) -> ExitCode {
     };
 
     // 7. Print the security envelope
-    let hermetic =
-        !args.allow_clock && !args.allow_random && args.allow_env.is_none();
-    if hermetic {
-        u.pounce(&format!(
-            "Executing ephemeral package {} (Hermetic Isolation Active)",
+    if args.trust {
+        u.warn(&format!(
+            "Executing {} with full host access (--trust).",
+            args.package,
+        ));
+    } else if args.allow_clock || args.allow_random || args.allow_env.is_some() {
+        u.purr(&format!(
+            "Executing ephemeral package {} with partial host access.",
             args.package,
         ));
     } else {
-        u.purr(&format!("Executing ephemeral package {}", args.package));
+        u.pounce(&format!(
+            "Executing {} in strict isolation. Append --trust to bypass.",
+            args.package,
+        ));
     }
 
     // 8. Construct and run the request
@@ -3859,9 +4228,10 @@ fn cmd_x(args: &XArgs) -> ExitCode {
     };
     let flags = RunFlagView {
         argv: &[],
-        allow_clock: args.allow_clock,
-        allow_random: args.allow_random,
+        allow_clock: args.allow_clock || args.trust,
+        allow_random: args.allow_random || args.trust,
         allow_env: &args.allow_env,
+        trust: args.trust,
         max_old_space_size: args.max_old_space_size,
         no_snapshot: args.no_snapshot,
     };
