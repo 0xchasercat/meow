@@ -313,6 +313,10 @@ impl rolldown_plugin::Plugin for MeowResolverPlugin {
 
         async move { result }
     }
+
+    fn register_hook_usage(&self) -> rolldown_plugin::HookUsage {
+        rolldown_plugin::HookUsage::ResolveId | rolldown_plugin::HookUsage::Load
+    }
 }
 
 pub async fn execute_bundle(
@@ -472,36 +476,28 @@ fn append_diagnostics(
     for diag in diagnostics {
         let message = diag.message.to_string();
 
-        if let Some(labels) = diag.labels.as_ref() {
-            if labels.is_empty() {
-                out.push(ToolDiagnostic {
-                    path: path.to_path_buf(),
-                    source: Arc::clone(source),
-                    span: (0, 0),
-                    message: message.clone(),
-                    label: None,
-                });
-            } else {
-                for label in labels {
-                    let start = label.offset();
-                    let len = label.len();
-                    let end = start.saturating_add(len);
-                    out.push(ToolDiagnostic {
-                        path: path.to_path_buf(),
-                        source: Arc::clone(source),
-                        span: (start, end),
-                        message: message.clone(),
-                        label: label.label().map(ToString::to_string),
-                    });
-                }
-            }
-        } else {
+        let labels = diag.labels.as_ref();
+        if labels.is_empty() {
             out.push(ToolDiagnostic {
                 path: path.to_path_buf(),
                 source: Arc::clone(source),
                 span: (0, 0),
                 message,
                 label: None,
+            });
+            continue;
+        }
+
+        for label in labels {
+            let start = label.offset();
+            let len = label.len();
+            let end = start.saturating_add(len);
+            out.push(ToolDiagnostic {
+                path: path.to_path_buf(),
+                source: Arc::clone(source),
+                span: (start, end),
+                message: message.clone(),
+                label: label.label().map(ToString::to_string),
             });
         }
     }
