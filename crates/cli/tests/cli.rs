@@ -211,14 +211,20 @@ process.stdin.setRawMode(false);
     .expect("write tty probe");
     let transcript = tmp.join("typescript");
     let meow_bin = assert_cmd::cargo::cargo_bin("meow");
-    let status = StdCommand::new(script_bin)
-        .arg("-q")
-        .arg(&transcript)
-        .arg(meow_bin)
-        .arg("run")
-        .arg(&entry)
-        .status()
-        .expect("run script pseudo-terminal");
+    // macOS (BSD script): script -q transcript cmd args...
+    // Linux (util-linux): script -qc "cmd args..." transcript
+    let mut cmd = StdCommand::new(script_bin);
+    if cfg!(target_os = "macos") {
+        cmd.arg("-q")
+            .arg(&transcript)
+            .arg(&meow_bin)
+            .arg("run")
+            .arg(&entry);
+    } else {
+        let full_cmd = format!("{} run {}", meow_bin.display(), entry.display());
+        cmd.arg("-q").arg("-c").arg(&full_cmd).arg(&transcript);
+    }
+    let status = cmd.status().expect("run script pseudo-terminal");
     assert!(status.success(), "pseudo-terminal run should succeed");
     let output = std::fs::read_to_string(&transcript).expect("read transcript");
     assert!(
@@ -633,8 +639,14 @@ console.log(`ARGV=${JSON.stringify(process.argv.slice(2))}`);"#,
     )
     .expect("write dev script");
 
-    let proj_display = proj.to_string_lossy().into_owned();
-    let nested_display = nested.to_string_lossy().into_owned();
+    // Strip \\?\ UNC prefix on Windows so the assertion matches what
+    // std::env::current_dir() returns inside the child process (without prefix).
+    fn strip_unc_prefix(p: &std::path::Path) -> String {
+        let s = p.to_string_lossy().into_owned();
+        s.strip_prefix(r#"\\?\"#).map(String::from).unwrap_or(s)
+    }
+    let proj_display = strip_unc_prefix(&proj);
+    let nested_display = strip_unc_prefix(&nested);
     meow()
         .current_dir(&nested)
         .arg("run")
@@ -1427,7 +1439,7 @@ fn init_creates_config_and_package_json() {
         .arg("--no-install")
         .assert()
         .success()
-        .stdout(predicate::str::contains("meow init: created"));
+        .stdout(predicate::str::contains("Project initialized!"));
 
     assert!(
         proj.join("meow.config.json").is_file(),
@@ -1437,6 +1449,7 @@ fn init_creates_config_and_package_json() {
         proj.join("package.json").is_file(),
         "package.json should exist"
     );
+    assert!(proj.join("main.ts").is_file(), "main.ts should exist");
     assert!(proj.join(".meow").is_dir(), ".meow dir should exist");
 
     let config = std::fs::read_to_string(proj.join("meow.config.json")).expect("read config");
@@ -1446,7 +1459,18 @@ fn init_creates_config_and_package_json() {
     );
 
     let pkg = std::fs::read_to_string(proj.join("package.json")).expect("read package");
-    assert!(pkg.contains("0.0.0"), "default version should be 0.0.0");
+    assert!(pkg.contains("0.1.0"), "version should be 0.1.0");
+    assert!(pkg.contains("\"type\": \"module\""), "should be ESM");
+    assert!(
+        pkg.contains("meow run main.ts"),
+        "dev script should use meow"
+    );
+
+    let main_ts = std::fs::read_to_string(proj.join("main.ts")).expect("read main.ts");
+    assert!(
+        main_ts.contains("meow:http"),
+        "main.ts should import meow:http"
+    );
 
     std::fs::remove_dir_all(&proj).ok();
 }

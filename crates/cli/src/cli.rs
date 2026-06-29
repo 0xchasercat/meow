@@ -4710,10 +4710,11 @@ fn cmd_init(args: &InitArgs) -> ExitCode {
         let pkg_content = format!(
             r#"{{
   "name": "{}",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
+  "type": "module",
   "scripts": {{
-    "dev": "node index.js"
+    "dev": "meow run main.ts"
   }}
 }}
 "#,
@@ -4721,6 +4722,27 @@ fn cmd_init(args: &InitArgs) -> ExitCode {
         );
         if let Err(err) = std::fs::write(&package_path, pkg_content) {
             hiss(&format!("meow init: cannot write package.json: {err}"));
+            return ExitCode::FAILURE;
+        }
+    }
+
+    // Scaffold a starter main.ts demonstrating native TypeScript + Web APIs.
+    let main_ts_path = root.join("main.ts");
+    if !main_ts_path.exists() || args.force {
+        if let Err(err) = std::fs::write(
+            &main_ts_path,
+            "\
+import { serve } from \"meow:http\";
+import { ui } from \"meow:ui\";
+
+ui.purr(\"meow runtime started!\");
+
+serve((req) => {
+  return new Response(\" 🎀 🐾 Hello from meow! 🐾 🎀\\n\");
+}, { port: 3000 });
+",
+        ) {
+            hiss(&format!("meow init: cannot write main.ts: {err}"));
             return ExitCode::FAILURE;
         }
     }
@@ -4771,11 +4793,7 @@ fn cmd_init(args: &InitArgs) -> ExitCode {
         }
     }
 
-    purr(&format!(
-        "meow init: created meow.config.json ({}) and package.json in {}",
-        args.mode,
-        root.display()
-    ));
+    ui().pounce("Project initialized! Run `meow dev` to start the server.");
     ExitCode::SUCCESS
 }
 // === /INIT-001 ===
