@@ -58,6 +58,7 @@ oxc_semantic = { workspace = true }
 oxc_span = { workspace = true }
 oxc_codegen = { workspace = true }
 oxc_transformer = { workspace = true }
+meow-graph = { path = "../graph" }
 # === /RT-007 ===
 # PKG-002's `meow install` HTTPS client (`reqwest`) and runtime TLS both use
 # `rustls`; installing the aws-lc-rs default in runtime avoids provider ambiguity.
@@ -97,7 +98,6 @@ deno_core = { workspace = true }
 parking_lot = "0.12"
 # === /RT-005 ===
 meow-config = { path = "../config" }
-meow-graph = { path = "../graph" }
 meow-loader = { path = "../loader" }
 meow-pkg = { path = "../pkg" }
 # === /RT-005 ===
