@@ -36,7 +36,7 @@ impl SemanticGraph {
             let ret = SemanticBuilder::new().build(cst.program());
             SemDep {
                 semantic: ret.semantic,
-                errors: ret.errors,
+                errors: ret.diagnostics,
             }
         });
         Self { cell }
