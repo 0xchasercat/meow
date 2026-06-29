@@ -47,8 +47,7 @@ fn hermetic_runtime(cfg: HermeticConfig) -> (Rc<RefCell<String>>, Runtime) {
         v8_flags: None,
     })
     .expect("runtime initializes with hermetic shadows");
-    rt.apply_hermetic_shadows()
-        .expect("hermetic shadows apply");
+    rt.apply_hermetic_shadows().expect("hermetic shadows apply");
     (out, rt)
 }
 
@@ -236,8 +235,7 @@ fn web_hermetic_runtime(cfg: HermeticConfig) -> (Rc<RefCell<String>>, Runtime) {
         v8_flags: None,
     })
     .expect("runtime initializes with web + hermetic");
-    rt.apply_hermetic_shadows()
-        .expect("hermetic shadows apply");
+    rt.apply_hermetic_shadows().expect("hermetic shadows apply");
     (out, rt)
 }
 
