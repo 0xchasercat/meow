@@ -550,58 +550,8 @@ if (globalThis.Deno) {
       }
     }
   }
-  function meowSanitizeChildEnv(env) {
-    const out = { ...(env ?? processValue?.env ?? {}) };
-    delete out.MEOW_NODE_SHIM;
-    out.MEOW_NO_SHIM = "1";
-    if (typeof out.PATH === "string" && typeof out.MEOW_HOME === "string") {
-      const shimDir = `${out.MEOW_HOME}/.meow/bin`;
-      const altShimDir = `${out.MEOW_HOME}/bin`;
-      out.PATH = out.PATH
-        .split(":")
-        .filter((part) => part !== shimDir && part !== altShimDir)
-        .join(":");
-    }
-    return out;
-  }
-  function meowPatchChildProcessShimEnv(processValue) {
-    if (processValue.env?.MEOW_NO_SHIM === "1") return;
-    let childProcess;
-    try {
-      childProcess = load("ext:deno_node/child_process.ts");
-    } catch {
-      return;
-    }
-    const target = childProcess?.default ?? childProcess;
-    if (!target || typeof target !== "object") return;
-    for (const name of ["spawn", "spawnSync", "execFile", "execFileSync", "exec", "execSync"]) {
-      const original = target[name];
-      if (typeof original !== "function" || original.__meowNoShimPatch === true) continue;
-      const patched = function (...args) {
-        let optionsIndex = (name === "exec" || name === "execSync") ? 1 : 2;
-        if (typeof args[optionsIndex] === "function") {
-          args.splice(optionsIndex, 0, { env: meowSanitizeChildEnv(undefined) });
-        } else {
-          const options = args[optionsIndex];
-          if (options === undefined || options === null) {
-            args[optionsIndex] = { env: meowSanitizeChildEnv(undefined) };
-          } else if (typeof options === "object") {
-            args[optionsIndex] = { ...options, env: meowSanitizeChildEnv(options.env) };
-          }
-        }
-        return original.apply(this, args);
-      };
-      patched.__meowNoShimPatch = true;
-      try {
-        target[name] = patched;
-      } catch {
-        // Non-writable export; leave it alone.
-      }
-    }
-  }
   if (processValue && typeof processValue === "object") {
     meowPatchProcessTtyStreams(processValue);
-    meowPatchChildProcessShimEnv(processValue);
     const originalExit = typeof processValue.exit === "function"
       ? processValue.exit.bind(processValue)
       : undefined;

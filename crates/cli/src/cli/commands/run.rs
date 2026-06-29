@@ -710,6 +710,7 @@ pub(super) async fn run_native_request(
         });
     install_node_shim_env(&mut env)?;
     env.insert("MEOW_NODE_SHIM".to_owned(), "1".to_owned());
+    env.insert("MEOW_NO_SHIM".to_owned(), "1".to_owned());
     if let Ok(exe) = std::env::current_exe() {
         env.insert(
             "MEOW_EXEC_PATH".to_owned(),
