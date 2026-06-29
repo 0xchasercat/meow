@@ -55,10 +55,7 @@ fn locate_tsc_for_tests(workspace_root: &Path) -> Option<PathBuf> {
             return Some(path);
         }
     }
-    let project_tsc = workspace_root
-        .join("node_modules")
-        .join(".bin")
-        .join("tsc");
+    let project_tsc = workspace_root.join("node_modules").join(".bin").join("tsc");
     if project_tsc.is_file() && works(&project_tsc) {
         return Some(project_tsc);
     }

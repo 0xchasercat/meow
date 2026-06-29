@@ -12,7 +12,9 @@ pub mod test;
 pub mod tool;
 pub mod x;
 
-pub use info::{cmd_doctor, cmd_init, cmd_ls, cmd_sync, cmd_types, cmd_why_dep, cmd_why_large, cmd_why_slow};
+pub use info::{
+    cmd_doctor, cmd_init, cmd_ls, cmd_sync, cmd_types, cmd_why_dep, cmd_why_large, cmd_why_slow,
+};
 pub use install::{cmd_add, cmd_install, cmd_remove};
 pub use run::{cmd_dev, cmd_node_eval, cmd_run, cmd_task};
 pub use test::cmd_test;

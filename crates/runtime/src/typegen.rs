@@ -56,7 +56,10 @@ pub struct TypegenLayout<'a> {
 #[derive(Debug, thiserror::Error)]
 pub enum TypegenError {
     #[error("could not spawn the TypeScript compiler: {source}")]
-    Spawn { #[source] source: io::Error },
+    Spawn {
+        #[source]
+        source: io::Error,
+    },
     #[error("could not prepare {path}: {source}")]
     CreateDir {
         path: PathBuf,

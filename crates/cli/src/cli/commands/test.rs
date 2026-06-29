@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use crate::cli::{hiss, purr, ui, TestArgs};
 use crate::cli::commands::run::{build_runtime_context, RuntimeNodeBridge};
+use crate::cli::{hiss, purr, ui, TestArgs};
 
 // === TEST-001 ===
 /// `meow test` — discover test files, execute each through a hermetic isolate,

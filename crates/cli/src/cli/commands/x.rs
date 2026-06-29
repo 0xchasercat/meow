@@ -6,12 +6,12 @@
 use std::collections::BTreeMap;
 use std::process::ExitCode;
 
-use crate::cli::{hiss, ui, XArgs};
 use crate::cli::commands::install::{
     dist_tag_requirement, load_install_package_json, resolve_requested_requirement,
     runtime_meow_requirement, split_package_arg, NpmRegistry,
 };
 use crate::cli::commands::run::{host_env_map, run_native_request, NativeRunRequest, RunFlagView};
+use crate::cli::{hiss, ui, XArgs};
 use crate::host;
 
 // === EPHEMERAL-X ===

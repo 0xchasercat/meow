@@ -15,8 +15,8 @@ use meow_runtime::node::{
 use node_resolver::errors::{PackageFolderResolveErrorKind, PackageNotFoundError};
 
 use crate::cli::{
-    cold_start, find_project_root, hiss, load_lockfile, meow_version, mode_label, ui,
-    NodeEvalArgs, ResidualLazySources, RunArgs, RunScriptArgs, TaskArgs,
+    cold_start, find_project_root, hiss, load_lockfile, meow_version, mode_label, ui, NodeEvalArgs,
+    ResidualLazySources, RunArgs, RunScriptArgs, TaskArgs,
 };
 use crate::host;
 

@@ -862,7 +862,9 @@ async fn requested_dependency(
     Ok((name, requirement))
 }
 
-pub(super) fn split_package_arg(raw: &str) -> Result<(meow_pkg::PackageName, Option<&str>), String> {
+pub(super) fn split_package_arg(
+    raw: &str,
+) -> Result<(meow_pkg::PackageName, Option<&str>), String> {
     if raw.is_empty() {
         return Err("empty package specifier".to_owned());
     }
