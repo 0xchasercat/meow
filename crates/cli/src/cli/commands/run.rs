@@ -1240,7 +1240,7 @@ fn install_node_shim(exe: &Path, shim_path: &Path) -> Result<(), RunCommandError
     use std::os::unix::fs::PermissionsExt;
 
     let quoted_exe = exe.to_string_lossy().replace('\'', "'\\''");
-    let script = format!("#!/bin/sh\nMEOW_NODE_SHIM=1 exec '{quoted_exe}' \"$@\"\n");
+    let script = format!("#!/bin/sh\nif [ \"$MEOW_NO_SHIM\" = \"1\" ]; then\n  unset MEOW_NODE_SHIM\n  exec /usr/bin/env node \"$@\"\nfi\nMEOW_NODE_SHIM=1 exec '{quoted_exe}' \"$@\"\n");
     if std::fs::read_to_string(shim_path).is_ok_and(|existing| existing == script) {
         return Ok(());
     }
@@ -1284,7 +1284,7 @@ fn install_node_shim(exe: &Path, shim_path: &Path) -> Result<(), RunCommandError
     // (no file lock, instant), falling back to a batch shim if linking fails
     // (e.g. cross-volume). The batch shim delegates to the real exe at runtime.
     let quoted_exe = exe.to_string_lossy().replace('\'', "'\\''");
-    let script = format!("@echo off\r\nset MEOW_NODE_SHIM=1\r\n\"{quoted_exe}\" %*\r\n");
+    let script = format!("@echo off\r\nif \"%MEOW_NO_SHIM%\"==\"1\" (\r\n  set MEOW_NODE_SHIM=\r\n  node %*\r\n  exit /b %ERRORLEVEL%\r\n)\r\nset MEOW_NODE_SHIM=1\r\n\"{quoted_exe}\" %*\r\n");
 
     // Check if the shim is already correct (idempotent — avoid touching a
     // locked file when no change is needed).

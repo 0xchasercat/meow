@@ -240,36 +240,75 @@ fn should_inject_run(arg: &str) -> bool {
         || is_standard_script(arg)
 }
 
+const KNOWN_COMMANDS: &[&str] = &[
+    "init",
+    "run",
+    "x",
+    "execute",
+    "dev",
+    "install",
+    "i",
+    "add",
+    "remove",
+    "rm",
+    "del",
+    "delete",
+    "uninstall",
+    "task",
+    "test",
+    "check",
+    "lint",
+    "fmt",
+    "bundle",
+    "ls",
+    "why-slow",
+    "why-large",
+    "why-dep",
+    "doctor",
+    "sync",
+    "types",
+];
+
+pub(crate) fn maybe_print_command_suggestion(argv: &[OsString]) -> Option<ExitCode> {
+    let raw = argv.get(1)?.to_string_lossy();
+    if raw.starts_with('-') || is_known_command(&raw) || should_inject_run(&raw) {
+        return None;
+    }
+    let suggestion = closest_command(&raw)?;
+    hiss(&format!(
+        "Unknown command '{}'. Did you mean '{}'?",
+        raw, suggestion
+    ));
+    Some(ExitCode::FAILURE)
+}
+
+fn closest_command(input: &str) -> Option<&'static str> {
+    KNOWN_COMMANDS
+        .iter()
+        .copied()
+        .map(|command| (command, levenshtein(input, command)))
+        .filter(|(_, distance)| *distance <= 2)
+        .min_by_key(|(_, distance)| *distance)
+        .map(|(command, _)| command)
+}
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let b_chars: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b_chars.len()).collect();
+    let mut curr = vec![0; b_chars.len() + 1];
+    for (i, ca) in a.chars().enumerate() {
+        curr[0] = i + 1;
+        for (j, cb) in b_chars.iter().enumerate() {
+            let cost = usize::from(ca != *cb);
+            curr[j + 1] = (curr[j] + 1).min(prev[j + 1] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b_chars.len()]
+}
+
 fn is_known_command(arg: &str) -> bool {
-    matches!(
-        arg,
-        "init"
-            | "run"
-            | "x"
-            | "execute"
-            | "dev"
-            | "install"
-            | "i"
-            | "add"
-            | "remove"
-            | "rm"
-            | "del"
-            | "delete"
-            | "uninstall"
-            | "task"
-            | "test"
-            | "check"
-            | "lint"
-            | "fmt"
-            | "bundle"
-            | "ls"
-            | "why-slow"
-            | "why-large"
-            | "why-dep"
-            | "doctor"
-            | "sync"
-            | "types"
-    )
+    KNOWN_COMMANDS.contains(&arg)
 }
 
 fn is_deno_run_compat_flag(arg: &str) -> bool {
@@ -483,6 +522,12 @@ pub struct InstallArgs {
     pub clean: bool,
     // === /PKG-004 ===
     // === PKG-002 ===
+    /// Add package specifier(s) to devDependencies before installing.
+    #[arg(short = 'D', long = "dev")]
+    pub dev: bool,
+    /// Write a lightweight package-lock.json compatibility marker for framework detectors.
+    #[arg(long = "compat-lockfile")]
+    pub compat_lockfile: bool,
     /// Optional package specifier(s) to add before installing, e.g. `lodash` or `p-limit@^5`.
     #[arg(value_name = "PKG")]
     pub packages: Vec<String>,
@@ -512,6 +557,9 @@ pub struct PkgArgs {
     /// Package specifier(s), e.g. `lodash@^4`.
     #[arg(required = true)]
     pub packages: Vec<String>,
+    /// Add packages to devDependencies instead of dependencies.
+    #[arg(short = 'D', long = "dev")]
+    pub dev: bool,
     /// Install or remove globally (writes/removes shim in ~/.meow/bin).
     #[arg(short = 'g', long)]
     pub global: bool,
@@ -631,16 +679,21 @@ impl Cli {
 }
 
 // === LOAD-001 ===
-/// Walk UP from `start` to the nearest directory holding a `meow.lock.jsonl` or
-/// `package.json` and return it; fall back to `start` when neither exists (a
-/// local-only run). Host-pure: it inspects only the given path, reads no env
-/// (`$HOME` stays in `host/`, I-6).
+/// Walk UP from `start` to the nearest independent project boundary. A meow
+/// lockfile wins, but a non-dependency `package.json` is also a boundary: nested
+/// package directories must not leak into an unrelated parent package.json.
+/// Host-pure: it inspects only the given path, reads no env (`$HOME` stays in
+/// `host/`, I-6).
 pub(crate) fn find_project_root(start: &Path) -> PathBuf {
     let mut dir = start;
     loop {
-        if dir.join("meow.lock.jsonl").is_file()
-            || (dir.join("package.json").is_file() && !is_inside_node_modules(dir))
-        {
+        if dir.join("meow.lock.jsonl").is_file() {
+            return dir.to_path_buf();
+        }
+        if dir.join("package.json").is_file() && !is_inside_node_modules(dir) {
+            return dir.to_path_buf();
+        }
+        if dir.join(".git").exists() {
             return dir.to_path_buf();
         }
         match dir.parent() {
@@ -920,6 +973,32 @@ mod tests {
     }
 
     #[test]
+    fn install_dev_flag_parses() {
+        let cli = Cli::try_parse_from(["meow", "install", "-D", "typescript"]).expect("parse cli");
+        let Some(Command::Install(args)) = cli.command else {
+            panic!("expected install command");
+        };
+        assert!(args.dev);
+        assert_eq!(args.packages, vec!["typescript".to_string()]);
+    }
+
+    #[test]
+    fn add_dev_flag_parses() {
+        let cli = Cli::try_parse_from(["meow", "add", "-D", "vitest"]).expect("parse cli");
+        let Some(Command::Add(args)) = cli.command else {
+            panic!("expected add command");
+        };
+        assert!(args.dev);
+        assert_eq!(args.packages, vec!["vitest".to_string()]);
+    }
+
+    #[test]
+    fn command_typo_suggests_nearest_command() {
+        let argv = vec![OsString::from("meow"), OsString::from("installc")];
+        assert_eq!(maybe_print_command_suggestion(&argv), Some(ExitCode::FAILURE));
+    }
+
+    #[test]
     fn install_materialize_flag_parses_as_default_projection() {
         let cli = Cli::try_parse_from(["meow", "install", "--materialize"]).expect("parse cli");
         let Some(Command::Install(args)) = cli.command else {
@@ -1110,6 +1189,39 @@ mod tests {
         std::fs::create_dir_all(&dep).expect("dependency dirs");
         std::fs::write(dep.join("package.json"), "{}").expect("dependency package.json");
         let found = find_project_root(&dep);
+        assert_eq!(
+            std::fs::canonicalize(&found).expect("canon found"),
+            std::fs::canonicalize(&root).expect("canon root"),
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn find_project_root_stops_at_nearest_nested_package() {
+        let outer = unit_tmp("outer-package");
+        std::fs::write(outer.join("package.json"), r#"{"dependencies":{"patchright":"^1"}}"#)
+            .expect("write outer package.json");
+        let inner = outer.join("examples").join("fluffybench");
+        std::fs::create_dir_all(&inner).expect("inner dirs");
+        std::fs::write(inner.join("package.json"), r#"{"private":true}"#)
+            .expect("write inner package.json");
+        let nested = inner.join("src");
+        std::fs::create_dir_all(&nested).expect("nested dirs");
+        let found = find_project_root(&nested);
+        assert_eq!(
+            std::fs::canonicalize(&found).expect("canon found"),
+            std::fs::canonicalize(&inner).expect("canon inner"),
+        );
+        std::fs::remove_dir_all(&outer).ok();
+    }
+
+    #[test]
+    fn find_project_root_stops_at_git_boundary_without_package_json() {
+        let root = unit_tmp("git-boundary");
+        std::fs::create_dir_all(root.join(".git")).expect("git dir");
+        let nested = root.join("src").join("inner");
+        std::fs::create_dir_all(&nested).expect("nested dirs");
+        let found = find_project_root(&nested);
         assert_eq!(
             std::fs::canonicalize(&found).expect("canon found"),
             std::fs::canonicalize(&root).expect("canon root"),

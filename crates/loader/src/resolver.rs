@@ -1390,6 +1390,9 @@ fn finalize_local_path(path: &Path) -> Option<PathBuf> {
     if path.is_file() {
         return Some(path.to_path_buf());
     }
+    if let Some(candidate) = typescript_source_fallback(path) {
+        return Some(candidate);
+    }
     for suffix in EXTENSIONS {
         let candidate = append_path_suffix(path, suffix);
         if candidate.is_file() {
@@ -1397,6 +1400,23 @@ fn finalize_local_path(path: &Path) -> Option<PathBuf> {
         }
     }
     local_directory_index(path)
+}
+
+fn typescript_source_fallback(path: &Path) -> Option<PathBuf> {
+    let requested_ext = path.extension().and_then(|ext| ext.to_str())?;
+    let fallbacks: &[&str] = match requested_ext {
+        "js" => &["ts", "tsx", "mts"],
+        "mjs" => &["mts", "ts", "tsx"],
+        "cjs" => &["cts", "ts", "tsx"],
+        _ => return None,
+    };
+    for ext in fallbacks {
+        let candidate = path.with_extension(ext);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn local_directory_index(path: &Path) -> Option<PathBuf> {
@@ -1708,6 +1728,23 @@ mod tests {
         assert_eq!(
             url.as_str(),
             Url::from_file_path(dir.join("a.js")).unwrap().as_str()
+        );
+        assert!(matches!(locator, ModuleLocator::LocalFile(_)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolves_typescript_source_for_javascript_esm_specifier() {
+        let dir = unique_dir("ts-js-fallback");
+        std::fs::write(dir.join("benchmarks.ts"), "export const ok = true;\n").expect("write module");
+        let resolver = resolver(&dir);
+        let referrer = Url::from_file_path(dir.join("index.ts")).expect("referrer URL");
+        let (url, locator) = resolver
+            .locate("./benchmarks.js", &referrer)
+            .expect("js specifier resolves to ts source");
+        assert_eq!(
+            url.as_str(),
+            Url::from_file_path(dir.join("benchmarks.ts")).unwrap().as_str()
         );
         assert!(matches!(locator, ModuleLocator::LocalFile(_)));
         std::fs::remove_dir_all(&dir).ok();

@@ -63,6 +63,9 @@ globalThis.console = {
   debug(...args) {
     op_meow_print(`${format(args)}\n`, false);
   },
+  clear() {
+    op_meow_print("\x1Bc", false);
+  },
   assert(condition, ...args) {
     if (condition) return;
     if (args.length === 0) {

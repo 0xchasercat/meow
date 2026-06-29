@@ -413,6 +413,8 @@ fn default_install_args() -> InstallArgs {
         vendor: false,
         vendor_dir: PathBuf::from("vendor"),
         clean: false,
+        dev: false,
+        compat_lockfile: false,
         packages: Vec::new(),
     }
 }
@@ -442,12 +444,17 @@ pub fn cmd_add(args: &PkgArgs) -> ExitCode {
     let outcome: Result<Vec<(meow_pkg::PackageName, meow_pkg::VersionReq)>, String> = runtime
         .block_on(async {
             let registry = NpmRegistry::npm()?;
+            let dependency_section = if args.dev {
+                meow_config::DependencySection::DevDependencies
+            } else {
+                meow_config::DependencySection::Dependencies
+            };
             let mut resolved = Vec::with_capacity(args.packages.len());
             for package in &args.packages {
                 let (name, req) = requested_dependency(&registry, package)
                     .await
                     .map_err(|err| err.to_string())?;
-                meow_config::add_dependency(&root, name.clone(), req.clone())
+                meow_config::add_dependency_to(&root, name.clone(), req.clone(), dependency_section)
                     .map_err(|err| err.to_string())?;
                 resolved.push((name, req));
             }
@@ -627,11 +634,17 @@ pub fn cmd_install(args: &InstallArgs) -> ExitCode {
         let t0 = std::time::Instant::now();
         let registry = NpmRegistry::lazy()?;
         // === CFG-003 ===
+        let dependency_section = if args.dev {
+            meow_config::DependencySection::DevDependencies
+        } else {
+            meow_config::DependencySection::Dependencies
+        };
         for package in &args.packages {
             let (name, req) = requested_dependency(&registry, package)
                 .await
                 .map_err(|err| err.to_string())?;
-            meow_config::add_dependency(&root, name, req).map_err(|err| err.to_string())?;
+            meow_config::add_dependency_to(&root, name, req, dependency_section)
+                .map_err(|err| err.to_string())?;
         }
         let package_json = load_install_package_json(&root)?;
         let direct_deps = package_json
@@ -707,6 +720,9 @@ pub fn cmd_install(args: &InstallArgs) -> ExitCode {
         lockfile
             .write_canonical(&lock_path)
             .map_err(|err| err.to_string())?;
+        if args.compat_lockfile {
+            write_compat_package_lockfile(&root).map_err(|err| err.to_string())?;
+        }
         if trace {
             eprintln!(
                 "[trace] lockfile write: {}ms",
@@ -798,6 +814,31 @@ pub fn cmd_install(args: &InstallArgs) -> ExitCode {
 }
 
 // === CFG-003 ===
+fn write_compat_package_lockfile(root: &Path) -> std::io::Result<()> {
+    let path = root.join("package-lock.json");
+    if path.exists() {
+        return Ok(());
+    }
+    let package_name = meow_config::PackageJson::read(root)
+        .ok()
+        .and_then(|package_json| package_json.name)
+        .unwrap_or_else(|| "meow-project".to_owned());
+    let body = serde_json::json!({
+        "name": package_name,
+        "lockfileVersion": 3,
+        "requires": true,
+        "packages": {
+            "": {
+                "name": package_name
+            }
+        },
+        "meowCompatibilityLockfile": true
+    });
+    let mut contents = serde_json::to_string_pretty(&body)?;
+    contents.push('\n');
+    std::fs::write(path, contents)
+}
+
 pub(super) fn load_install_package_json(root: &Path) -> Result<meow_config::PackageJson, String> {
     match meow_config::PackageJson::read(root) {
         Ok(package_json) => Ok(package_json),

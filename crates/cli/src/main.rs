@@ -8,6 +8,10 @@ include!(concat!(env!("OUT_DIR"), "/snapshot_data.rs"));
 
 fn main() -> std::process::ExitCode {
     cli::mark_start();
-    let argv = cli::normalize_argv(std::env::args_os().collect());
+    let raw_argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if let Some(exit) = cli::maybe_print_command_suggestion(&raw_argv) {
+        return exit;
+    }
+    let argv = cli::normalize_argv(raw_argv);
     <cli::Cli as clap::Parser>::parse_from(argv).run()
 }

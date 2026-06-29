@@ -65,6 +65,11 @@ impl ProcessExitCode {
 /// The ONLY host I/O op in the base runtime extension. Synchronous, infallible-by-
 /// contract write that honors a [`PrintSink`] override when present, else writes
 /// to stdout/stderr.
+fn is_internal_process_exit_payload(msg: &str) -> bool {
+    let trimmed = msg.trim();
+    trimmed.starts_with(r#"{"__meowProcessExit":true,"#) && trimmed.ends_with('}')
+}
+
 #[op2(fast)]
 fn op_meow_print(
     state: &mut OpState,
@@ -75,6 +80,9 @@ fn op_meow_print(
 }
 
 pub(crate) fn write_output(state: &mut OpState, msg: &str, is_err: bool) -> Result<(), io::Error> {
+    if is_internal_process_exit_payload(msg) {
+        return Ok(());
+    }
     if let Some(sink) = state.try_borrow::<PrintSink>() {
         (sink.0)(msg, is_err);
         return Ok(());
