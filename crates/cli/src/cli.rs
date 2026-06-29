@@ -995,7 +995,10 @@ mod tests {
     #[test]
     fn command_typo_suggests_nearest_command() {
         let argv = vec![OsString::from("meow"), OsString::from("installc")];
-        assert_eq!(maybe_print_command_suggestion(&argv), Some(ExitCode::FAILURE));
+        assert_eq!(
+            maybe_print_command_suggestion(&argv),
+            Some(ExitCode::FAILURE)
+        );
     }
 
     #[test]
@@ -1199,8 +1202,11 @@ mod tests {
     #[test]
     fn find_project_root_stops_at_nearest_nested_package() {
         let outer = unit_tmp("outer-package");
-        std::fs::write(outer.join("package.json"), r#"{"dependencies":{"patchright":"^1"}}"#)
-            .expect("write outer package.json");
+        std::fs::write(
+            outer.join("package.json"),
+            r#"{"dependencies":{"patchright":"^1"}}"#,
+        )
+        .expect("write outer package.json");
         let inner = outer.join("examples").join("fluffybench");
         std::fs::create_dir_all(&inner).expect("inner dirs");
         std::fs::write(inner.join("package.json"), r#"{"private":true}"#)

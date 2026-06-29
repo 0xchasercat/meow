@@ -61,12 +61,9 @@ pub fn remove_dependency(root: &Path, name: &PackageName) -> Result<PackageJson,
     let (path, mut value) = read_package_json_document(root, false)?;
     let root_object = root_object_mut(&path, &mut value)?;
     let remove_field = {
-        let Some(deps) = dependencies_object_mut(
-            &path,
-            root_object,
-            DependencySection::Dependencies,
-            false,
-        )? else {
+        let Some(deps) =
+            dependencies_object_mut(&path, root_object, DependencySection::Dependencies, false)?
+        else {
             return parse_package_json_value(&path, &value);
         };
 

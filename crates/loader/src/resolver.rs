@@ -1736,7 +1736,8 @@ mod tests {
     #[test]
     fn resolves_typescript_source_for_javascript_esm_specifier() {
         let dir = unique_dir("ts-js-fallback");
-        std::fs::write(dir.join("benchmarks.ts"), "export const ok = true;\n").expect("write module");
+        std::fs::write(dir.join("benchmarks.ts"), "export const ok = true;\n")
+            .expect("write module");
         let resolver = resolver(&dir);
         let referrer = Url::from_file_path(dir.join("index.ts")).expect("referrer URL");
         let (url, locator) = resolver
@@ -1744,7 +1745,9 @@ mod tests {
             .expect("js specifier resolves to ts source");
         assert_eq!(
             url.as_str(),
-            Url::from_file_path(dir.join("benchmarks.ts")).unwrap().as_str()
+            Url::from_file_path(dir.join("benchmarks.ts"))
+                .unwrap()
+                .as_str()
         );
         assert!(matches!(locator, ModuleLocator::LocalFile(_)));
         std::fs::remove_dir_all(&dir).ok();

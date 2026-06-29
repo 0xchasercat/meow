@@ -454,8 +454,13 @@ pub fn cmd_add(args: &PkgArgs) -> ExitCode {
                 let (name, req) = requested_dependency(&registry, package)
                     .await
                     .map_err(|err| err.to_string())?;
-                meow_config::add_dependency_to(&root, name.clone(), req.clone(), dependency_section)
-                    .map_err(|err| err.to_string())?;
+                meow_config::add_dependency_to(
+                    &root,
+                    name.clone(),
+                    req.clone(),
+                    dependency_section,
+                )
+                .map_err(|err| err.to_string())?;
                 resolved.push((name, req));
             }
             Ok(resolved)
