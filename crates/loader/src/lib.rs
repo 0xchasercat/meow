@@ -278,13 +278,26 @@ fn cjs_facade_source(
 ) -> ModuleSource {
     let path_js =
         serde_json::to_string(require_path).expect("serializing require path as JS string");
-    let mut code =
-        String::from("import { createRequire as __meowCreateRequire } from \"node:module\";\n");
+    // When this facade is the entry point (require.main is not yet set), load
+    // the CJS module via Module._load(path, null, true) so Node's module system
+    // sets mainModule BEFORE the module code runs. This makes
+    // `module === require.main` true inside the CJS module — required by
+    // launcher scripts (wrangler, jest, etc.) that guard on that check.
+    // For non-entry CJS imports, fall back to regular require().
+    let mut code = String::from(
+        "import { Module, createRequire as __meowCreateRequire } from \"node:module\";\n",
+    );
     code.push_str("const __meowRequire = __meowCreateRequire(");
     code.push_str(&path_js);
-    code.push_str(");\nconst __meowCjsExports = __meowRequire(");
+    code.push_str(");\n");
+    code.push_str("const __meowCjsExports = (!__meowRequire.main)\n");
+    code.push_str("  ? Module._load(");
     code.push_str(&path_js);
-    code.push_str(");\nexport default __meowCjsExports;\n");
+    code.push_str(", null, true)\n");
+    code.push_str("  : __meowRequire(");
+    code.push_str(&path_js);
+    code.push_str(");\n");
+    code.push_str("export default __meowCjsExports;\n");
     for name in named_exports {
         let key = serde_json::to_string(name).expect("serializing export name as JS string");
         code.push_str("export const ");

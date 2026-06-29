@@ -247,7 +247,8 @@ fn should_inject_run(arg: &str) -> bool {
 fn is_known_command(arg: &str) -> bool {
     matches!(
         arg,
-        "run"
+        "init"
+            | "run"
             | "x"
             | "execute"
             | "dev"
@@ -281,6 +282,8 @@ fn is_deno_run_compat_flag(arg: &str) -> bool {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Initialize a new meow project in the current directory.
+    Init(InitArgs),
     /// Execute a file or a package.json script (default mode = node-compat; `strict-web` is opt-in).
     Run(RunArgs),
     /// Ephemeral package execution (npx/bunx equivalent): installs the named package
@@ -332,6 +335,19 @@ pub enum Command {
 }
 
 #[derive(Debug, Args)]
+pub struct InitArgs {
+    /// Project mode: strict-web (deterministic, no host access) or node-compat (full Node.js compat).
+    #[arg(long, value_parser = ["strict-web", "node-compat"], default_value = "strict-web")]
+    pub mode: String,
+    /// Overwrite existing files if they already exist.
+    #[arg(long)]
+    pub force: bool,
+    /// Skip installing dependencies after creating config files.
+    #[arg(long)]
+    pub no_install: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct NodeEvalArgs {
     /// Node eval flag used by the shim.
     #[arg(allow_hyphen_values = true, value_parser = ["-e", "--eval", "-p", "--print", "--interactive"])]
@@ -344,6 +360,7 @@ pub struct NodeEvalArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(disable_version_flag = true)]
 pub struct RunArgs {
     /// Script name or entry module to execute.
     pub target: String,
@@ -380,6 +397,7 @@ pub struct RunArgs {
 
 // === RUN-001 ===
 #[derive(Debug, Args)]
+#[command(disable_version_flag = true)]
 pub struct RunScriptArgs {
     /// Arguments after `--`, to forward to the script.
     #[arg(last = true)]
@@ -500,6 +518,7 @@ fn cmd_ls() -> ExitCode {
 /// Flags come BEFORE the package name; everything after the package is treated
 /// as trailing arguments (no `--` separator required).
 #[derive(Debug, Args)]
+#[command(disable_version_flag = true)]
 pub struct XArgs {
     // === RT-006 ===
     /// Expose the real system clock + monotonic time.
@@ -679,6 +698,7 @@ impl Cli {
             Command::Lint(args) => cmd_lint(&args),
             // === /TOOL-003 ===
             // === RT-001 ===
+            Command::Init(args) => cmd_init(&args),
             Command::Run(args) => cmd_run(&args),
             Command::NodeEval(args) => cmd_node_eval(args),
             // === OBS-001 ===
@@ -3293,11 +3313,37 @@ fn install_node_shim(exe: &Path, shim_path: &Path) -> Result<(), RunCommandError
 
 #[cfg(windows)]
 fn install_node_shim(exe: &Path, shim_path: &Path) -> Result<(), RunCommandError> {
-    std::fs::copy(exe, shim_path).map(|_| ()).map_err(|source| {
+    // On Windows, copying the running executable fails with "file in use"
+    // (os error 32) when meow is the active process. Use a hard link first
+    // (no file lock, instant), falling back to a batch shim if linking fails
+    // (e.g. cross-volume). The batch shim delegates to the real exe at runtime.
+    let quoted_exe = exe.to_string_lossy().replace('\'', "'\\''");
+    let script = format!("@echo off\r\nset MEOW_NODE_SHIM=1\r\n\"{quoted_exe}\" %*\r\n");
+
+    // Check if the shim is already correct (idempotent — avoid touching a
+    // locked file when no change is needed).
+    if std::fs::read_to_string(shim_path).is_ok_and(|existing| existing == script) {
+        return Ok(());
+    }
+
+    // Remove any existing shim first.
+    match std::fs::remove_file(shim_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(RunCommandError::Message(format!(
+                "cannot replace node shim {}: {source}",
+                shim_path.display()
+            )));
+        }
+    }
+
+    // Write the batch shim. This avoids the file-lock problem of copying the
+    // running executable, and works across volumes.
+    std::fs::write(shim_path, script).map_err(|source| {
         RunCommandError::Message(format!(
-            "cannot install node shim {} from {}: {source}",
-            shim_path.display(),
-            exe.display()
+            "cannot write node shim {}: {source}",
+            shim_path.display()
         ))
     })
 }
@@ -4545,7 +4591,7 @@ fn cmd_x(args: &XArgs) -> ExitCode {
         spec,
         main_module: Some(bin_path.to_string_lossy().into_owned()),
         argv1: Some(bin_path.to_string_lossy().into_owned()),
-        argv: args.argv.clone(),
+        argv: package_argv.clone(),
     };
     let flags = RunFlagView {
         argv: &package_argv,
@@ -4603,6 +4649,136 @@ async fn resolve_dependency_req(
         None => dist_tag_requirement(registry, name, "latest").await,
     }
 }
+
+// === INIT-001 ===
+/// `meow init` — scaffold a new meow project in the current directory.
+fn cmd_init(args: &InitArgs) -> ExitCode {
+    let root = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            hiss(&format!(
+                "meow init: cannot resolve the current directory: {err}"
+            ));
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let config_path = root.join("meow.config.json");
+    let package_path = root.join("package.json");
+
+    // Guard: refuse to overwrite unless --force.
+    if !args.force {
+        if config_path.exists() {
+            hiss("meow init: meow.config.json already exists (use --force to overwrite)");
+            return ExitCode::FAILURE;
+        }
+        if package_path.exists() {
+            hiss("meow init: package.json already exists (use --force to overwrite)");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    // Write meow.config.json.
+    let config_content = match args.mode.as_str() {
+        "strict-web" => {
+            r#"{ "mode": "strict-web" }
+"#
+        }
+        "node-compat" => {
+            r#"{ "mode": "node-compat" }
+"#
+        }
+        _ => {
+            hiss(&format!(
+                "meow init: unknown mode '{}', expected strict-web or node-compat",
+                args.mode
+            ));
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(err) = std::fs::write(&config_path, config_content) {
+        hiss(&format!("meow init: cannot write meow.config.json: {err}"));
+        return ExitCode::FAILURE;
+    }
+
+    // Write a minimal package.json if none exists.
+    if !package_path.exists() || args.force {
+        let dir_name = root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "my-project".to_owned());
+        let pkg_content = format!(
+            r#"{{
+  "name": "{}",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {{
+    "dev": "node index.js"
+  }}
+}}
+"#,
+            dir_name
+        );
+        if let Err(err) = std::fs::write(&package_path, pkg_content) {
+            hiss(&format!("meow init: cannot write package.json: {err}"));
+            return ExitCode::FAILURE;
+        }
+    }
+
+    // Run `meow sync` to generate shadow configs.
+    let sync_status = std::process::Command::new(
+        std::env::current_exe().unwrap_or_else(|_| PathBuf::from("meow")),
+    )
+    .arg("sync")
+    .current_dir(&root)
+    .status();
+    match sync_status {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            hiss(&format!(
+                "meow init: meow sync exited with {}",
+                status.code().unwrap_or(1)
+            ));
+            return ExitCode::FAILURE;
+        }
+        Err(err) => {
+            hiss(&format!("meow init: cannot run meow sync: {err}"));
+            return ExitCode::FAILURE;
+        }
+    }
+
+    // Optionally run `meow install`.
+    if !args.no_install {
+        let install_status = std::process::Command::new(
+            std::env::current_exe().unwrap_or_else(|_| PathBuf::from("meow")),
+        )
+        .arg("install")
+        .current_dir(&root)
+        .status();
+        match install_status {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                hiss(&format!(
+                    "meow init: meow install exited with {}",
+                    status.code().unwrap_or(1)
+                ));
+                return ExitCode::FAILURE;
+            }
+            Err(err) => {
+                hiss(&format!("meow init: cannot run meow install: {err}"));
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    purr(&format!(
+        "meow init: created meow.config.json ({}) and package.json in {}",
+        args.mode,
+        root.display()
+    ));
+    ExitCode::SUCCESS
+}
+// === /INIT-001 ===
 
 /// `meow doctor` — environment, config, and lockfile health as a panel.
 fn cmd_doctor() -> ExitCode {

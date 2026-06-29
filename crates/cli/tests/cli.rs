@@ -633,14 +633,8 @@ console.log(`ARGV=${JSON.stringify(process.argv.slice(2))}`);"#,
     )
     .expect("write dev script");
 
-    let proj_display = std::fs::canonicalize(&proj)
-        .expect("canon project")
-        .to_string_lossy()
-        .into_owned();
-    let nested_display = std::fs::canonicalize(&nested)
-        .expect("canon nested")
-        .to_string_lossy()
-        .into_owned();
+    let proj_display = proj.to_string_lossy().into_owned();
+    let nested_display = nested.to_string_lossy().into_owned();
     meow()
         .current_dir(&nested)
         .arg("run")
@@ -1419,3 +1413,79 @@ fn why_dep_json_is_machine_readable() {
     std::fs::remove_dir_all(&proj).ok();
 }
 // === /OBS-001 ===
+
+// === INIT-001 ===
+#[test]
+fn init_creates_config_and_package_json() {
+    let proj = load_tmp("init-ok");
+    let _ = std::fs::remove_dir_all(&proj);
+    std::fs::create_dir_all(&proj).expect("create project dir");
+
+    meow()
+        .current_dir(&proj)
+        .arg("init")
+        .arg("--no-install")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("meow init: created"));
+
+    assert!(
+        proj.join("meow.config.json").is_file(),
+        "config should exist"
+    );
+    assert!(
+        proj.join("package.json").is_file(),
+        "package.json should exist"
+    );
+    assert!(proj.join(".meow").is_dir(), ".meow dir should exist");
+
+    let config = std::fs::read_to_string(proj.join("meow.config.json")).expect("read config");
+    assert!(
+        config.contains("strict-web"),
+        "default mode should be strict-web"
+    );
+
+    let pkg = std::fs::read_to_string(proj.join("package.json")).expect("read package");
+    assert!(pkg.contains("0.0.0"), "default version should be 0.0.0");
+
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[test]
+fn init_node_compat_mode() {
+    let proj = load_tmp("init-node-compat");
+    let _ = std::fs::remove_dir_all(&proj);
+    std::fs::create_dir_all(&proj).expect("create project dir");
+
+    meow()
+        .current_dir(&proj)
+        .arg("init")
+        .arg("--mode")
+        .arg("node-compat")
+        .arg("--no-install")
+        .assert()
+        .success();
+
+    let config = std::fs::read_to_string(proj.join("meow.config.json")).expect("read config");
+    assert!(config.contains("node-compat"), "mode should be node-compat");
+
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[test]
+fn init_refuses_to_overwrite_without_force() {
+    let proj = load_tmp("init-no-overwrite");
+    let _ = std::fs::remove_dir_all(&proj);
+    std::fs::create_dir_all(&proj).expect("create project dir");
+    std::fs::write(proj.join("meow.config.json"), "{}").expect("seed config");
+
+    meow()
+        .current_dir(&proj)
+        .arg("init")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("already exists"));
+
+    std::fs::remove_dir_all(&proj).ok();
+}
+// === /INIT-001 ===

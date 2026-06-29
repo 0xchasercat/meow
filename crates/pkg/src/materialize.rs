@@ -1444,7 +1444,13 @@ fn set_fixed_times(path: &Path) -> Result<(), MaterializeError> {
     #[cfg(not(unix))]
     {
         let fixed = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
-        let file = fs::File::open(path).map_err(|source| MaterializeError::io(path, source))?;
+        // Open with write access so set_times works on all Windows versions.
+        // A read-only handle can fail with access-denied on some configurations.
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .or_else(|_| fs::File::open(path))
+            .map_err(|source| MaterializeError::io(path, source))?;
         file.set_times(fs::FileTimes::new().set_accessed(fixed).set_modified(fixed))
             .map_err(|source| MaterializeError::io(path, source))?;
     }
