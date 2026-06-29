@@ -43,9 +43,9 @@ fn transform_typescript_with_oxc(
         })
         .parse();
 
-    if parsed.panicked || !parsed.errors.is_empty() {
+    if parsed.panicked || !parsed.diagnostics.is_empty() {
         let message = parsed
-            .errors
+            .diagnostics
             .into_iter()
             .map(|error| format!("{:?}", error.with_source_code(source_text.to_owned())))
             .collect::<Vec<_>>()
@@ -60,9 +60,9 @@ fn transform_typescript_with_oxc(
         .with_excess_capacity(2.0)
         .with_enum_eval(true)
         .build(&program);
-    if !semantic.errors.is_empty() {
+    if !semantic.diagnostics.is_empty() {
         let message = semantic
-            .errors
+            .diagnostics
             .into_iter()
             .map(|error| format!("{:?}", error.with_source_code(source_text.to_owned())))
             .collect::<Vec<_>>()
@@ -81,9 +81,9 @@ fn transform_typescript_with_oxc(
     };
     let transformed = Transformer::new(&allocator, &source_path, &transform_options)
         .build_with_scoping(semantic.semantic.into_scoping(), &mut program);
-    if !transformed.errors.is_empty() {
+    if !transformed.diagnostics.is_empty() {
         let message = transformed
-            .errors
+            .diagnostics
             .into_iter()
             .map(|error| format!("{:?}", error.with_source_code(source_text.to_owned())))
             .collect::<Vec<_>>()
