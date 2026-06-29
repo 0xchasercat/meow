@@ -94,6 +94,34 @@ impl Cache {
         Ok(hash)
     }
 
+    /// Hash `bytes` with sha512, write the blob atomically, and return its [`ContentHash`].
+    /// Used when the registry provides sha512 integrity, so the cache key
+    /// matches the lockfile integrity.
+    pub fn store_sha512(&self, bytes: &[u8]) -> Result<ContentHash, CacheError> {
+        let hash = ContentHash::of_sha512(bytes);
+        let dest = self.path_for(&hash);
+        if let Ok(existing) = fs::read(&dest) {
+            if ContentHash::of_sha512(&existing) == hash {
+                return Ok(hash);
+            }
+        }
+        let dir = dest.parent().unwrap_or(&self.root);
+        fs::create_dir_all(dir).map_err(|source| CacheError::Io {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+        let tmp = tmp_path(&dest);
+        fs::write(&tmp, bytes).map_err(|source| CacheError::Io {
+            path: tmp.clone(),
+            source,
+        })?;
+        fs::rename(&tmp, &dest).map_err(|source| CacheError::Io {
+            path: dest.clone(),
+            source,
+        })?;
+        Ok(hash)
+    }
+
     /// Read the blob for `hash`, RECOMPUTE its hash, and compare before
     /// returning (I-7).
     ///
@@ -110,7 +138,10 @@ impl Cache {
             Err(source) => return Err(CacheError::Io { path, source }),
         };
 
-        let got = ContentHash::of(&bytes);
+        let got = match hash.algo() {
+            crate::HashAlgo::Sha256 => ContentHash::of(&bytes),
+            crate::HashAlgo::Sha512 => ContentHash::of_sha512(&bytes),
+        };
         if &got != hash {
             return Err(CacheError::IntegrityMismatch {
                 expected: hash.to_sri(),

@@ -189,8 +189,20 @@ fn normalize_node_argv(argv: Vec<OsString>) -> Vec<OsString> {
 /// Standard npm/package.json script names — the omni-router maps bare script
 /// requests to `meow run <script>` without requiring explicit `run`.
 const STANDARD_SCRIPTS: &[&str] = &[
-    "build", "start", "dev", "lint", "fmt", "test", "preview", "serve",
-    "deploy", "release", "clean", "compile", "watch", "storybook",
+    "build",
+    "start",
+    "dev",
+    "lint",
+    "fmt",
+    "test",
+    "preview",
+    "serve",
+    "deploy",
+    "release",
+    "clean",
+    "compile",
+    "watch",
+    "storybook",
 ];
 
 fn is_standard_script(arg: &str) -> bool {
@@ -207,7 +219,9 @@ fn invoked_as_meowx(argv0: Option<&OsString>) -> bool {
     Path::new(argv0)
         .file_name()
         .and_then(OsStr::to_str)
-        .is_some_and(|name| name == "meowx" || name == "meowx.exe" || name == "mwx" || name == "mwx.exe")
+        .is_some_and(|name| {
+            name == "meowx" || name == "meowx.exe" || name == "mwx" || name == "mwx.exe"
+        })
 }
 
 fn should_inject_run(arg: &str) -> bool {
@@ -450,10 +464,7 @@ fn cmd_ls() -> ExitCode {
             let port_str = &name[colon + 1..];
             if let Ok(port) = port_str.parse::<u16>() {
                 if known_ports.contains_key(&port) {
-                    let label = known_ports
-                        .get(&port)
-                        .copied()
-                        .unwrap_or(command);
+                    let label = known_ports.get(&port).copied().unwrap_or(command);
                     rows.push((pid, label.to_string(), port));
                 }
             }
@@ -472,13 +483,7 @@ fn cmd_ls() -> ExitCode {
     let headers = &["PID", "SERVICE", "PORT"];
     let data: Vec<Vec<String>> = rows
         .iter()
-        .map(|(pid, cmd, port)| {
-            vec![
-                pid.to_string(),
-                cmd.clone(),
-                port.to_string(),
-            ]
-        })
+        .map(|(pid, cmd, port)| vec![pid.to_string(), cmd.clone(), port.to_string()])
         .collect();
     let aligns = &[
         meow_ui::table::Align::Right,
@@ -890,10 +895,7 @@ fn cmd_bundle(args: &BundleArgs) -> ExitCode {
         }
     };
 
-    let out_dir = plan
-        .out
-        .clone()
-        .unwrap_or_else(|| root.join("dist"));
+    let out_dir = plan.out.clone().unwrap_or_else(|| root.join("dist"));
 
     // Build a resolver from the project context
     let async_rt = match tokio::runtime::Builder::new_current_thread()
@@ -1149,30 +1151,78 @@ async fn sleep_before_retry(attempt: usize) {
 
 /// Production npm registry client. Lives at the CLI edge so `meow-pkg` stays
 /// network-free; all registry I/O is explicit here.
+///
+/// The reqwest client is built lazily on first use — a fully cache-hit install
+/// (warm/hot) never pays the rustls/aws-lc init cost (~10-15ms).
 #[derive(Clone)]
 struct NpmRegistry {
     base: String,
-    client: reqwest::Client,
+    client: Arc<OnceLock<reqwest::Client>>,
     /// Tarball download concurrency limit (bandwidth-sensitive).
     limiter: Arc<tokio::sync::Semaphore>,
     /// Metadata fetch concurrency limit (JSON docs — small and fast, so much higher).
     metadata_limiter: Arc<tokio::sync::Semaphore>,
+    /// On-disk metadata cache root: `~/.meow/cache/metadata/`.
+    /// Stores raw npm registry JSON responses keyed by package name.
+    /// This is a performance hint — tarball SHA-512 is always verified,
+    /// so stale/forged metadata cannot compromise security (worst case:
+    /// a stale version list causes a tarball cache miss → network fetch).
+    metadata_cache_dir: PathBuf,
 }
 
 impl NpmRegistry {
+    /// Construct without initializing the HTTP client — the reqwest/rustls
+    /// stack is deferred to the first actual network call.
+    fn lazy() -> Result<NpmRegistry, String> {
+        let home = crate::host::host_home();
+        let metadata_cache_dir = home.join(".meow").join("cache").join("metadata");
+        Ok(NpmRegistry {
+            base: NPM_REGISTRY_URL.to_owned(),
+            client: Arc::new(OnceLock::new()),
+            limiter: Arc::new(tokio::sync::Semaphore::new(NPM_HTTP_CONCURRENCY)),
+            metadata_limiter: Arc::new(tokio::sync::Semaphore::new(256)),
+            metadata_cache_dir,
+        })
+    }
+
+    /// Eagerly construct with the HTTP client built now (used by `meow add`
+    /// which always needs the registry).
     fn npm() -> Result<NpmRegistry, String> {
+        let reg = Self::lazy()?;
+        let _ = reg.client();
+        Ok(reg)
+    }
+
+    fn metadata_cache_path(&self, name: &meow_pkg::PackageName) -> PathBuf {
+        // Escape `/` in scoped package names for flat-file storage.
+        let escaped = name.as_str().replace('/', "+");
+        self.metadata_cache_dir.join(format!("{escaped}.json"))
+    }
+
+    /// Compact metadata cache: stores only the fields the resolver needs,
+    /// not the full npm document. A package like zod has ~1MB of raw JSON
+    /// but only ~50KB of useful resolution data (versions + deps + tarball URLs).
+    fn metadata_cache_compact_path(&self, name: &meow_pkg::PackageName) -> PathBuf {
+        let escaped = name.as_str().replace('/', "+");
+        self.metadata_cache_dir
+            .join(format!("{escaped}.compact.json"))
+    }
+
+    fn client(&self) -> Result<&reqwest::Client, meow_pkg::RegistryError> {
+        if let Some(client) = self.client.get() {
+            return Ok(client);
+        }
         let client = reqwest::Client::builder()
             .user_agent(concat!("meow/", env!("CARGO_PKG_VERSION")))
             .http2_adaptive_window(true)
             .pool_max_idle_per_host(NPM_HTTP_CONCURRENCY)
             .build()
-            .map_err(|err| format!("cannot initialize npm HTTP client: {err}"))?;
-        Ok(NpmRegistry {
-            base: NPM_REGISTRY_URL.to_owned(),
-            client,
-            limiter: Arc::new(tokio::sync::Semaphore::new(NPM_HTTP_CONCURRENCY)),
-            metadata_limiter: Arc::new(tokio::sync::Semaphore::new(256)),
-        })
+            .map_err(|err| meow_pkg::RegistryError::Fetch {
+                target: "http client init".to_owned(),
+                reason: format!("cannot initialize npm HTTP client: {err}"),
+            })?;
+        let _ = self.client.set(client);
+        Ok(self.client.get().expect("client was just initialized"))
     }
 
     fn base_url(&self) -> &str {
@@ -1201,7 +1251,68 @@ impl NpmRegistry {
         &self,
         name: &meow_pkg::PackageName,
     ) -> Result<meow_pkg::PackageMetadata, meow_pkg::RegistryError> {
+        let trace = std::env::var_os("MEOW_INSTALL_TRACE").is_some();
+        let t0 = std::time::Instant::now();
+
+        // Compact metadata cache: synchronous read + parse for small files.
+        // The compact cache is 10-100x smaller than the raw npm document,
+        // so reading + parsing on the async thread is faster than the
+        // spawn_blocking thread pool hop overhead (~1ms per hop).
+        let compact_path = self.metadata_cache_compact_path(name);
+        if let Ok(bytes) = std::fs::read(&compact_path) {
+            if let Ok(meta) = serde_json::from_slice::<meow_pkg::PackageMetadata>(&bytes) {
+                if trace {
+                    eprintln!(
+                        "[trace] metadata compact HIT {name}: {}μs",
+                        t0.elapsed().as_micros()
+                    );
+                }
+                return Ok(meta);
+            }
+        }
+
+        // Fall back to raw JSON cache (larger, needs spawn_blocking for parse).
+        let raw_path = self.metadata_cache_path(name);
+        if let Ok(bytes) = std::fs::read(&raw_path) {
+            let bytes_for_parse = bytes.clone();
+            let parse_result = tokio::task::spawn_blocking(move || {
+                serde_json::from_slice::<meow_pkg::PackageMetadata>(&bytes_for_parse)
+            })
+            .await
+            .map_err(|err| meow_pkg::RegistryError::Fetch {
+                target: "metadata cache parse".to_owned(),
+                reason: err.to_string(),
+            })?;
+            if let Ok(meta) = parse_result {
+                // Write compact cache from the parsed metadata.
+                let compact_path = compact_path.clone();
+                let meta_clone = meta.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ = std::fs::create_dir_all(compact_path.parent().unwrap_or(&compact_path));
+                    if let Ok(compact) = serde_json::to_vec(&meta_clone) {
+                        let tmp = compact_path.with_extension("compact.json.tmp");
+                        let _ = std::fs::write(&tmp, &compact);
+                        let _ = std::fs::rename(&tmp, &compact_path);
+                    }
+                })
+                .await
+                .ok();
+                if trace {
+                    eprintln!(
+                        "[trace] metadata raw HIT {name}: {}μs",
+                        t0.elapsed().as_micros()
+                    );
+                }
+                return Ok(meta);
+            }
+        }
+
+        if trace {
+            eprintln!("[trace] metadata cache MISS {name}, fetching from network");
+        }
+
         let url = self.metadata_url(name);
+        let client = self.client()?;
         for attempt in 0..NPM_FETCH_RETRIES {
             let _permit = self
                 .metadata_limiter
@@ -1212,8 +1323,7 @@ impl NpmRegistry {
                     target: url.clone(),
                     reason: err.to_string(),
                 })?;
-            let response = match self
-                .client
+            let response = match client
                 .get(&url)
                 .header("Accept", NPM_INSTALL_METADATA_ACCEPT)
                 .send()
@@ -1264,7 +1374,30 @@ impl NpmRegistry {
             };
 
             match serde_json::from_slice::<meow_pkg::PackageMetadata>(&bytes) {
-                Ok(meta) => return Ok(meta),
+                Ok(meta) => {
+                    // Write both raw + compact caches (best-effort, non-blocking).
+                    let raw_path = self.metadata_cache_path(name);
+                    let compact_path = self.metadata_cache_compact_path(name);
+                    let bytes_to_write = bytes.clone();
+                    let meta_to_write = meta.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let dir = raw_path.parent().unwrap_or(&raw_path);
+                        let _ = std::fs::create_dir_all(dir);
+                        // Raw cache (for debugging/fallback)
+                        let tmp = raw_path.with_extension("json.tmp");
+                        let _ = std::fs::write(&tmp, &bytes_to_write);
+                        let _ = std::fs::rename(&tmp, &raw_path);
+                        // Compact cache (what we actually read on warm)
+                        if let Ok(compact) = serde_json::to_vec(&meta_to_write) {
+                            let tmp = compact_path.with_extension("compact.json.tmp");
+                            let _ = std::fs::write(&tmp, &compact);
+                            let _ = std::fs::rename(&tmp, &compact_path);
+                        }
+                    })
+                    .await
+                    .ok();
+                    return Ok(meta);
+                }
                 Err(err) if attempt + 1 < NPM_FETCH_RETRIES => {
                     drop(_permit);
                     sleep_before_retry(attempt).await;
@@ -1286,9 +1419,10 @@ impl NpmRegistry {
     }
 
     async fn fetch_tarball_async(&self, url: &str) -> Result<Vec<u8>, meow_pkg::RegistryError> {
+        let client = self.client()?;
         for attempt in 0..NPM_FETCH_RETRIES {
             let _permit = self.acquire_http_permit(url).await?;
-            let response = match self.client.get(url).send().await {
+            let response = match client.get(url).send().await {
                 Ok(response) => response,
                 Err(err) if attempt + 1 < NPM_FETCH_RETRIES => {
                     drop(_permit);
@@ -1359,6 +1493,10 @@ impl meow_pkg::RegistrySource for NpmRegistry {
         url: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, meow_pkg::RegistryError>> + Send + 'a>> {
         Box::pin(async move { self.fetch_tarball_async(url).await })
+    }
+
+    fn has_metadata_cache(&self, name: &meow_pkg::PackageName) -> bool {
+        self.metadata_cache_compact_path(name).exists()
     }
 }
 
@@ -1481,7 +1619,10 @@ exec meow x "{}" "$@"
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o755));
+                    let _ = std::fs::set_permissions(
+                        &shim_path,
+                        std::fs::Permissions::from_mode(0o755),
+                    );
                 }
                 u.purr(&format!("Globally installed {bin_name}"));
                 succeeded += 1;
@@ -1584,6 +1725,7 @@ fn cmd_install(args: &InstallArgs) -> ExitCode {
     };
 
     let mut bar = ui().progress(0, "resolving dependencies");
+    let bar_animate = bar.animate();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -1598,7 +1740,9 @@ fn cmd_install(args: &InstallArgs) -> ExitCode {
         }
     };
     let outcome: Result<InstallSuccess, String> = runtime.block_on(async {
-        let registry = NpmRegistry::npm()?;
+        let trace = std::env::var_os("MEOW_INSTALL_TRACE").is_some();
+        let t0 = std::time::Instant::now();
+        let registry = NpmRegistry::lazy()?;
         // === CFG-003 ===
         for package in &args.packages {
             let (name, req) = requested_dependency(&registry, package)
@@ -1618,58 +1762,99 @@ fn cmd_install(args: &InstallArgs) -> ExitCode {
         let cache = meow_pkg::Cache::in_home(crate::host::host_home());
         let meow_req = runtime_meow_requirement().map_err(|err| err.to_string())?;
         let lock_path = root.join("meow.lock.jsonl");
+        let t_lock = std::time::Instant::now();
         let prior_lockfile = if lock_path.exists() {
             Some(meow_pkg::Lockfile::read(&lock_path).map_err(|err| err.to_string())?)
         } else {
             None
         };
+        if trace {
+            eprintln!("[trace] lockfile read: {}ms", t_lock.elapsed().as_millis());
+        }
         let mut installer =
             meow_pkg::Installer::new(registry.clone(), &cache, registry.base_url(), meow_req)
                 .with_overrides(overrides);
         if let Some(lockfile) = prior_lockfile {
             installer = installer.with_reuse_lockfile(lockfile);
         }
+        let t_resolve = std::time::Instant::now();
         let lockfile = installer
             .resolve_with_progress_async(&direct_deps, |progress| {
-                let (cached, resolved_total, label) = match progress {
+                let (cached, resolved_total) = match progress {
                     meow_pkg::InstallProgress::MetadataFetched {
-                        package,
                         cached,
                         resolved_total,
                         ..
-                    } => (cached, resolved_total, format!("resolving · {package}")),
+                    } => (cached, resolved_total),
                     meow_pkg::InstallProgress::PackageDownloaded {
-                        package,
                         cached,
                         resolved_total,
                         ..
-                    } => (cached, resolved_total, format!("downloading · {package}")),
+                    } => (cached, resolved_total),
                     meow_pkg::InstallProgress::PackageCached {
-                        package,
                         cached,
                         resolved_total,
                         ..
-                    } => (cached, resolved_total, format!("linking · {package}")),
+                    } => (cached, resolved_total),
                 };
-                bar.update(cached as u64, resolved_total as u64, label);
+                if bar_animate {
+                    let label = match progress {
+                        meow_pkg::InstallProgress::MetadataFetched { package, .. } => {
+                            format!("resolving · {package}")
+                        }
+                        meow_pkg::InstallProgress::PackageDownloaded { package, .. } => {
+                            format!("downloading · {package}")
+                        }
+                        meow_pkg::InstallProgress::PackageCached { package, .. } => {
+                            format!("linking · {package}")
+                        }
+                    };
+                    bar.update(cached as u64, resolved_total as u64, label);
+                } else {
+                    bar.update_counts(cached as u64, resolved_total as u64);
+                }
             })
             .await
             .map_err(|err| err.to_string())?;
+        if trace {
+            eprintln!("[trace] resolve: {}ms", t_resolve.elapsed().as_millis());
+        }
         let installed = lockfile.len();
+        let t_lockwrite = std::time::Instant::now();
         lockfile
             .write_canonical(&lock_path)
             .map_err(|err| err.to_string())?;
+        if trace {
+            eprintln!(
+                "[trace] lockfile write: {}ms",
+                t_lockwrite.elapsed().as_millis()
+            );
+        }
 
         // === PKG-004 ===
+        let t_graph = std::time::Instant::now();
         let roots =
             meow_pkg::resolve_roots(&direct_deps, &lockfile).map_err(|err| err.to_string())?;
         let graph = meow_pkg::ResolutionGraph::assemble(std::sync::Arc::new(lockfile), roots)
             .map_err(|err| err.to_string())?;
+        if trace {
+            eprintln!(
+                "[trace] graph assemble: {}ms",
+                t_graph.elapsed().as_millis()
+            );
+        }
         bar.set_label("materializing node_modules");
+        let t_mat = std::time::Instant::now();
         let report = meow_pkg::Materializer::new(&cache, &graph, &root)
             .materialize_async(&projection)
             .await
             .map_err(|err| err.to_string())?;
+        if trace {
+            eprintln!("[trace] materialize: {}ms", t_mat.elapsed().as_millis());
+        }
+        if trace {
+            eprintln!("[trace] TOTAL: {}ms", t0.elapsed().as_millis());
+        }
         Ok(InstallSuccess::Materialized {
             installed,
             lock_path,
@@ -1714,7 +1899,10 @@ fn cmd_install(args: &InstallArgs) -> ExitCode {
                 ("lockfile".to_owned(), lock_name.to_owned()),
             ]));
             if report.skipped {
-                lines.push(u.stdout_caps().muted("node_modules/ skipped (already up to date)"));
+                lines.push(
+                    u.stdout_caps()
+                        .muted("node_modules/ skipped (already up to date)"),
+                );
             }
             u.panel("meow install", &lines);
             ExitCode::SUCCESS
@@ -2112,7 +2300,11 @@ fn cmd_node_eval(args: NodeEvalArgs) -> ExitCode {
         .enable_all()
         .build()
     {
-        Ok(rt) => match rt.block_on(run_native_request(&request, flags, host_env_map(flags.allow_env, meow_runtime::node::NodeMode::Enabled))) {
+        Ok(rt) => match rt.block_on(run_native_request(
+            &request,
+            flags,
+            host_env_map(flags.allow_env, meow_runtime::node::NodeMode::Enabled),
+        )) {
             Ok(code) => code,
             Err(err) => {
                 hiss(&format!("node: {err}"));
@@ -2169,7 +2361,12 @@ fn cmd_run_result(target: &str, flags: RunFlagView<'_>) -> Result<ExitCode, RunC
         }
 
         let request = prepare_direct_file_run(&cwd, target, flags.argv)?;
-        run_native_request(&request, flags, host_env_map(flags.allow_env, meow_runtime::node::NodeMode::Enabled)).await
+        run_native_request(
+            &request,
+            flags,
+            host_env_map(flags.allow_env, meow_runtime::node::NodeMode::Enabled),
+        )
+        .await
     })
 }
 
@@ -3364,11 +3561,7 @@ fn cmd_landing() -> ExitCode {
     lines.push(format!(
         "{} {}",
         caps.brand("meow"),
-        caps.dim(&format!(
-            "v{} ({})",
-            meow_version(),
-            install_method,
-        )),
+        caps.dim(&format!("v{} ({})", meow_version(), install_method,)),
     ));
 
     if cache_packages > 0 {
@@ -3404,7 +3597,10 @@ fn cmd_landing() -> ExitCode {
 
     if !shadows.is_empty() {
         lines.push(String::new());
-        lines.push(caps.paint(meow_ui::palette::Rgb::HONEY, "⚠ Multiple meow installations detected!"));
+        lines.push(caps.paint(
+            meow_ui::palette::Rgb::HONEY,
+            "⚠ Multiple meow installations detected!",
+        ));
         for sh in &shadows {
             lines.push(format!("  You are running: {}", caps.dim(sh)));
         }
@@ -3604,10 +3800,8 @@ struct TscDiagnostic {
 
 /// Parse tsc's --pretty false output: `file(line,col): error TS{code}: {message}`
 fn parse_tsc_diagnostics(output: &str) -> Vec<TscDiagnostic> {
-    let re = regex::Regex::new(
-        r"^(.+)\((\d+),(\d+)\):\s+(error|warning)\s+(TS\d+):\s+(.+)$",
-    )
-    .expect("valid tsc diagnostic regex");
+    let re = regex::Regex::new(r"^(.+)\((\d+),(\d+)\):\s+(error|warning)\s+(TS\d+):\s+(.+)$")
+        .expect("valid tsc diagnostic regex");
     let mut diagnostics = Vec::new();
     for line in output.lines() {
         if let Some(caps) = re.captures(line) {
@@ -3667,22 +3861,21 @@ fn find_tsc(project_root: &std::path::Path) -> Option<std::path::PathBuf> {
         return Some(local_exe);
     }
     // Fall back to PATH lookup
-    std::env::var_os("PATH")
-        .and_then(|path| {
-            std::env::split_paths(&path).find_map(|dir| {
-                let candidate = dir.join("tsc");
-                if candidate.is_file() {
-                    Some(candidate)
+    std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path).find_map(|dir| {
+            let candidate = dir.join("tsc");
+            if candidate.is_file() {
+                Some(candidate)
+            } else {
+                let candidate_exe = dir.join("tsc.exe");
+                if candidate_exe.is_file() {
+                    Some(candidate_exe)
                 } else {
-                    let candidate_exe = dir.join("tsc.exe");
-                    if candidate_exe.is_file() {
-                        Some(candidate_exe)
-                    } else {
-                        None
-                    }
+                    None
                 }
-            })
+            }
         })
+    })
 }
 
 // === TEST-001 ===
@@ -3874,7 +4067,10 @@ async fn run_test_file_inner(root: &Path, file: &Path) -> Result<Vec<serde_json:
     // After module evaluation, call the test runner. Results are stored in OpState
     // via the op_test_store_results op.
     runtime
-        .execute_script("meow:test/runner", String::from("globalThis.__meowTestRunAll()"))
+        .execute_script(
+            "meow:test/runner",
+            String::from("globalThis.__meowTestRunAll()"),
+        )
         .map_err(|e| format!("test runner error: {e}"))?;
 
     let result_str = runtime
@@ -4057,14 +4253,14 @@ fn cmd_why_slow(args: &PathArgs) -> ExitCode {
                 let file_size = meow_ui::fmt::bytes(m.len());
                 lines.push(format!(
                     "{}  {}  {}",
-                    u.stdout_caps().muted(&meow_ui::width::pad_end("module", 12)),
+                    u.stdout_caps()
+                        .muted(&meow_ui::width::pad_end("module", 12)),
                     meow_ui::fmt::duration(resolve_time),
                     file_size,
                 ));
                 lines.push(format!(
                     "{}  {}",
-                    u.stdout_caps()
-                        .muted(&meow_ui::width::pad_end("path", 12)),
+                    u.stdout_caps().muted(&meow_ui::width::pad_end("path", 12)),
                     target.display(),
                 ));
             }
@@ -4181,7 +4377,10 @@ fn cmd_x(args: &XArgs) -> ExitCode {
     // 3. Create a minimal package.json
     let pkg_json_path = temp_dir.join("package.json");
     if let Err(err) = std::fs::write(&pkg_json_path, b"{}\n") {
-        hiss(&format!("meow x: cannot write {}: {err}", pkg_json_path.display()));
+        hiss(&format!(
+            "meow x: cannot write {}: {err}",
+            pkg_json_path.display()
+        ));
         let _ = std::fs::remove_dir_all(&temp_dir);
         return ExitCode::FAILURE;
     }
@@ -4210,33 +4409,35 @@ fn cmd_x(args: &XArgs) -> ExitCode {
             let cache = std::sync::Arc::new(meow_pkg::Cache::in_home(crate::host::host_home()));
             let meow_req = runtime_meow_requirement()?;
 
-            let installer = meow_pkg::Installer::new(
-                registry.clone(),
-                &cache,
-                registry.base_url(),
-                meow_req,
-            )
-            .with_overrides(overrides);
-            let lockfile = installer.resolve_with_progress_async(&dep_map, |progress| {
-                let label = match progress {
-                    meow_pkg::InstallProgress::MetadataFetched { package, .. } => {
-                        format!("resolving {package}")
-                    }
-                    meow_pkg::InstallProgress::PackageDownloaded { package, .. } => {
-                        format!("downloading {package}")
-                    }
-                    meow_pkg::InstallProgress::PackageCached { package, .. } => {
-                        format!("linking {package}")
-                    }
-                };
-                // Quick feedback via stderr — no spinner needed for ephemeral installs
-                eprint!("\r  \u{1b}[2m{label}\u{1b}[0m");
-            }).await.map_err(|err| format!("{err}"))?;
+            let installer =
+                meow_pkg::Installer::new(registry.clone(), &cache, registry.base_url(), meow_req)
+                    .with_overrides(overrides);
+            let lockfile = installer
+                .resolve_with_progress_async(&dep_map, |progress| {
+                    let label = match progress {
+                        meow_pkg::InstallProgress::MetadataFetched { package, .. } => {
+                            format!("resolving {package}")
+                        }
+                        meow_pkg::InstallProgress::PackageDownloaded { package, .. } => {
+                            format!("downloading {package}")
+                        }
+                        meow_pkg::InstallProgress::PackageCached { package, .. } => {
+                            format!("linking {package}")
+                        }
+                    };
+                    // Quick feedback via stderr — no spinner needed for ephemeral installs
+                    eprint!("\r  \u{1b}[2m{label}\u{1b}[0m");
+                })
+                .await
+                .map_err(|err| format!("{err}"))?;
             eprint!("\r\u{1b}[2K"); // clear the progress line
             let lock_path = temp_dir.join("meow.lock.jsonl");
-            lockfile.write_canonical(&lock_path).map_err(|err| format!("{err}"))?;
+            lockfile
+                .write_canonical(&lock_path)
+                .map_err(|err| format!("{err}"))?;
 
-            let roots = meow_pkg::resolve_roots(&dep_map, &lockfile).map_err(|err| format!("{err}"))?;
+            let roots =
+                meow_pkg::resolve_roots(&dep_map, &lockfile).map_err(|err| format!("{err}"))?;
             let graph = meow_pkg::ResolutionGraph::assemble(std::sync::Arc::new(lockfile), roots)
                 .map_err(|err| format!("{err}"))?;
             let projection = meow_pkg::MaterializeOptions::node_modules();
@@ -4248,7 +4449,10 @@ fn cmd_x(args: &XArgs) -> ExitCode {
         })
     })();
     if let Err(err) = result {
-        hiss(&format!("meow x: failed to install {}: {err}", args.package));
+        hiss(&format!(
+            "meow x: failed to install {}: {err}",
+            args.package
+        ));
         let _ = std::fs::remove_dir_all(&temp_dir);
         return ExitCode::FAILURE;
     }
@@ -4256,7 +4460,10 @@ fn cmd_x(args: &XArgs) -> ExitCode {
     // 6. Look up the binary
     let bin_name = name.as_str().rsplit('/').next().unwrap_or(name.as_str());
     let bin_path = {
-        let pkg_json_path = temp_dir.join("node_modules").join(name.as_str()).join("package.json");
+        let pkg_json_path = temp_dir
+            .join("node_modules")
+            .join(name.as_str())
+            .join("package.json");
         let bytes = match std::fs::read(&pkg_json_path) {
             Ok(b) => b,
             Err(err) => {
@@ -4316,10 +4523,7 @@ fn cmd_x(args: &XArgs) -> ExitCode {
     let spec = match meow_runtime::ModuleSpecifier::from_file_path(&bin_path) {
         Ok(s) => s,
         Err(_) => {
-            hiss(&format!(
-                "meow x: invalid bin path: {}",
-                bin_path.display(),
-            ));
+            hiss(&format!("meow x: invalid bin path: {}", bin_path.display(),));
             let _ = std::fs::remove_dir_all(&temp_dir);
             return ExitCode::FAILURE;
         }
@@ -4351,10 +4555,7 @@ fn cmd_x(args: &XArgs) -> ExitCode {
         Ok(rt) => match rt.block_on(run_native_request(
             &request,
             flags,
-            host_env_map(
-                flags.allow_env,
-                meow_runtime::node::NodeMode::Enabled,
-            ),
+            host_env_map(flags.allow_env, meow_runtime::node::NodeMode::Enabled),
         )) {
             Ok(code) => code,
             Err(err) => {

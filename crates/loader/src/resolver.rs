@@ -267,18 +267,29 @@ impl Resolver {
     }
 
     pub fn projected_path_for(&self, locator: &ModuleLocator) -> Option<PathBuf> {
-        let ModuleLocator::Cached { package, member } = locator else { return None; };
+        let ModuleLocator::Cached { package, member } = locator else {
+            return None;
+        };
         let (name, version) = self.by_integrity.get(package)?;
         let root = self.project_root.to_file_path().ok()?;
 
         let key = format!("{}@{}", name.as_str().replace('/', "+"), version);
-        let strict_path = root.join("node_modules").join(".meow").join(key).join("node_modules").join(name.as_str()).join(member);
+        let strict_path = root
+            .join("node_modules")
+            .join(".meow")
+            .join(key)
+            .join("node_modules")
+            .join(name.as_str())
+            .join(member);
 
         if strict_path.exists() {
             return Some(strict_path);
         }
 
-        let hoisted_path = root.join("node_modules").join(name.to_string()).join(member);
+        let hoisted_path = root
+            .join("node_modules")
+            .join(name.to_string())
+            .join(member);
         hoisted_path.exists().then_some(hoisted_path)
     }
 
@@ -308,7 +319,9 @@ impl Resolver {
     /// removed virtual cache schemes), so ESM `locate`/`resolve`, the CJS
     /// require path, and owner referrers all agree on one URL per member.
     pub fn cached_url(&self, locator: &ModuleLocator) -> Result<Url, ResolveError> {
-        let path = self.projected_path_for(locator).unwrap_or_else(|| self.runtime_path_for(locator).unwrap());
+        let path = self
+            .projected_path_for(locator)
+            .unwrap_or_else(|| self.runtime_path_for(locator).unwrap());
         Url::from_file_path(&path).map_err(|()| ResolveError::SpecifierNotFound {
             specifier: path.display().to_string(),
             referrer: self.project_root.clone(),
@@ -529,7 +542,9 @@ impl Resolver {
                 })?
             }
             ModuleLocator::Cached { .. } => {
-                let path = self.projected_path_for(&locator).unwrap_or_else(|| self.runtime_path_for(&locator).unwrap());
+                let path = self
+                    .projected_path_for(&locator)
+                    .unwrap_or_else(|| self.runtime_path_for(&locator).unwrap());
                 std::fs::read(&path).map_err(|source| ResolveError::Io { path, source })?
             }
             // === RT-005 ===
@@ -1532,7 +1547,8 @@ fn cached_file_kind(root: &Path, member: &str) -> ModuleKind {
                     return ModuleKind::Cjs;
                 }
             }
-            if let Some(module_path) = manifest.module.as_deref().and_then(normalize_legacy_member) {
+            if let Some(module_path) = manifest.module.as_deref().and_then(normalize_legacy_member)
+            {
                 let module_dir = Path::new(&module_path).parent().unwrap_or(Path::new(""));
                 if Path::new(member).starts_with(module_dir) {
                     return ModuleKind::Esm;
@@ -1545,7 +1561,8 @@ fn cached_file_kind(root: &Path, member: &str) -> ModuleKind {
             if manifest.package_type.as_deref() == Some("module") {
                 return ModuleKind::Esm;
             }
-            if let Some(module_path) = manifest.module.as_deref().and_then(normalize_legacy_member) {
+            if let Some(module_path) = manifest.module.as_deref().and_then(normalize_legacy_member)
+            {
                 let module_dir = Path::new(&module_path).parent().unwrap_or(Path::new(""));
                 if Path::new(member).starts_with(module_dir) {
                     return ModuleKind::Esm;

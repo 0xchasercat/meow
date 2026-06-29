@@ -171,7 +171,7 @@ impl node::NpmPackageFolderResolver for TestDenoNodeBridge {
                         package_name: specifier.to_string(),
                         referrer: referrer.display(),
                         referrer_extra: Some(err.to_string()),
-                    }
+                    },
                 );
                 return Err(node::PackageFolderResolveError(Box::new(kind)));
             }
@@ -844,9 +844,15 @@ async fn first_party_js_commonjs_runs_end_to_end() {
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, resolver.clone(), Some(&proj.join("cache")), &entry, vec![sink_ext])
-        .await
-        .expect("first-party CommonJS runs");
+    run_entry(
+        loader,
+        resolver.clone(),
+        Some(&proj.join("cache")),
+        &entry,
+        vec![sink_ext],
+    )
+    .await
+    .expect("first-party CommonJS runs");
 
     assert_eq!(*out.borrow(), "42\n");
     std::fs::remove_dir_all(&proj).ok();
@@ -1089,9 +1095,15 @@ async fn esm_imports_cjs_default_named_and_reassignment() {
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, resolver.clone(), Some(&proj.join("cache")), &entry, vec![sink_ext])
-        .await
-        .expect("ESM imports CJS");
+    run_entry(
+        loader,
+        resolver.clone(),
+        Some(&proj.join("cache")),
+        &entry,
+        vec![sink_ext],
+    )
+    .await
+    .expect("ESM imports CJS");
 
     assert_eq!(*out.borrow(), "{\"answer\":42,\"foo\":3,\"bar\":4}\n");
     std::fs::remove_dir_all(&proj).ok();
@@ -1123,9 +1135,15 @@ async fn circular_commonjs_sees_partial_exports_object() {
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, resolver.clone(), Some(&proj.join("cache")), &entry, vec![sink_ext])
-        .await
-        .expect("cycle runs");
+    run_entry(
+        loader,
+        resolver.clone(),
+        Some(&proj.join("cache")),
+        &entry,
+        vec![sink_ext],
+    )
+    .await
+    .expect("cycle runs");
 
     assert_eq!(
         *out.borrow(),
@@ -1155,9 +1173,15 @@ async fn repeated_require_returns_the_same_object() {
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, resolver.clone(), Some(&proj.join("cache")), &entry, vec![sink_ext])
-        .await
-        .expect("repeat require runs");
+    run_entry(
+        loader,
+        resolver.clone(),
+        Some(&proj.join("cache")),
+        &entry,
+        vec![sink_ext],
+    )
+    .await
+    .expect("repeat require runs");
 
     assert_eq!(*out.borrow(), "[true,1,2]\n");
     std::fs::remove_dir_all(&proj).ok();
@@ -1248,9 +1272,15 @@ async fn dynamic_require_resolves_at_runtime() {
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, resolver.clone(), Some(&proj.join("cache")), &entry, vec![sink_ext])
-        .await
-        .expect("dynamic require resolves through native CJS");
+    run_entry(
+        loader,
+        resolver.clone(),
+        Some(&proj.join("cache")),
+        &entry,
+        vec![sink_ext],
+    )
+    .await
+    .expect("dynamic require resolves through native CJS");
     assert_eq!(*out.borrow(), "42\n");
     std::fs::remove_dir_all(&proj).ok();
 }
@@ -1276,9 +1306,15 @@ async fn unresolvable_static_require_falls_through_to_catchable_runtime_error() 
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, resolver.clone(), Some(&proj.join("cache")), &entry, vec![sink_ext])
-        .await
-        .expect("optional require wrapped in try/catch must not abort build");
+    run_entry(
+        loader,
+        resolver.clone(),
+        Some(&proj.join("cache")),
+        &entry,
+        vec![sink_ext],
+    )
+    .await
+    .expect("optional require wrapped in try/catch must not abort build");
 
     assert_eq!(
         *out.borrow(),
@@ -1305,9 +1341,15 @@ async fn erasable_typescript_commonjs_runs() {
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, resolver.clone(), Some(&proj.join("cache")), &entry, vec![sink_ext])
-        .await
-        .expect("TS CommonJS runs");
+    run_entry(
+        loader,
+        resolver.clone(),
+        Some(&proj.join("cache")),
+        &entry,
+        vec![sink_ext],
+    )
+    .await
+    .expect("TS CommonJS runs");
 
     assert_eq!(*out.borrow(), "42\n");
     std::fs::remove_dir_all(&proj).ok();

@@ -51,11 +51,7 @@ fn version_and_help_succeed() {
 const CASES: &[(&[&str], &str)] = &[];
 #[test]
 fn every_subcommand_stub_is_honest() {
-    assert_eq!(
-        CASES.len(),
-        0,
-        "all subcommands are implemented"
-    );
+    assert_eq!(CASES.len(), 0, "all subcommands are implemented");
     for (argv, verb) in CASES {
         let expected = format!("meow: `{verb}` is not yet implemented");
         meow()
@@ -161,11 +157,8 @@ fn bundle_entry_is_skeleton_with_pending_wiring_message() {
     let tmp = load_tmp("bundle");
     let entry = tmp.join("entry.ts");
     let dist = tmp.join("dist");
-    std::fs::write(
-        &entry,
-        "const value = 1; console.log('bundle ok');\n",
-    )
-    .expect("write bundle entry");
+    std::fs::write(&entry, "const value = 1; console.log('bundle ok');\n")
+        .expect("write bundle entry");
     let out = meow()
         .current_dir(&tmp)
         .arg("bundle")
@@ -174,10 +167,7 @@ fn bundle_entry_is_skeleton_with_pending_wiring_message() {
         .arg(&dist)
         .output()
         .expect("run bundle");
-    assert!(
-        out.status.success(),
-        "bundle should succeed: {out:?}"
-    );
+    assert!(out.status.success(), "bundle should succeed: {out:?}");
     let stdout = String::from_utf8(out.stdout).expect("stdout utf8");
     let stdout_lc = stdout.to_lowercase();
     assert!(

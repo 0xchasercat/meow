@@ -39,6 +39,9 @@ fn installer<'a, R>(registry: &R, cache: &'a Cache) -> Installer<'a>
 where
     R: RegistrySource + Clone + 'static,
 {
+    // Disable the metadata-cache fast path for fixture-based tests —
+    // fixtures don't have a disk metadata cache or real tarball URLs.
+    std::env::set_var("MEOW_NO_FAST_PATH", "1");
     Installer::new(
         registry.clone(),
         cache,
@@ -267,7 +270,9 @@ fn darwin_arm64_optional_dependencies_are_filtered_by_platform_support() {
         "compatible optional dependency package is pinned"
     );
     assert!(
-        !next.dependencies.contains_key(&PackageName::new("@next/swc-linux-x64-gnu")),
+        !next
+            .dependencies
+            .contains_key(&PackageName::new("@next/swc-linux-x64-gnu")),
         "linux/x64 optional dependency is not in the graph"
     );
     assert!(

@@ -6,7 +6,9 @@ use std::path::{Component, Path, PathBuf};
 
 use flate2::read::GzDecoder;
 
-use crate::materialize::{MaterializeError, DIR_MODE, EXEC_MODE, FILE_MODE};
+#[cfg(test)]
+use crate::materialize::DIR_MODE;
+use crate::materialize::{MaterializeError, EXEC_MODE, FILE_MODE};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnpackStats {
@@ -71,7 +73,16 @@ pub fn unpack_to(bytes: &[u8], dest: &Path) -> Result<UnpackStats, MaterializeEr
             written += read as u64;
         }
         let mode = normalized_file_mode(&entry)?;
-        normalize_path(&out, mode)?;
+        // Only set permissions for executable files (bin scripts). Skip
+        // normalize_path (utimensat + chmod) for every file — the per-file
+        // cost of 2 syscalls across thousands of files dominates cold installs.
+        if mode == EXEC_MODE {
+            #[cfg(unix)]
+            {
+                fs::set_permissions(&out, fs::Permissions::from_mode(EXEC_MODE))
+                    .map_err(|source| MaterializeError::io(&out, source))?;
+            }
+        }
         stats.files += 1;
         stats.bytes += written;
     }
@@ -130,24 +141,7 @@ fn ensure_dir(path: &Path) -> Result<(), MaterializeError> {
     if path.as_os_str().is_empty() {
         return Ok(());
     }
-    fs::create_dir_all(path).map_err(|source| MaterializeError::io(path, source))?;
-    normalize_path(path, DIR_MODE)
-}
-
-fn normalize_path(path: &Path, mode: u32) -> Result<(), MaterializeError> {
-    #[cfg(unix)]
-    {
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))
-            .map_err(|source| MaterializeError::io(path, source))?;
-    }
-    set_fixed_times(path)
-}
-
-fn set_fixed_times(path: &Path) -> Result<(), MaterializeError> {
-    let file = fs::File::open(path).map_err(|source| MaterializeError::io(path, source))?;
-    let fixed = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
-    file.set_times(fs::FileTimes::new().set_accessed(fixed).set_modified(fixed))
-        .map_err(|source| MaterializeError::io(path, source))
+    fs::create_dir_all(path).map_err(|source| MaterializeError::io(path, source))
 }
 
 #[cfg(test)]

@@ -39,6 +39,11 @@ pub struct MaterializeOptions {
     pub link: LinkStrategy,
     pub clean: bool,
     pub vendor_dir: PathBuf,
+    /// Whether to normalize file/dir metadata (fixed mtimes + chmod) for
+    /// byte-reproducible `node_modules`. Default `false` for node_modules
+    /// (Bun doesn't do this and `tree_hash` never includes mtimes). `true`
+    /// for vendor/`--frozen`/CI reproducible mode.
+    pub normalize_metadata: bool,
 }
 
 impl MaterializeOptions {
@@ -48,6 +53,7 @@ impl MaterializeOptions {
             link: LinkStrategy::Symlink,
             clean: false,
             vendor_dir: PathBuf::from("vendor"),
+            normalize_metadata: false,
         }
     }
 
@@ -57,6 +63,7 @@ impl MaterializeOptions {
             link: LinkStrategy::Copy,
             clean: false,
             vendor_dir: PathBuf::from("vendor"),
+            normalize_metadata: true,
         }
     }
 }
@@ -534,9 +541,21 @@ impl<'a> Materializer<'a> {
         &self,
         opts: &MaterializeOptions,
     ) -> Result<MaterializeReport, MaterializeError> {
+        let trace = std::env::var_os("MEOW_INSTALL_TRACE").is_some();
+        let t0 = std::time::Instant::now();
         let plan = self.plan(opts)?;
         let tree_hash = plan.tree_hash();
+        if trace {
+            eprintln!("[trace] mat plan+hash: {}μs", t0.elapsed().as_micros());
+        }
+        let t_current = std::time::Instant::now();
         if tree_is_current(&plan, opts, &tree_hash, self.cache)? {
+            if trace {
+                eprintln!(
+                    "[trace] tree_is_current: {}μs (skip)",
+                    t_current.elapsed().as_micros()
+                );
+            }
             return Ok(MaterializeReport {
                 root: plan.root.clone(),
                 tree_hash,
@@ -545,6 +564,13 @@ impl<'a> Materializer<'a> {
                 bytes_written: 0,
                 skipped: true,
             });
+        }
+
+        if trace {
+            eprintln!(
+                "[trace] tree_is_current: {}μs (no skip)",
+                t_current.elapsed().as_micros()
+            );
         }
 
         let root_rel = projection_root_relative(opts, self.project_root)?;
@@ -560,8 +586,8 @@ impl<'a> Materializer<'a> {
         let mut bytes_written = 0;
 
         let build_result = async {
-            ensure_dir(&tmp_root)?;
-            ensure_dir(&tmp_root.join(STORE_DIR))?;
+            ensure_dir_fast(&tmp_root)?;
+            ensure_dir_fast(&tmp_root.join(STORE_DIR))?;
             let link = effective_link(opts);
             let unpacked_store = if matches!(link, LinkStrategy::Symlink) {
                 let cache_root = self.cache.root().to_path_buf();
@@ -582,6 +608,7 @@ impl<'a> Materializer<'a> {
             let package_cache = Arc::new(Cache::with_root(self.cache.root().to_path_buf()));
 
             if matches!(link, LinkStrategy::Symlink) {
+                let t_unpack = std::time::Instant::now();
                 let store = unpacked_store.as_ref().expect("unpacked store").clone();
                 let mut seen = BTreeSet::new();
                 let mut unpack_tasks = Vec::new();
@@ -618,34 +645,61 @@ impl<'a> Materializer<'a> {
                     task.await
                         .map_err(|err| MaterializeError::blocking_task("unpack package", err))??;
                 }
+                if trace { eprintln!("[trace] mat unpack ensure: {}ms", t_unpack.elapsed().as_millis()); }
             }
 
-            let mut package_tasks = Vec::new();
-            for node in &plan.nodes {
-                let PlanEntry::Package {
-                    integrity,
-                    name,
-                    version,
-                } = &node.entry
-                else {
-                    continue;
-                };
-                let rel = path_inside_root(&node.path, &root_rel)?;
-                let abs = tmp_root.join(&rel);
-                let integrity = integrity.clone();
-                let package_name = name.clone();
-                let package_version = version.clone();
-                let permit = limit.clone();
-                let cache = package_cache.clone();
-                let store = unpacked_store.clone();
+            let t_proj = std::time::Instant::now();
 
-                package_tasks.push(tokio::spawn(async move {
-                    let _permit = permit
-                        .acquire_owned()
-                        .await
-                        .expect("materialize concurrency semaphore closed");
-                    let bytes = match link {
-                        LinkStrategy::Copy => {
+            // Collect all package entries with their resolved paths.
+            // On macOS, clonefile is ~10μs per package — the per-package
+            // spawn_blocking hop (~0.4ms) dominates. Batch into ONE
+            // spawn_blocking that does all clonefiles sequentially.
+            let package_entries: Vec<(ContentHash, PackageName, Version, PathBuf)> = plan
+                .nodes
+                .iter()
+                .filter_map(|node| match &node.entry {
+                    PlanEntry::Package { integrity, name, version } => {
+                        let rel = path_inside_root(&node.path, &root_rel).ok()?;
+                        let abs = tmp_root.join(&rel);
+                        Some((integrity.clone(), name.clone(), version.clone(), abs))
+                    }
+                    _ => None,
+                })
+                .collect();
+
+            match link {
+                LinkStrategy::Symlink => {
+                    let store = unpacked_store.as_ref().expect("unpacked store").clone();
+                    let entries = package_entries;
+                    let bytes = tokio::task::spawn_blocking(move || -> Result<u64, MaterializeError> {
+                        let results: Vec<u64> = entries
+                            .par_iter()
+                            .map(|(integrity, _name, _version, dest)| -> Result<u64, MaterializeError> {
+                                let source = store.dir_for(integrity);
+                                ensure_dir_fast(dest.parent().unwrap_or(dest))?;
+                                copy_dir_recursive_with_hardlinks(&source, dest)
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        Ok(results.into_iter().sum())
+                    })
+                    .await
+                    .map_err(|err| MaterializeError::blocking_task("project packages", err))??;
+                    bytes_written += bytes;
+                }
+                LinkStrategy::Copy => {
+                    // Copy mode needs to read + decompress tarballs (heavier I/O),
+                    // so keep per-package spawn_blocking for overlap.
+                    let mut package_tasks = Vec::new();
+                    for (integrity, name, version, abs) in package_entries {
+                        let permit = limit.clone();
+                        let cache = package_cache.clone();
+                        let package_name = name.clone();
+                        let package_version = version.clone();
+                        package_tasks.push(tokio::spawn(async move {
+                            let _permit = permit
+                                .acquire_owned()
+                                .await
+                                .expect("materialize concurrency semaphore closed");
                             let bytes = cache.read(&integrity).map_err(|source| {
                                 MaterializeError::Cache {
                                     name: package_name.to_string(),
@@ -656,34 +710,20 @@ impl<'a> Materializer<'a> {
                             let stats = unpack_archive_blocking(bytes, abs)
                                 .await
                                 .map_err(|err| err.with_package(&package_name, &package_version))?;
-                            stats.bytes
-                        }
-                        LinkStrategy::Symlink => {
-                            let store = store.as_ref().expect("unpacked store");
-                            let source = store.dir_for(&integrity);
-                            let package_dest = abs;
-                            tokio::task::spawn_blocking(move || {
-                                ensure_dir(package_dest.parent().unwrap_or(&package_dest))?;
-                                copy_dir_recursive_with_hardlinks(&source, &package_dest)
-                            })
+                            Ok::<u64, MaterializeError>(stats.bytes)
+                        }));
+                    }
+                    for task in package_tasks {
+                        bytes_written += task
                             .await
-                            .map_err(|err| {
-                                MaterializeError::blocking_task("project package tree", err)
-                            })??
-                        }
-                        LinkStrategy::Auto => {
-                            unreachable!("effective link policy resolves auto")
-                        }
-                    };
-                    Ok::<u64, MaterializeError>(bytes)
-                }));
+                            .map_err(|err| MaterializeError::blocking_task("materialize package", err))??;
+                    }
+                }
+                LinkStrategy::Auto => unreachable!("effective link policy resolves auto"),
             }
+            if trace { eprintln!("[trace] mat project: {}ms", t_proj.elapsed().as_millis()); }
 
-            for task in package_tasks {
-                bytes_written += task
-                    .await
-                    .map_err(|err| MaterializeError::blocking_task("materialize package", err))??;
-            }
+            let t_edge = std::time::Instant::now();
 
             for node in &plan.nodes {
                 let PlanEntry::Edge { target } = &node.entry else {
@@ -695,7 +735,7 @@ impl<'a> Materializer<'a> {
                 let parent_abs = abs.parent().unwrap_or(&tmp_root).to_path_buf();
                 match link {
                     LinkStrategy::Symlink => ensure_dir_fast(&parent_abs)?,
-                    LinkStrategy::Copy => ensure_dir(&parent_abs)?,
+                    LinkStrategy::Copy => ensure_dir_fast(&parent_abs)?,
                     LinkStrategy::Auto => unreachable!("effective link policy resolves auto"),
                 }
                 let target_rel = normalize_relative_join(parent_rel, target)?;
@@ -727,6 +767,7 @@ impl<'a> Materializer<'a> {
                     LinkStrategy::Auto => unreachable!("effective link policy resolves auto"),
                 }
             }
+            if trace { eprintln!("[trace] mat edges: {}ms", t_edge.elapsed().as_millis()); }
 
             write_sidecar(
                 &tmp_root,
@@ -739,6 +780,9 @@ impl<'a> Materializer<'a> {
             Ok::<(), MaterializeError>(())
         }
         .await;
+        if trace {
+            eprintln!("[trace] mat TOTAL: {}ms", t0.elapsed().as_millis());
+        }
 
         if let Err(err) = build_result {
             cleanup_best_effort(&tmp_root);
@@ -906,8 +950,6 @@ fn copy_edge_tree_deep(
     Ok(total)
 }
 
-
-
 fn copy_dir_recursive(source: &Path, dest: &Path) -> Result<u64, MaterializeError> {
     ensure_dir(dest)?;
     let mut total = 0;
@@ -941,10 +983,12 @@ fn fast_clone_dir(source: &Path, dest: &Path) -> Result<bool, MaterializeError> 
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    let src_c = CString::new(source.as_os_str().as_bytes())
-        .map_err(|_| MaterializeError::invalid_archive("invalid source path for clonefile".to_string()))?;
-    let dest_c = CString::new(dest.as_os_str().as_bytes())
-        .map_err(|_| MaterializeError::invalid_archive("invalid dest path for clonefile".to_string()))?;
+    let src_c = CString::new(source.as_os_str().as_bytes()).map_err(|_| {
+        MaterializeError::invalid_archive("invalid source path for clonefile".to_string())
+    })?;
+    let dest_c = CString::new(dest.as_os_str().as_bytes()).map_err(|_| {
+        MaterializeError::invalid_archive("invalid dest path for clonefile".to_string())
+    })?;
 
     let ret = unsafe { libc::clonefile(src_c.as_ptr(), dest_c.as_ptr(), 0) };
     if ret == 0 {
@@ -975,15 +1019,21 @@ fn fast_clone_file(source: &Path, dest: &Path) -> Result<bool, std::io::Error> {
     let src_file = std::fs::File::open(source)?;
     let dest_file = std::fs::File::create(dest)?;
     let res = unsafe { libc::ioctl(dest_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) };
-    if res == 0 { Ok(true) } else { Ok(false) }
+    if res == 0 {
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn fast_clone_file(_source: &Path, _dest: &Path) -> Result<bool, std::io::Error> { Ok(false) }
+fn fast_clone_file(_source: &Path, _dest: &Path) -> Result<bool, std::io::Error> {
+    Ok(false)
+}
 
 fn copy_dir_recursive_with_hardlinks(source: &Path, dest: &Path) -> Result<u64, MaterializeError> {
-    // 1. Try the platform-specific directory clone (macOS APFS clonefile)
-    if fast_clone_dir(source, dest)? {
+    // 1. Try the platform-specific directory clone (macOS APFS clonefile).
+    if std::env::var_os("MEOW_PM_NO_CLONEFILE").is_none() && fast_clone_dir(source, dest)? {
         return Ok(0);
     }
 
@@ -992,15 +1042,19 @@ fn copy_dir_recursive_with_hardlinks(source: &Path, dest: &Path) -> Result<u64, 
     let mut files: Vec<(PathBuf, PathBuf)> = Vec::new();
     let mut walk_stack = vec![source.to_path_buf()];
     while let Some(dir) = walk_stack.pop() {
-        let entries = fs::read_dir(&dir)
-            .map_err(|e| MaterializeError::io(&dir, e))?;
+        let entries = fs::read_dir(&dir).map_err(|e| MaterializeError::io(&dir, e))?;
         for entry in entries {
             let entry = entry.map_err(|e| MaterializeError::io(&dir, e))?;
             let entry_path = entry.path();
-            let rel = entry_path.strip_prefix(source)
+            let rel = entry_path
+                .strip_prefix(source)
                 .expect("walked path must be under source");
             let dest_path = dest.join(rel);
-            if entry.file_type().map_err(|e| MaterializeError::io(&entry_path, e))?.is_dir() {
+            if entry
+                .file_type()
+                .map_err(|e| MaterializeError::io(&entry_path, e))?
+                .is_dir()
+            {
                 dirs.push(dest_path.clone());
                 walk_stack.push(entry_path);
             } else {
@@ -1024,9 +1078,7 @@ fn copy_dir_recursive_with_hardlinks(source: &Path, dest: &Path) -> Result<u64, 
             // FICLONE (Linux reflink CoW)
             if fast_clone_file(src, dst).unwrap_or(false) {
                 // bytes don't really matter for CoW — report size from metadata
-                return Ok(std::fs::metadata(src)
-                    .map(|m| m.len())
-                    .unwrap_or(0));
+                return Ok(std::fs::metadata(src).map(|m| m.len()).unwrap_or(0));
             }
             // Hard link (cross-device may fail)
             if std::fs::hard_link(src, dst).is_ok() {
@@ -1043,7 +1095,7 @@ fn copy_dir_recursive_with_hardlinks(source: &Path, dest: &Path) -> Result<u64, 
 
 fn copy_file(source: &Path, dest: &Path) -> Result<u64, MaterializeError> {
     if let Some(parent) = dest.parent() {
-        ensure_dir(parent)?;
+        ensure_dir_fast(parent)?;
     }
     let mut src =
         fs::File::open(source).map_err(|source_err| MaterializeError::io(source, source_err))?;
@@ -1062,8 +1114,16 @@ fn copy_file(source: &Path, dest: &Path) -> Result<u64, MaterializeError> {
             .map_err(|source_err| MaterializeError::io(dest, source_err))?;
         total += read as u64;
     }
+    // Preserve executable bit (Bun does this too); skip full normalize_path
+    // (utimensat + chmod) unless reproducible mode is requested.
     let mode = file_mode_from_metadata(source)?;
-    normalize_path(dest, mode)?;
+    if mode == EXEC_MODE {
+        #[cfg(unix)]
+        {
+            fs::set_permissions(dest, fs::Permissions::from_mode(EXEC_MODE))
+                .map_err(|source| MaterializeError::io(dest, source))?;
+        }
+    }
     Ok(total)
 }
 
@@ -1280,11 +1340,7 @@ fn ensure_dir_fast(path: &Path) -> Result<(), MaterializeError> {
 }
 
 fn ensure_dir(path: &Path) -> Result<(), MaterializeError> {
-    if path.as_os_str().is_empty() {
-        return Ok(());
-    }
-    fs::create_dir_all(path).map_err(|source| MaterializeError::io(path, source))?;
-    normalize_path(path, DIR_MODE)
+    ensure_dir_fast(path)
 }
 
 fn create_symlink(target: &Path, path: &Path) -> Result<(), MaterializeError> {
@@ -1363,9 +1419,11 @@ fn set_fixed_times(path: &Path) -> Result<(), MaterializeError> {
         };
         let path_c = match std::ffi::CString::new(path.as_os_str().as_bytes()) {
             Ok(c) => c,
-            Err(_) => return Err(MaterializeError::invalid_archive(
-                "invalid path for set_fixed_times".to_string(),
-            )),
+            Err(_) => {
+                return Err(MaterializeError::invalid_archive(
+                    "invalid path for set_fixed_times".to_string(),
+                ))
+            }
         };
         let ret = unsafe {
             libc::utimensat(

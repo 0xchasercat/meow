@@ -220,13 +220,16 @@ pub fn bundle_entries(
         } else {
             root.join(entry)
         };
-        let entry_url = deno_core::url::Url::from_file_path(&entry_abs)
-            .map_err(|_| ToolError::Message(format!("invalid entry path: {}", entry_abs.display())))?;
+        let entry_url = deno_core::url::Url::from_file_path(&entry_abs).map_err(|_| {
+            ToolError::Message(format!("invalid entry path: {}", entry_abs.display()))
+        })?;
 
         // Resolve the entry module
         let resolved = resolver
             .resolve(entry_url.as_str(), &entry_url)
-            .map_err(|e| ToolError::Message(format!("cannot resolve entry {}: {e}", entry_abs.display())))?;
+            .map_err(|e| {
+                ToolError::Message(format!("cannot resolve entry {}: {e}", entry_abs.display()))
+            })?;
 
         // BFS walk to collect all dependencies
         let mut modules: BTreeMap<String, BundleModule> = BTreeMap::new();
@@ -242,9 +245,7 @@ pub fn bundle_entries(
             // Transpile if needed
             let source = transpile_for_bundle(&modl)?;
 
-            let bundle_mod = BundleModule {
-                source,
-            };
+            let bundle_mod = BundleModule { source };
 
             // Parse the original source (before transpilation) to discover imports
             let imports = discover_imports(&modl);
@@ -308,7 +309,10 @@ fn discover_imports(modl: &ResolvedModule) -> Vec<String> {
                 let after_from = &trimmed[from_pos + 6..];
                 let spec = extract_string_literal(after_from);
                 if let Some(spec) = spec {
-                    if !spec.starts_with("node:") && !spec.starts_with("meow:") && !spec.starts_with("ext:") {
+                    if !spec.starts_with("node:")
+                        && !spec.starts_with("meow:")
+                        && !spec.starts_with("ext:")
+                    {
                         imports.push(spec);
                     }
                 }
@@ -317,7 +321,10 @@ fn discover_imports(modl: &ResolvedModule) -> Vec<String> {
         // dynamic import
         if let Some(after_paren) = trimmed.strip_prefix("import(") {
             if let Some(end) = after_paren.find(')') {
-                let spec = &after_paren[..end].trim().trim_matches('"').trim_matches('\'');
+                let spec = &after_paren[..end]
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'');
                 if !spec.is_empty() && !spec.starts_with("node:") && !spec.starts_with("meow:") {
                     imports.push(spec.to_string());
                 }
@@ -435,11 +442,8 @@ fn transpile_for_bundle(modl: &ResolvedModule) -> Result<String, ToolError> {
         },
         ..TransformOptions::default()
     };
-    let transformed =
-        Transformer::new(&allocator, &file_path, &transform).build_with_scoping(
-            semantic.semantic.into_scoping(),
-            &mut program,
-        );
+    let transformed = Transformer::new(&allocator, &file_path, &transform)
+        .build_with_scoping(semantic.semantic.into_scoping(), &mut program);
 
     if !transformed.errors.is_empty() {
         let msg = transformed
@@ -468,9 +472,13 @@ fn transpile_for_bundle(modl: &ResolvedModule) -> Result<String, ToolError> {
                 let mut parts: Vec<&std::ffi::OsStr> = Vec::new();
                 for component in resolved.components() {
                     match component {
-                        std::path::Component::CurDir => {},
-                        std::path::Component::ParentDir => { parts.pop(); },
-                        other => { parts.push(other.as_os_str()); },
+                        std::path::Component::CurDir => {}
+                        std::path::Component::ParentDir => {
+                            parts.pop();
+                        }
+                        other => {
+                            parts.push(other.as_os_str());
+                        }
                     }
                 }
                 let normalized: std::path::PathBuf = parts.iter().collect();
@@ -488,7 +496,9 @@ fn transpile_for_bundle(modl: &ResolvedModule) -> Result<String, ToolError> {
 /// Extract a string literal from a token: removes outer quotes and semicolons.
 /// Extract leading whitespace from a line (for indentation preservation).
 fn leading_ws(line: &str) -> &str {
-    let ws_end = line.find(|c: char| c != ' ' && c != '\t').unwrap_or(line.len());
+    let ws_end = line
+        .find(|c: char| c != ' ' && c != '\t')
+        .unwrap_or(line.len());
     &line[..ws_end]
 }
 
@@ -558,7 +568,9 @@ fn esm_to_cjs(source: &str, resolve: impl Fn(&str) -> String) -> String {
                         .join(", ");
                     let resolved = resolve(&src);
                     let ws = leading_ws(&line);
-                    out.push_str(&format!("{ws}const {{ {names} }} = require({resolved:?});\n"));
+                    out.push_str(&format!(
+                        "{ws}const {{ {names} }} = require({resolved:?});\n"
+                    ));
                 } else if imports.starts_with("* as ") {
                     let ns = imports.trim_start_matches("* as ").trim();
                     let ws = leading_ws(&line);
@@ -587,7 +599,8 @@ fn esm_to_cjs(source: &str, resolve: impl Fn(&str) -> String) -> String {
         }
 
         // === export function / export async function ===
-        if trimmed.starts_with("export function ") || trimmed.starts_with("export async function ") {
+        if trimmed.starts_with("export function ") || trimmed.starts_with("export async function ")
+        {
             let has_async = trimmed.starts_with("export async function ");
             let body = if has_async {
                 trimmed.strip_prefix("export async function ").unwrap_or("")
@@ -595,7 +608,11 @@ fn esm_to_cjs(source: &str, resolve: impl Fn(&str) -> String) -> String {
                 trimmed.strip_prefix("export function ").unwrap_or("")
             };
             let fn_name = body.split(['(', ' ', '<']).next().unwrap_or("").trim();
-            let fn_decl = if has_async { "async function " } else { "function " };
+            let fn_decl = if has_async {
+                "async function "
+            } else {
+                "function "
+            };
             let ws = leading_ws(&line);
 
             // Emit the declaration line with "export " stripped
@@ -611,8 +628,11 @@ fn esm_to_cjs(source: &str, resolve: impl Fn(&str) -> String) -> String {
                 let mut brace_depth: i32 = 0;
                 // Count braces already on this line (in the body)
                 for c in body.chars() {
-                    if c == '{' { brace_depth += 1; }
-                    else if c == '}' { brace_depth -= 1; }
+                    if c == '{' {
+                        brace_depth += 1;
+                    } else if c == '}' {
+                        brace_depth -= 1;
+                    }
                 }
                 while pos < len && brace_depth > 0 {
                     let next_line = read_line(&mut pos);
@@ -620,8 +640,11 @@ fn esm_to_cjs(source: &str, resolve: impl Fn(&str) -> String) -> String {
                     // Check if this line contains an "export " keyword (nested) — skip
                     // Count braces on this line
                     for c in trimmed_next.chars() {
-                        if c == '{' { brace_depth += 1; }
-                        else if c == '}' { brace_depth -= 1; }
+                        if c == '{' {
+                            brace_depth += 1;
+                        } else if c == '}' {
+                            brace_depth -= 1;
+                        }
                     }
                     out.push_str(&next_line);
                     out.push('\n');
@@ -645,15 +668,21 @@ fn esm_to_cjs(source: &str, resolve: impl Fn(&str) -> String) -> String {
                 out.push('\n');
                 let mut brace_depth: i32 = 0;
                 for c in body.chars() {
-                    if c == '{' { brace_depth += 1; }
-                    else if c == '}' { brace_depth -= 1; }
+                    if c == '{' {
+                        brace_depth += 1;
+                    } else if c == '}' {
+                        brace_depth -= 1;
+                    }
                 }
                 while pos < len && brace_depth > 0 {
                     let next_line = read_line(&mut pos);
                     let trimmed_next = next_line.trim();
                     for c in trimmed_next.chars() {
-                        if c == '{' { brace_depth += 1; }
-                        else if c == '}' { brace_depth -= 1; }
+                        if c == '{' {
+                            brace_depth += 1;
+                        } else if c == '}' {
+                            brace_depth -= 1;
+                        }
                     }
                     out.push_str(&next_line);
                     out.push('\n');
@@ -675,7 +704,13 @@ fn esm_to_cjs(source: &str, resolve: impl Fn(&str) -> String) -> String {
         if let Some(rest) = trimmed.strip_prefix("export ") {
             if rest.starts_with("const ") || rest.starts_with("let ") || rest.starts_with("var ") {
                 let ws = leading_ws(&line);
-                let var_kw = if rest.starts_with("const ") { "const " } else if rest.starts_with("let ") { "let " } else { "var " };
+                let var_kw = if rest.starts_with("const ") {
+                    "const "
+                } else if rest.starts_with("let ") {
+                    "let "
+                } else {
+                    "var "
+                };
                 let after_kw = rest.strip_prefix(var_kw).unwrap_or("");
                 let names = after_kw.split('=').next().unwrap_or("").trim();
                 out.push_str(&format!("{ws}{rest}\n"));
@@ -699,7 +734,9 @@ fn esm_to_cjs(source: &str, resolve: impl Fn(&str) -> String) -> String {
                 let src = extract_quoted_string(raw);
                 let resolved = resolve(&src);
                 let ws = leading_ws(&line);
-                out.push_str(&format!("{ws}Object.assign(exports, require({resolved:?}));\n"));
+                out.push_str(&format!(
+                    "{ws}Object.assign(exports, require({resolved:?}));\n"
+                ));
                 continue;
             }
             // export { a, b } from "x"
@@ -712,9 +749,15 @@ fn esm_to_cjs(source: &str, resolve: impl Fn(&str) -> String) -> String {
                         let raw = after[from_pos + 6..].trim().trim_end_matches(';');
                         let src = extract_quoted_string(raw);
                         let resolved = resolve(&src);
-                        let name_list: String = names.split(',').map(|s| s.trim()).collect::<Vec<_>>().join(", ");
+                        let name_list: String = names
+                            .split(',')
+                            .map(|s| s.trim())
+                            .collect::<Vec<_>>()
+                            .join(", ");
                         let ws = leading_ws(&line);
-                        out.push_str(&format!("{ws}const {{ {name_list} }} = require({resolved:?});\n"));
+                        out.push_str(&format!(
+                            "{ws}const {{ {name_list} }} = require({resolved:?});\n"
+                        ));
                         continue;
                     }
                 }
@@ -739,10 +782,7 @@ fn emit_bundle(modules: &BTreeMap<String, BundleModule>, entry_id: &str) -> Stri
     output.push_str("var __map = ");
     let mut map = serde_json::Map::new();
     for (id, modl) in modules {
-        map.insert(
-            id.clone(),
-            serde_json::Value::String(modl.source.clone()),
-        );
+        map.insert(id.clone(), serde_json::Value::String(modl.source.clone()));
     }
     output.push_str(&serde_json::to_string(&map).unwrap_or_default());
     output.push_str(";\n");
@@ -1197,8 +1237,12 @@ Widget();
     fn format_paths_supports_js_with_directive_and_jsx() {
         let tmp = tmp_dir("fmt-jsx");
         let file = jsx_js_file(&tmp);
-        let report = format_paths(&tmp, std::slice::from_ref(&file), FormatOptions { check: true })
-            .expect("format_paths should parse jsx js fixture");
+        let report = format_paths(
+            &tmp,
+            std::slice::from_ref(&file),
+            FormatOptions { check: true },
+        )
+        .expect("format_paths should parse jsx js fixture");
 
         assert_no_parser_blocking_diagnostics(&report.diagnostics);
         std::fs::remove_dir_all(&tmp).ok();
@@ -1208,8 +1252,8 @@ Widget();
     fn lint_paths_supports_js_with_directive_and_jsx() {
         let tmp = tmp_dir("lint-jsx");
         let file = jsx_js_file(&tmp);
-        let report =
-            lint_paths(&tmp, std::slice::from_ref(&file)).expect("lint_paths should parse jsx js fixture");
+        let report = lint_paths(&tmp, std::slice::from_ref(&file))
+            .expect("lint_paths should parse jsx js fixture");
 
         assert_no_parser_blocking_diagnostics(&report.diagnostics);
         std::fs::remove_dir_all(&tmp).ok();

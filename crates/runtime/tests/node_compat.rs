@@ -807,18 +807,40 @@ console.log([
     // and that `_handle` exists in both paths.
     let output = out.borrow();
     let parts: Vec<&str> = output.trim().split(':').collect();
-    assert_eq!(parts.len(), 4, "expected 4 colon-delimited fields, got {output:?}");
+    assert_eq!(
+        parts.len(),
+        4,
+        "expected 4 colon-delimited fields, got {output:?}"
+    );
     if parts[0] == "Duplex" {
         // Non-TTY: polyfill path — io.stdin.setRaw must be in the source
-        assert_eq!(parts[1], "undefined", "expected undefined _handle.setRawMode in Duplex path");
-        assert_eq!(parts[2], "false", "expected no _handle.setRawMode in Duplex path");
-        assert_eq!(parts[3], "true", "expected io.stdin.setRaw in setRawMode source for Duplex path");
+        assert_eq!(
+            parts[1], "undefined",
+            "expected undefined _handle.setRawMode in Duplex path"
+        );
+        assert_eq!(
+            parts[2], "false",
+            "expected no _handle.setRawMode in Duplex path"
+        );
+        assert_eq!(
+            parts[3], "true",
+            "expected io.stdin.setRaw in setRawMode source for Duplex path"
+        );
     } else if parts[0] == "ReadStream" {
         // TTY: real handle path — _handle.setRawMode is a native function,
         // io.stdin.setRaw fallback not needed
-        assert_eq!(parts[1], "function", "expected function _handle.setRawMode in TTY path");
-        assert_eq!(parts[2], "true", "expected _handle.setRawMode in source for TTY path");
-        assert_eq!(parts[3], "false", "expected no io.stdin.setRaw in source for TTY path");
+        assert_eq!(
+            parts[1], "function",
+            "expected function _handle.setRawMode in TTY path"
+        );
+        assert_eq!(
+            parts[2], "true",
+            "expected _handle.setRawMode in source for TTY path"
+        );
+        assert_eq!(
+            parts[3], "false",
+            "expected no io.stdin.setRaw in source for TTY path"
+        );
     } else {
         panic!("unexpected constructor name: {}", parts[0]);
     }

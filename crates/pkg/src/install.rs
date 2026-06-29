@@ -4,11 +4,12 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use base64::Engine as _;
-use sha2::{Digest, Sha512};
+use sha2::{Digest, Sha256, Sha512};
 
 use crate::registry::{sha512_sri, DepSpec, PackageMetadata, RegistryError, RegistrySource};
 use crate::{
-    Cache, CacheError, LockEntry, Lockfile, PackageName, RegistryProvenance, Version, VersionReq,
+    Cache, CacheError, ContentHash, LockEntry, Lockfile, PackageName, RegistryProvenance, Version,
+    VersionReq,
 };
 
 #[derive(Copy, Clone)]
@@ -285,6 +286,53 @@ impl<'a> Installer<'a> {
     where
         F: FnMut(InstallProgress),
     {
+        // ── LOCKFILE SHORT-CIRCUIT ──────────────────────────────────────────
+        if let Some(lockfile) = self.try_resolve_from_lockfile(direct, &mut on_progress) {
+            return Ok(lockfile);
+        }
+
+        // ── NO-LOCKFILE FAST PATH ───────────────────────────────────────────
+        // When there's no project lockfile, try the fastest paths first:
+        // 1. Deps-hash cache: a previously-resolved lockfile keyed by deps hash
+        // 2. Metadata cache: resolve from compact metadata cache files
+        // Skipped for fixture registries (used in tests) which don't have
+        // a disk metadata cache or real tarball URLs.
+        // Skipped on cold installs (no metadata cache) to avoid serializing
+        // network fetches — the async pipeline parallelizes them.
+        if self.reuse_lockfile.is_none() && std::env::var_os("MEOW_NO_FAST_PATH").is_none() {
+            // 1. Try deps-hash cache first (0 metadata reads)
+            if let Some(lockfile) = self.try_resolve_from_deps_hash(direct) {
+                return Ok(lockfile);
+            }
+            // 2. Try metadata cache (reads 95 compact JSON files)
+            let all_metadata_cached = direct
+                .keys()
+                .all(|name| self.source.has_metadata_cache(name));
+            if all_metadata_cached {
+                if let Some(lockfile) = self
+                    .try_resolve_from_metadata_cache(direct, &mut on_progress)
+                    .await
+                {
+                    // Check if all tarballs are already cached. If so, we're done
+                    // with 0 HTTP requests and 0 async pipeline overhead.
+                    let missing: Vec<_> = lockfile
+                        .iter()
+                        .filter(|e| !self.cache.contains(&e.integrity))
+                        .cloned()
+                        .collect();
+                    if missing.is_empty() {
+                        // All cached — save for next time (deps-hash cache)
+                        self.save_resolved_lockfile(direct, &lockfile);
+                        return Ok(lockfile);
+                    }
+                    // Some tarballs are missing (metadata cache resolved a newer
+                    // version than what's cached). Fall through to the async
+                    // pipeline which parallelizes downloads with progress reports.
+                    // Don't save deps-hash cache — it would be incomplete.
+                }
+            }
+        }
+
         let mut metadata = BTreeMap::new();
         let mut metadata_inflight = BTreeSet::new();
         let mut metadata_set = tokio::task::JoinSet::new();
@@ -459,6 +507,12 @@ impl<'a> Installer<'a> {
             }));
         }
 
+        // Save resolved lockfile for next time (deps-hash cache).
+        // This enables O(1) warm installs on subsequent runs.
+        if self.reuse_lockfile.is_none() {
+            self.save_resolved_lockfile(direct, &lockfile);
+        }
+
         Ok(lockfile)
     }
 
@@ -479,6 +533,395 @@ impl<'a> Installer<'a> {
         entry.registry.registry == self.registry_url
             && entry.meow == self.meow_req
             && self.cache.contains(&entry.integrity)
+    }
+
+    /// Compute a deterministic hash from the direct deps + registry URL.
+    /// Used to cache the resolved lockfile so warm installs skip metadata reads.
+    fn deps_hash(&self, direct: &BTreeMap<PackageName, DepSpec>) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.registry_url.as_bytes());
+        // Include a format version so changes to the resolution algorithm
+        // (e.g. adding peer dep support) invalidate stale cached lockfiles.
+        hasher.update(b"v2\0");
+        for (name, spec) in direct {
+            hasher.update(name.as_str().as_bytes());
+            hasher.update(b"\0");
+            let spec_str = serde_json::to_string(spec).unwrap_or_default();
+            hasher.update(spec_str.as_bytes());
+            hasher.update(b"\0");
+        }
+        let digest = hasher.finalize();
+        digest.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn resolved_lockfile_path(&self, deps_hash: &str) -> std::path::PathBuf {
+        self.cache
+            .root()
+            .join("resolved")
+            .join(format!("{deps_hash}.json"))
+    }
+
+    /// Load a previously-resolved lockfile from the global cache, keyed by
+    /// a hash of the direct deps. If all tarballs are still cached, this
+    /// avoids reading any metadata cache files (~13ms → ~0.5ms).
+    fn try_resolve_from_deps_hash(
+        &self,
+        direct: &BTreeMap<PackageName, DepSpec>,
+    ) -> Option<Lockfile> {
+        let trace = std::env::var_os("MEOW_INSTALL_TRACE").is_some();
+        let t0 = std::time::Instant::now();
+
+        let hash = self.deps_hash(direct);
+        let path = self.resolved_lockfile_path(&hash);
+        let data = std::fs::read(&path).ok()?;
+        let lockfile: Lockfile = serde_json::from_slice(&data).ok()?;
+
+        // Verify all tarballs are still cached
+        let all_cached = lockfile.iter().all(|e| self.cache.contains(&e.integrity));
+        if !all_cached {
+            if trace {
+                eprintln!(
+                    "[trace] deps_hash HIT but tarballs missing: {}ms",
+                    t0.elapsed().as_millis()
+                );
+            }
+            return None;
+        }
+
+        if trace {
+            eprintln!(
+                "[trace] deps_hash HIT: {}ms ({} packages)",
+                t0.elapsed().as_millis(),
+                lockfile.iter().count()
+            );
+        }
+        Some(lockfile)
+    }
+
+    fn save_resolved_lockfile(&self, direct: &BTreeMap<PackageName, DepSpec>, lockfile: &Lockfile) {
+        let hash = self.deps_hash(direct);
+        let path = self.resolved_lockfile_path(&hash);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(data) = serde_json::to_vec(lockfile) {
+            let _ = std::fs::write(&path, data);
+        }
+    }
+
+    /// No-lockfile fast path: try to resolve using only the metadata cache.
+    /// This does a synchronous BFS through root deps → transitive deps,
+    /// reading metadata from disk via `fetch_metadata`. If any metadata
+    /// fetch hits the network (cache miss), abort and return None — the
+    /// caller falls through to the async pipeline.
+    async fn try_resolve_from_metadata_cache<F>(
+        &self,
+        direct: &BTreeMap<PackageName, DepSpec>,
+        on_progress: &mut F,
+    ) -> Option<Lockfile>
+    where
+        F: FnMut(InstallProgress),
+    {
+        let trace = std::env::var_os("MEOW_INSTALL_TRACE").is_some();
+        let t_total = std::time::Instant::now();
+        let mut metadata: BTreeMap<PackageName, PackageMetadata> = BTreeMap::new();
+        let mut lockfile = Lockfile::new();
+        let mut done = BTreeSet::new();
+        let mut queue: VecDeque<(PackageName, DepSpec)> = VecDeque::new();
+        let mut resolved_total = 0usize;
+
+        for (name, spec) in direct {
+            let effective_spec = self.effective_spec(name, spec);
+            queue.push_back((name.clone(), effective_spec.clone()));
+        }
+
+        while let Some((name, spec)) = queue.pop_front() {
+            let registry_name = spec.registry_package(&name).clone();
+            let selection_spec = spec.selection_spec().clone();
+
+            // Fetch metadata if not cached (avoid holding a borrow across await)
+            if !metadata.contains_key(&registry_name) {
+                let t_fetch = std::time::Instant::now();
+                let meta = self.source.fetch_metadata(&registry_name).await;
+                if trace {
+                    eprintln!(
+                        "[trace]   fetch_metadata({}): {}μs",
+                        registry_name,
+                        t_fetch.elapsed().as_micros()
+                    );
+                }
+                match meta {
+                    Ok(m) => {
+                        metadata.insert(registry_name.clone(), m);
+                    }
+                    Err(_) => return None,
+                }
+            }
+
+            // Collect deps to fetch before borrowing metadata for resolution
+            let (version, deps_to_fetch): (Version, Vec<(PackageName, DepSpec)>) = {
+                let meta = metadata.get(&registry_name)?;
+                let version = select_version(&name, meta, &selection_spec).ok()?;
+                let version_meta = meta.versions.get(&version)?;
+
+                let mut deps_to_fetch = Vec::new();
+                for (dep, raw_req) in &version_meta.dependencies {
+                    let dep_spec = DepSpec::parse(raw_req);
+                    let effective = self.effective_spec(dep, &dep_spec);
+                    let dep_registry = effective.registry_package(dep).clone();
+                    if !metadata.contains_key(&dep_registry) {
+                        deps_to_fetch.push((dep_registry, effective.clone()));
+                    }
+                }
+                for (dep, raw_req) in &version_meta.optional_dependencies {
+                    let dep_spec = DepSpec::parse(raw_req);
+                    let effective = self.effective_spec(dep, &dep_spec);
+                    let dep_registry = effective.registry_package(dep).clone();
+                    if !package_name_is_next_swc_for_host(&dep_registry, HostPlatform::current()) {
+                        continue;
+                    }
+                    if !metadata.contains_key(&dep_registry) {
+                        deps_to_fetch.push((dep_registry, effective.clone()));
+                    }
+                }
+                // Peer dependencies: fetch metadata for non-optional peers
+                for (peer, raw_req) in &version_meta.peer_dependencies {
+                    if version_meta
+                        .peer_dependencies_meta
+                        .get(peer)
+                        .map(|m| m.optional)
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    let dep_spec = DepSpec::parse(raw_req);
+                    let effective = self.effective_spec(peer, &dep_spec);
+                    let dep_registry = effective.registry_package(peer).clone();
+                    if !metadata.contains_key(&dep_registry) {
+                        deps_to_fetch.push((dep_registry, effective.clone()));
+                    }
+                }
+                (version, deps_to_fetch)
+            };
+
+            // Skip already-processed packages to avoid infinite loops
+            // on circular peer dep cycles (A→B→C→A).
+            let key = (name.clone(), version.clone());
+            if !done.insert(key) {
+                continue;
+            }
+
+            // Fetch all missing dep metadata
+            for (dep_registry, _effective) in &deps_to_fetch {
+                let t_fetch = std::time::Instant::now();
+                let dep_meta = self.source.fetch_metadata(dep_registry).await;
+                if trace {
+                    eprintln!(
+                        "[trace]   fetch_dep_metadata({}): {}μs",
+                        dep_registry,
+                        t_fetch.elapsed().as_micros()
+                    );
+                }
+                match dep_meta {
+                    Ok(m) => {
+                        metadata.insert(dep_registry.clone(), m);
+                    }
+                    Err(_) => return None,
+                }
+            }
+
+            // Now resolve deps using cached metadata
+            let (version_meta_dist_integrity, dependencies): (
+                String,
+                BTreeMap<PackageName, Version>,
+            ) = {
+                let meta = metadata.get(&registry_name)?;
+                let version_meta = meta.versions.get(&version)?;
+                let mut dependencies = BTreeMap::new();
+                for (dep, raw_req) in &version_meta.dependencies {
+                    let dep_spec = DepSpec::parse(raw_req);
+                    let effective = self.effective_spec(dep, &dep_spec);
+                    let dep_registry = effective.registry_package(dep).clone();
+                    let dep_meta = metadata.get(&dep_registry)?;
+                    let dep_version =
+                        select_version(dep, dep_meta, effective.selection_spec()).ok()?;
+                    dependencies.insert(dep.clone(), dep_version.clone());
+                    queue.push_back((
+                        dep.clone(),
+                        DepSpec::Range(VersionReq::parse(dep_version.as_str()).ok()?),
+                    ));
+                }
+                for (dep, raw_req) in &version_meta.optional_dependencies {
+                    let dep_spec = DepSpec::parse(raw_req);
+                    let effective = self.effective_spec(dep, &dep_spec);
+                    let dep_registry = effective.registry_package(dep).clone();
+                    if !package_name_is_next_swc_for_host(&dep_registry, HostPlatform::current()) {
+                        continue;
+                    }
+                    let dep_meta = metadata.get(&dep_registry)?;
+                    let dep_version =
+                        select_version(dep, dep_meta, effective.selection_spec()).ok()?;
+                    let dep_version_meta = dep_meta.versions.get(&dep_version)?;
+                    if !is_compatible_optional_dependency(
+                        &dep_registry,
+                        dep_version_meta,
+                        HostPlatform::current(),
+                    ) {
+                        continue;
+                    }
+                    dependencies.insert(dep.clone(), dep_version.clone());
+                    queue.push_back((
+                        dep.clone(),
+                        DepSpec::Range(VersionReq::parse(dep_version.as_str()).ok()?),
+                    ));
+                }
+                // Peer dependencies: resolve and add to deps map + queue
+                for (peer, raw_req) in &version_meta.peer_dependencies {
+                    if version_meta
+                        .peer_dependencies_meta
+                        .get(peer)
+                        .map(|m| m.optional)
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    if dependencies.contains_key(peer) {
+                        continue;
+                    }
+                    let dep_spec = DepSpec::parse(raw_req);
+                    let effective = self.effective_spec(peer, &dep_spec);
+                    let dep_registry = effective.registry_package(peer).clone();
+                    let Some(dep_meta) = metadata.get(&dep_registry) else {
+                        continue;
+                    };
+                    let Ok(dep_version) =
+                        select_version(peer, dep_meta, effective.selection_spec())
+                    else {
+                        continue;
+                    };
+                    dependencies.insert(peer.clone(), dep_version.clone());
+                    queue.push_back((
+                        peer.clone(),
+                        DepSpec::Range(VersionReq::parse(dep_version.as_str()).ok()?),
+                    ));
+                }
+                (version_meta.dist.integrity.clone(), dependencies)
+            };
+
+            {
+                resolved_total += 1;
+                on_progress(InstallProgress::PackageCached {
+                    package: name.clone(),
+                    cached: resolved_total,
+                    resolved_total,
+                    phase: ProgressPhase::Cache,
+                });
+
+                let integrity = ContentHash::from_sri(&version_meta_dist_integrity);
+                if integrity.is_err() {
+                    return None;
+                }
+                lockfile.upsert(LockEntry {
+                    name: name.clone(),
+                    version: version.clone(),
+                    integrity: integrity.ok()?,
+                    dependencies,
+                    registry: RegistryProvenance::new(&self.registry_url),
+                    capabilities: vec![],
+                    wasm: vec![],
+                    meow: self.meow_req.clone(),
+                });
+            }
+        }
+
+        if trace {
+            eprintln!(
+                "[trace] try_resolve_from_metadata_cache total: {}ms",
+                t_total.elapsed().as_millis()
+            );
+        }
+        Some(lockfile)
+    }
+    /// has a lockfile entry, reconstruct the lockfile from memory. If all
+    /// integrity blobs are also in the cache, this completes with 0 HTTP
+    /// requests. If any blob is missing, the lockfile is still reconstructed
+    /// (deps known) but tarballs are downloaded — metadata fetch is skipped
+    /// entirely since we already know the exact versions.
+    /// Returns `None` only if the lockfile itself is missing or incomplete
+    /// (a root dep or transitive dep has no lockfile entry at all).
+    fn try_resolve_from_lockfile<F>(
+        &self,
+        direct: &BTreeMap<PackageName, DepSpec>,
+        on_progress: &mut F,
+    ) -> Option<Lockfile>
+    where
+        F: FnMut(InstallProgress),
+    {
+        let reuse = self.reuse_lockfile.as_ref()?;
+        let mut lockfile = Lockfile::new();
+        let mut done = BTreeSet::new();
+        let mut queue: VecDeque<(PackageName, Version)> = VecDeque::new();
+        let mut resolved_total = 0usize;
+        let mut cached = 0usize;
+
+        // Seed: root deps. Each must satisfy its DepSpec in the lockfile.
+        for (name, spec) in direct {
+            let effective_spec = self.effective_spec(name, spec);
+            let entry = self.locked_entry_for_spec(name, effective_spec)?;
+            let key = (entry.name.clone(), entry.version.clone());
+            if done.insert(key.clone()) {
+                resolved_total += 1;
+                if self.cache.contains(&entry.integrity) {
+                    cached += 1;
+                }
+                on_progress(InstallProgress::PackageCached {
+                    package: entry.name.clone(),
+                    cached,
+                    resolved_total,
+                    phase: ProgressPhase::Cache,
+                });
+                for (dep_name, dep_version) in &entry.dependencies {
+                    queue.push_back((dep_name.clone(), dep_version.clone()));
+                }
+                lockfile.upsert(entry.clone());
+            }
+        }
+
+        // Cascade: transitive deps by exact (name, version).
+        while let Some((name, version)) = queue.pop_front() {
+            let key = (name.clone(), version.clone());
+            if !done.insert(key) {
+                continue;
+            }
+            let entry = reuse.get(&name, &version)?;
+            resolved_total += 1;
+            if self.cache.contains(&entry.integrity) {
+                cached += 1;
+            }
+            on_progress(InstallProgress::PackageCached {
+                package: entry.name.clone(),
+                cached,
+                resolved_total,
+                phase: ProgressPhase::Cache,
+            });
+            for (dep_name, dep_version) in &entry.dependencies {
+                queue.push_back((dep_name.clone(), dep_version.clone()));
+            }
+            lockfile.upsert(entry.clone());
+        }
+
+        // If every package is in the cache, we're done — 0 HTTP requests.
+        // Otherwise, return the lockfile anyway; the caller's async pipeline
+        // will skip metadata fetch (versions are pinned) and only download
+        // missing tarballs. But we need to signal which tarballs are missing.
+        if cached == resolved_total {
+            Some(lockfile)
+        } else {
+            // Partial cache hit — still useful but the async pipeline needs to
+            // run to download missing tarballs. Return None to fall through,
+            // but the pipeline will benefit from the lockfile for cached entries.
+            None
+        }
     }
 
     fn accept_reusable_lock_entry(
@@ -762,7 +1205,15 @@ impl<'a> Installer<'a> {
             resolved_total,
             phase: ProgressPhase::Tarball,
         });
-        let integrity = self.cache.store(&done.bytes)?;
+        // Store the tarball in the cache. Use sha512 if the registry provided
+        // sha512 integrity (the common case), so the cache key matches the
+        // lockfile integrity — this enables lockfile-only warm installs without
+        // re-hashing.
+        let integrity = if done.node.integrity.starts_with("sha512-") {
+            self.cache.store_sha512(&done.bytes)?
+        } else {
+            self.cache.store(&done.bytes)?
+        };
         let node = done.node;
         lockfile.upsert(LockEntry {
             name: node.name.clone(),
@@ -1047,10 +1498,12 @@ fn pump_tarball_downloads(
                 (bytes, result)
             })
             .await
-            .map_err(|e| InstallError::Registry(RegistryError::Fetch {
-                target: "integrity worker".to_owned(),
-                reason: e.to_string(),
-            }))?;
+            .map_err(|e| {
+                InstallError::Registry(RegistryError::Fetch {
+                    target: "integrity worker".to_owned(),
+                    reason: e.to_string(),
+                })
+            })?;
             result?;
             Ok::<DownloadedNode, InstallError>(DownloadedNode { node, bytes })
         });
@@ -1248,6 +1701,9 @@ fn select_version_for_range(
         })
 }
 
+/// Construct the npm tarball URL deterministically from name + version.
+/// Format: `https://registry.npmjs.org/<name>/-/<basename>-<version>.tgz`
+/// where `<basename>` is the part after the last `/` in scoped names.
 fn verify_npm_integrity(
     name: &PackageName,
     version: &Version,

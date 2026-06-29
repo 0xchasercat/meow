@@ -82,6 +82,20 @@ impl ProgressBar {
         self.repaint();
     }
 
+    /// Set current and total without allocating a label string.
+    /// Used when animation is off (non-tty) to avoid per-event `format!` cost.
+    pub fn update_counts(&mut self, current: u64, total: u64) {
+        self.current = current;
+        self.total = total;
+        self.repaint();
+    }
+
+    /// Whether this bar is animating (tty). Callers use this to skip
+    /// label-string allocation when the bar won't repaint anyway.
+    pub fn animate(&self) -> bool {
+        self.animate
+    }
+
     fn repaint(&self) {
         if !self.animate {
             return;
