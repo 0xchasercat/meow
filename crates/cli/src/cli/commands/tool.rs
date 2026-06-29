@@ -2,7 +2,6 @@
 //! Lint/fmt/bundle delegate to `meow-tool`; `check` shells out to `tsc` over the
 //! shadow config and renders diagnostics through meow-ui.
 
-use std::path::PathBuf;
 use std::process::ExitCode;
 
 use crate::cli::{find_project_root, hiss, purr, ui, BundleArgs, FmtArgs, PathArgs};
@@ -134,7 +133,7 @@ pub fn cmd_bundle(args: &BundleArgs) -> ExitCode {
         }
     };
 
-    let result: Result<Vec<PathBuf>, String> = async_rt.block_on(async {
+    let result: Result<meow_tool::BundleReport, String> = async_rt.block_on(async {
         let ctx = build_runtime_context(&root, false).map_err(|e| e.to_string())?;
         let resolver = meow_loader::Resolver::from_resolution(
             &ctx.graph,
@@ -142,21 +141,19 @@ pub fn cmd_bundle(args: &BundleArgs) -> ExitCode {
             ctx.project_root.clone(),
             meow_runtime::native::native_module_registry(),
         );
-        meow_tool::bundle_entries(&resolver, &root, &plan.entries, &out_dir)
+        meow_tool::execute_bundle(resolver, &root, &plan.entries, &out_dir)
+            .await
             .map_err(|e| e.to_string())
     });
 
     match result {
-        Ok(files) => {
-            let file_list: Vec<String> = files
-                .iter()
-                .map(|f| f.to_string_lossy().into_owned())
-                .collect();
+        Ok(report) => {
+            let chunk_count = report.emitted.len();
             purr(&format!(
-                "meow bundle: wrote {} file{} — {}",
-                files.len(),
-                if files.len() == 1 { "" } else { "s" },
-                file_list.join(", "),
+                "meow bundle: Emitted {} chunk{} to {}",
+                chunk_count,
+                if chunk_count == 1 { "" } else { "s" },
+                report.out_dir.display(),
             ));
             ExitCode::SUCCESS
         }

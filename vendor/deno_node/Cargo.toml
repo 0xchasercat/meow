@@ -51,22 +51,22 @@ features = ["ffi-api"]
 version = "1.11.1"
 
 [dependencies.oxc_allocator]
-version = "0.134"
+version = "0.137"
 
 [dependencies.oxc_codegen]
-version = "0.134"
+version = "0.137"
 
 [dependencies.oxc_parser]
-version = "0.134"
+version = "0.137"
 
 [dependencies.oxc_semantic]
-version = "0.134"
+version = "0.137"
 
 [dependencies.oxc_span]
-version = "0.134"
+version = "0.137"
 
 [dependencies.oxc_transformer]
-version = "0.134"
+version = "0.137"
 
 [dependencies.deno_core]
 version = "0.403.0"
