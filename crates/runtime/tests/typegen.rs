@@ -1,6 +1,5 @@
 //! RT-005 type-generation + editor-surface tests.
 
-use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,7 +10,7 @@ use meow_config::{
 };
 use meow_runtime::native::{native_module_declaration, NATIVE_MODULES};
 use meow_runtime::typegen::{
-    check_against_dir, emit_to_dir, locate_tsc, TypegenEnv, TypegenError, TypegenLayout,
+    check_against_dir, emit_to_dir, TscCommand, TypegenEnv, TypegenError, TypegenLayout,
 };
 
 fn unique_dir(tag: &str) -> PathBuf {
@@ -25,8 +24,6 @@ fn unique_dir(tag: &str) -> PathBuf {
 
 struct TypegenContext {
     workspace_root: PathBuf,
-    home_dir: PathBuf,
-    meow_tsc: Option<OsString>,
     compiler: PathBuf,
 }
 
@@ -34,10 +31,47 @@ impl TypegenContext {
     fn env(&self) -> TypegenEnv<'_> {
         TypegenEnv {
             project_root: &self.workspace_root,
-            home_dir: &self.home_dir,
-            meow_tsc: self.meow_tsc.as_deref(),
+            tsc_command: TscCommand::Direct(self.compiler.clone()),
         }
     }
+}
+
+/// Test-only tsc location: honor `MEOW_TSC`, then check `node_modules/.bin/tsc`
+/// in the workspace root, then fall back to a `PATH` lookup. Verifies the binary
+/// actually runs (`tsc --version`) before returning it. This is test
+/// infrastructure (not user-facing code), so a direct binary search is fine —
+/// the production CLI edge dogfoods `meow x tsc` instead.
+fn locate_tsc_for_tests(workspace_root: &Path) -> Option<PathBuf> {
+    fn works(path: &Path) -> bool {
+        std::process::Command::new(path)
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+    if let Some(raw) = meow_runtime::host::meow_tsc() {
+        let path = PathBuf::from(raw);
+        if path.is_file() && works(&path) {
+            return Some(path);
+        }
+    }
+    let project_tsc = workspace_root
+        .join("node_modules")
+        .join(".bin")
+        .join("tsc");
+    if project_tsc.is_file() && works(&project_tsc) {
+        return Some(project_tsc);
+    }
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths).find_map(|dir| {
+            let candidate = dir.join("tsc");
+            if candidate.is_file() && works(&candidate) {
+                Some(candidate)
+            } else {
+                None
+            }
+        })
+    })
 }
 
 fn typegen_context() -> Option<TypegenContext> {
@@ -47,22 +81,13 @@ fn typegen_context() -> Option<TypegenContext> {
         .parent()
         .expect("workspace root")
         .to_path_buf();
-    let home_dir = meow_runtime::host::home_dir();
-    let meow_tsc = meow_runtime::host::meow_tsc();
-    let env = TypegenEnv {
-        project_root: &workspace_root,
-        home_dir: &home_dir,
-        meow_tsc: meow_tsc.as_deref(),
-    };
-    match locate_tsc(&env) {
-        Ok(compiler) => Some(TypegenContext {
+    match locate_tsc_for_tests(&workspace_root) {
+        Some(compiler) => Some(TypegenContext {
             workspace_root,
-            home_dir,
-            meow_tsc,
             compiler,
         }),
-        Err(err) => {
-            eprintln!("skipping RT-005 typegen tests: {err}");
+        None => {
+            eprintln!("skipping RT-005 typegen tests: tsc not found");
             None
         }
     }

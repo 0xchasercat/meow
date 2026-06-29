@@ -4,7 +4,6 @@
 //! meow owns orchestration, normalization, and the freshness check, not a native
 //! `.d.ts` emitter (I-4 / I-9).
 
-use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -16,10 +15,37 @@ use crate::web::STRICT_WEB_DTS;
 
 pub const GENERATED_TYPES_HEADER: &str = "// GENERATED — do not edit (run: meow types)";
 
+/// How the CLI edge wants the library to invoke the TypeScript compiler.
+///
+/// The library stays free of host reads (I-6): it does not search
+/// `node_modules/.bin`, `$PATH`, or any npm cache. The CLI edge picks the
+/// strategy and hands it in.
+#[derive(Clone)]
+pub enum TscCommand {
+    /// Run a specific `tsc` binary directly (e.g. an explicit `MEOW_TSC` path).
+    Direct(PathBuf),
+    /// Dogfood the meow omni-router: `<exe> x tsc -- <tsc flags…>`.
+    /// `meow x tsc` resolves the compiler locally (if installed via
+    /// `meow add typescript`) or ephemerally — no `.bin` or `$PATH` search.
+    MeowX { exe: PathBuf },
+}
+
+impl TscCommand {
+    fn into_command(self) -> Command {
+        match self {
+            TscCommand::Direct(path) => Command::new(path),
+            TscCommand::MeowX { exe } => {
+                let mut cmd = Command::new(exe);
+                cmd.arg("x").arg("tsc").arg("--");
+                cmd
+            }
+        }
+    }
+}
+
 pub struct TypegenEnv<'a> {
     pub project_root: &'a Path,
-    pub home_dir: &'a Path,
-    pub meow_tsc: Option<&'a OsStr>,
+    pub tsc_command: TscCommand,
 }
 
 pub struct TypegenLayout<'a> {
@@ -29,12 +55,8 @@ pub struct TypegenLayout<'a> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum TypegenError {
-    #[error("MEOW_TSC points to {path}, but that compiler does not exist")]
-    InvalidCompilerOverride { path: PathBuf },
-    #[error(
-        "could not find the TypeScript compiler; set MEOW_TSC, install typescript in {project}, or use the npm npx cache under {cache}"
-    )]
-    MissingCompiler { project: PathBuf, cache: PathBuf },
+    #[error("could not spawn the TypeScript compiler: {source}")]
+    Spawn { #[source] source: io::Error },
     #[error("could not prepare {path}: {source}")]
     CreateDir {
         path: PathBuf,
@@ -61,51 +83,6 @@ pub enum TypegenError {
         "type declarations drifted for {files}; run `meow types --emit` and commit the result"
     )]
     Drift { files: String },
-}
-
-fn check_tsc_works(path: &Path) -> bool {
-    Command::new(path)
-        .arg("--version")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
-}
-
-pub fn locate_tsc(env: &TypegenEnv<'_>) -> Result<PathBuf, TypegenError> {
-    if let Some(raw) = env.meow_tsc {
-        let path = PathBuf::from(raw);
-        return path
-            .is_file()
-            .then_some(path.clone())
-            .ok_or(TypegenError::InvalidCompilerOverride { path });
-    }
-
-    let project_tsc = env
-        .project_root
-        .join("node_modules")
-        .join(".bin")
-        .join("tsc");
-    if project_tsc.is_file() && check_tsc_works(&project_tsc) {
-        return Ok(project_tsc);
-    }
-
-    let npx_root = env.home_dir.join(".npm").join("_npx");
-    if let Ok(entries) = fs::read_dir(&npx_root) {
-        let mut candidates = entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path().join("node_modules").join(".bin").join("tsc"))
-            .filter(|path| path.is_file() && check_tsc_works(path))
-            .collect::<Vec<_>>();
-        candidates.sort();
-        if let Some(path) = candidates.into_iter().next() {
-            return Ok(path);
-        }
-    }
-
-    Err(TypegenError::MissingCompiler {
-        project: env.project_root.to_path_buf(),
-        cache: npx_root,
-    })
 }
 
 pub fn emit_to_dir(
@@ -163,7 +140,7 @@ fn generate_module_types(
     env: &TypegenEnv<'_>,
     layout: &TypegenLayout<'_>,
 ) -> Result<Vec<(&'static str, String)>, TypegenError> {
-    let compiler = locate_tsc(env)?;
+    let mut compiler = env.tsc_command.clone().into_command();
     let scratch_guard = make_scratch_dir();
     let scratch = scratch_guard.0.as_path();
     let src_dir = scratch.join("src");
@@ -204,15 +181,12 @@ fn generate_module_types(
         source,
     })?;
 
-    let output = Command::new(&compiler)
+    let output = compiler
         .arg("-p")
         .arg(&tsconfig)
         .current_dir(scratch)
         .output()
-        .map_err(|source| TypegenError::Read {
-            path: compiler.clone(),
-            source,
-        })?;
+        .map_err(|source| TypegenError::Spawn { source })?;
     if !output.status.success() {
         return Err(TypegenError::TscFailed {
             stderr: decode_output(&output.stdout, &output.stderr),
