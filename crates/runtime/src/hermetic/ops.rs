@@ -43,6 +43,21 @@ pub fn op_hermetic_mono_ms(state: &mut OpState) -> f64 {
     hermetic_state(state).borrow().mono_ms()
 }
 
+/// Report whether the active config uses the virtual clock and/or seeded RNG.
+/// Called once at runtime init by `globalThis.__meowApplyHermeticShadows` to
+/// decide whether to shadow `Date`/`performance` (virtual clock) and
+/// `Math.random`/`crypto` (seeded RNG). When a real source is granted
+/// (`--trust` / `--allow-clock` / `--allow-random`), the corresponding
+/// shadows are skipped so V8's native intrinsics run unhindered — no FFI
+/// tax in hot loops.
+#[op2]
+#[serde]
+pub fn op_hermetic_status(state: &mut OpState) -> (bool, bool) {
+    let st = hermetic_state(state);
+    let st = st.borrow();
+    (st.is_virtual_clock(), st.is_seeded_rng())
+}
+
 /// Fill `buf` with bytes from the active randomness source. Backs
 /// `crypto.getRandomValues` and the one-time `Math.random` seed draw.
 #[op2(fast)]

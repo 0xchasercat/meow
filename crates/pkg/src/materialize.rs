@@ -1406,6 +1406,10 @@ fn normalize_path(path: &Path, mode: u32) -> Result<(), MaterializeError> {
         fs::set_permissions(path, fs::Permissions::from_mode(mode))
             .map_err(|source| MaterializeError::io(path, source))?;
     }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+    }
     set_fixed_times(path)
 }
 

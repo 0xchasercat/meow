@@ -124,6 +124,22 @@ impl HermeticState {
         }
     }
 
+    /// Whether the clock is the deterministic virtual clock (vs. a real grant).
+    /// Exposed so the JS shadow layer can skip rebinding `Date` / `performance`
+    /// entirely when the real clock is granted — V8's native intrinsics stay in
+    /// place and the FFI tax is avoided.
+    pub fn is_virtual_clock(&self) -> bool {
+        matches!(self.clock, ClockState::Virtual { .. })
+    }
+
+    /// Whether the RNG is the deterministic seeded stream (vs. OS entropy).
+    /// Exposed so the JS shadow layer can skip rebinding `Math.random` /
+    /// `crypto.getRandomValues` when OS entropy is granted — V8's native
+    /// `Math.random` stays in place.
+    pub fn is_seeded_rng(&self) -> bool {
+        matches!(self.rng, RngState::Seeded(_))
+    }
+
     /// Env lookup. Deny → `None`. Allow(set) → `Some(value)` iff `name ∈ set` and
     /// the host has it; else `None` (scoped, not all-or-nothing).
     pub fn env_get(&self, name: &str) -> Option<String> {

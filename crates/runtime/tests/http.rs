@@ -178,6 +178,9 @@ fn spawn_runtime(source: &str, policy: Policy) -> RuntimeThread {
             })
             .map_err(|err| err.to_string())?;
             runtime
+                .apply_hermetic_shadows()
+                .map_err(|err| err.to_string())?;
+            runtime
                 .run_main_module_from_source(&spec, source)
                 .await
                 .map_err(|err| err.to_string())

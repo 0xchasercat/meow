@@ -340,6 +340,7 @@ async fn run_entry(
         v8_flags: None,
     })
     .expect("runtime initializes");
+    rt.apply_hermetic_shadows().expect("hermetic shadows apply");
     let spec = ModuleSpecifier::from_file_path(entry).expect("entry → file URL");
     rt.run_main_module(&spec).await
 }

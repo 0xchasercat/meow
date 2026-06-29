@@ -319,6 +319,39 @@ impl Runtime {
         crate::node::refresh_bootstrap_state(&mut self.js_runtime, argv, main_module, cwd, env)
     }
 
+    /// Apply hermetic global shadows (`Date` / `Math.random` / `performance` /
+    /// `crypto`) if the active [`hermetic::HermeticConfig`] requires them.
+    ///
+    /// This MUST be called after [`Runtime::new`] (whether from a snapshot or
+    /// fresh) for the hermetic extension to take effect. The shadow logic lives
+    /// in `globalThis.__meowApplyHermeticShadows` (defined by `hermetic.js` at
+    /// module-eval time, so it survives snapshot restore) and is invoked here
+    /// at runtime so it reads the *runtime* config via `op_hermetic_status`,
+    /// not the snapshot-creation config.
+    ///
+    /// Under `--trust` / `--allow-clock` / `--allow-random`, the corresponding
+    /// shadows are skipped and V8's native intrinsics run unhindered -- no FFI
+    /// tax in hot loops. If the hermetic extension is not installed, this is a
+    /// no-op (the global is absent).
+    pub fn apply_hermetic_shadows(&mut self) -> Result<(), RuntimeError> {
+        // Fast path: if both the clock and RNG are real (e.g. --trust or
+        // node-compat mode), no shadows are needed. Skip the execute_script
+        // entirely — saves ~1-2ms of JS compile+eval on every run.
+        let op_state = self.js_runtime.op_state();
+        let needed = {
+            let state = op_state.borrow();
+            crate::hermetic::shadows_needed(&state)
+        };
+        if !needed {
+            return Ok(());
+        }
+        self.execute_script(
+            "hermetic_apply",
+            String::from("if (typeof globalThis.__meowApplyHermeticShadows === 'function') globalThis.__meowApplyHermeticShadows();"),
+        )?;
+        Ok(())
+    }
+
     /// The canonical deno_core dance: kick off evaluation, pump the event
     /// loop until the module resolves, then continue pumping for any
     /// lingering server/async work. An uncaught top-level throw / TLA

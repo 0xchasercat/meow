@@ -37,7 +37,7 @@ fn hermetic_runtime(cfg: HermeticConfig) -> (Rc<RefCell<String>>, Runtime) {
     let (out, sink_ext) = capture();
     let mut exts = extensions(cfg);
     exts.push(sink_ext);
-    let rt = Runtime::new(RuntimeOptions {
+    let mut rt = Runtime::new(RuntimeOptions {
         module_loader: real_loader::loader_for(&root),
         extensions: exts,
         max_heap_size: None,
@@ -47,6 +47,8 @@ fn hermetic_runtime(cfg: HermeticConfig) -> (Rc<RefCell<String>>, Runtime) {
         v8_flags: None,
     })
     .expect("runtime initializes with hermetic shadows");
+    rt.apply_hermetic_shadows()
+        .expect("hermetic shadows apply");
     (out, rt)
 }
 
@@ -224,7 +226,7 @@ fn web_hermetic_runtime(cfg: HermeticConfig) -> (Rc<RefCell<String>>, Runtime) {
     });
     exts.extend(extensions(cfg));
     exts.push(sink_ext);
-    let rt = Runtime::new(RuntimeOptions {
+    let mut rt = Runtime::new(RuntimeOptions {
         module_loader: real_loader::loader_for(&root),
         extensions: exts,
         max_heap_size: None,
@@ -234,6 +236,8 @@ fn web_hermetic_runtime(cfg: HermeticConfig) -> (Rc<RefCell<String>>, Runtime) {
         v8_flags: None,
     })
     .expect("runtime initializes with web + hermetic");
+    rt.apply_hermetic_shadows()
+        .expect("hermetic shadows apply");
     (out, rt)
 }
 

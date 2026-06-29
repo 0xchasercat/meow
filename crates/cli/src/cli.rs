@@ -2812,6 +2812,13 @@ async fn run_native_request(
         v8_flags: flags.v8_flags.map(|s| s.to_string()),
     })
     .map_err(|err| RunCommandError::Message(err.to_string()))?;
+    // Apply hermetic shadows (Date / Math.random / performance / crypto) if the
+    // active config requires them. Deferred to runtime init so snapshots keep
+    // V8's native intrinsics; under --trust the conditionals short-circuit and
+    // no FFI tax is paid in hot loops.
+    runtime
+        .apply_hermetic_shadows()
+        .map_err(|err| RunCommandError::Message(err.to_string()))?;
     // Refresh Node bootstrap state if we loaded from a snapshot.
     // The snapshot bakes in placeholder argv/cwd/env from snapshot-creation time.
     if startup_snapshot.is_some() {
@@ -4055,6 +4062,9 @@ async fn run_test_file_inner(root: &Path, file: &Path) -> Result<Vec<serde_json:
         v8_flags: None,
     })
     .map_err(|e| e.to_string())?;
+    runtime
+        .apply_hermetic_shadows()
+        .map_err(|e| e.to_string())?;
 
     let spec = meow_runtime::ModuleSpecifier::from_file_path(file)
         .map_err(|()| format!("invalid test file path: {}", file.display()))?;

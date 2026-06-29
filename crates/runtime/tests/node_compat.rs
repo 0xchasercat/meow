@@ -279,7 +279,7 @@ fn node_runtime(
     extensions.extend(hermetic::extensions(hermetic_cfg));
     extensions.push(sink);
 
-    let runtime = Runtime::new(RuntimeOptions {
+    let mut runtime = Runtime::new(RuntimeOptions {
         module_loader: loader,
         extensions,
         max_heap_size: None,
@@ -289,6 +289,9 @@ fn node_runtime(
         v8_flags: None,
     })
     .expect("runtime initializes");
+    runtime
+        .apply_hermetic_shadows()
+        .expect("hermetic shadows apply");
     (out, runtime)
 }
 
