@@ -2,10 +2,11 @@
 //! Lint/fmt/bundle delegate to `meow-tool`; `check` shells out to `tsc` over the
 //! shadow config and renders diagnostics through meow-ui.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use crate::cli::{find_project_root, hiss, purr, ui, BundleArgs, FmtArgs, PathArgs};
 use crate::cli::commands::run::build_runtime_context;
+use crate::cli::{find_project_root, hiss, purr, ui, BundleArgs, FmtArgs, PathArgs};
 
 // === TOOL-001 ===
 pub fn cmd_lint(args: &PathArgs) -> ExitCode {

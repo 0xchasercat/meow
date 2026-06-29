@@ -260,12 +260,15 @@ impl rolldown_plugin::Plugin for MeowResolverPlugin {
             }
 
             let referrer = self.referrer_url(args.importer)?;
-            let resolved = self.resolver.resolve(args.specifier, &referrer).map_err(|err| {
-                ToolError::Message(format!(
-                    "cannot resolve {} from {}: {err}",
-                    args.specifier, referrer
-                ))
-            })?;
+            let resolved = self
+                .resolver
+                .resolve(args.specifier, &referrer)
+                .map_err(|err| {
+                    ToolError::Message(format!(
+                        "cannot resolve {} from {}: {err}",
+                        args.specifier, referrer
+                    ))
+                })?;
             let path = resolved.url.to_file_path().map_err(|()| {
                 ToolError::Message(format!(
                     "rolldown resolved {} to unsupported URL {}",
@@ -359,7 +362,9 @@ pub async fn execute_bundle(
         dir: Some(out_dir.to_string_lossy().into_owned()),
         platform: Some(rolldown::Platform::Node),
         format: Some(rolldown::OutputFormat::Esm),
-        entry_filenames: Some(rolldown::ChunkFilenamesOutputOption::String("[name].js".into())),
+        entry_filenames: Some(rolldown::ChunkFilenamesOutputOption::String(
+            "[name].js".into(),
+        )),
         chunk_filenames: Some(rolldown::ChunkFilenamesOutputOption::String(
             "chunks/[name]-[hash].js".into(),
         )),
@@ -489,8 +494,8 @@ fn append_diagnostics(
         }
 
         for label in labels {
-            let start = label.offset();
-            let len = label.len();
+            let start: usize = label.offset().try_into().unwrap();
+            let len: usize = label.len().try_into().unwrap();
             let end = start.saturating_add(len);
             out.push(ToolDiagnostic {
                 path: path.to_path_buf(),
