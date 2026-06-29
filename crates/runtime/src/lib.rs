@@ -425,9 +425,9 @@ pub fn maybe_transpile_source(
             ..ParseOptions::default()
         })
         .parse();
-    if parsed.panicked || !parsed.errors.is_empty() {
+    if parsed.panicked || !parsed.diagnostics.is_empty() {
         let message = parsed
-            .errors
+            .diagnostics
             .into_iter()
             .map(|error| format!("{:?}", error.with_source_code(source_text.to_owned())))
             .collect::<Vec<_>>()
@@ -442,9 +442,9 @@ pub fn maybe_transpile_source(
         .with_excess_capacity(2.0)
         .with_enum_eval(true)
         .build(&program);
-    if !semantic.errors.is_empty() {
+    if !semantic.diagnostics.is_empty() {
         let message = semantic
-            .errors
+            .diagnostics
             .into_iter()
             .map(|error| format!("{:?}", error.with_source_code(source_text.to_owned())))
             .collect::<Vec<_>>()
@@ -463,9 +463,9 @@ pub fn maybe_transpile_source(
     };
     let transformed = Transformer::new(&allocator, &source_path, &transform_options)
         .build_with_scoping(semantic.semantic.into_scoping(), &mut program);
-    if !transformed.errors.is_empty() {
+    if !transformed.diagnostics.is_empty() {
         let message = transformed
-            .errors
+            .diagnostics
             .into_iter()
             .map(|error| format!("{:?}", error.with_source_code(source_text.to_owned())))
             .collect::<Vec<_>>()
