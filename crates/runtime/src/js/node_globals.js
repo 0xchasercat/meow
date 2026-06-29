@@ -551,7 +551,6 @@ if (globalThis.Deno) {
     }
   }
   if (processValue && typeof processValue === "object") {
-    meowPatchProcessTtyStreams(processValue);
     const originalExit = typeof processValue.exit === "function"
       ? processValue.exit.bind(processValue)
       : undefined;
@@ -790,6 +789,7 @@ globalThis.__meowRuntimeBootstrap = function () {
   meowApplyDenoNamespace(info);
   meowRunNodeBootstrap(info, false);
   meowApplyProcessBootstrapOverrides(info);
+  meowPatchProcessTtyStreams(processValue);
   meowSetupChildIpc();
 };
 
