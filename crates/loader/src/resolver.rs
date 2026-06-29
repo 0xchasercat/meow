@@ -491,7 +491,14 @@ impl Resolver {
             // === /RT-007 ===
             return self.locate_url(url);
         }
-        if specifier.starts_with("./") || specifier.starts_with("../") || specifier.starts_with('/')
+        if specifier.starts_with("./")
+            || specifier.starts_with("../")
+            || specifier.starts_with('/')
+            || specifier.starts_with("\\\\?\\")
+            || (specifier.len() >= 3
+                && specifier.as_bytes()[0].is_ascii_alphabetic()
+                && specifier.as_bytes()[1] == b':'
+                && (specifier.as_bytes()[2] == b'/' || specifier.as_bytes()[2] == b'\\'))
         {
             let joined = referrer
                 .join(specifier)
