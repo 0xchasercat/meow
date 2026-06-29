@@ -418,6 +418,24 @@ pub fn maybe_transpile_source(
     let source_path = source_path_for_oxc(specifier_str);
     let source_type = SourceType::from_path(&source_path)
         .unwrap_or_else(|_| source_type_from_specifier(specifier_str));
+    if source_type.is_typescript() {
+        let mut graph = meow_graph::GraphDb::new();
+        let file = graph.set_file_with_source_type(
+            source_path.clone(),
+            std::sync::Arc::<str>::from(source_text),
+            source_type,
+        );
+        if let Some(Err(diagnostics)) = graph.runtime_ir(file) {
+            let message = diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(deno_error::JsErrorBox::generic(format!(
+                "Oxc type stripping failed for {specifier_str}: {message}"
+            )));
+        }
+    }
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source_text, source_type)
         .with_options(ParseOptions {

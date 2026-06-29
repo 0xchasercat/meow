@@ -2266,6 +2266,16 @@ function setupChannel(
     if (!target.channel) {
       return;
     }
+    // Deno's npm/process-state bootstrap can arrive as a control payload before
+    // userland fork protocols such as jest-worker's numeric tuple messages. Do
+    // not surface control-like tuple wrappers to userland `message` listeners:
+    // Next's compiled jest-worker processChild rejects `[object Object]` as an
+    // unexpected request. Real user IPC tuples for these worker protocols start
+    // with a numeric opcode.
+    if (Array.isArray(msg) && msg.length === 1 && msg[0] && typeof msg[0] === "object") {
+      target.emit("internalMessage", msg[0], handle);
+      return;
+    }
     // serde_v8 deserializes objects with null prototype, but Node.js IPC
     // messages should have Object.prototype (as if from JSON.parse).
     if (serialization === "json") {

@@ -171,12 +171,12 @@ fn bundle_entry_is_skeleton_with_pending_wiring_message() {
     let stdout = String::from_utf8(out.stdout).expect("stdout utf8");
     let stdout_lc = stdout.to_lowercase();
     assert!(
-        stdout_lc.contains("wrote"),
-        "bundle success should mention 'wrote': {stdout:?}"
+        stdout_lc.contains("emitted 1 chunk"),
+        "bundle success should report emitted chunks: {stdout:?}"
     );
     assert!(
-        stdout_lc.contains("entry.js"),
-        "bundle output should name entry.js: {stdout:?}"
+        stdout_lc.contains("dist"),
+        "bundle output should name output directory: {stdout:?}"
     );
     assert!(
         dist.join("entry.js").is_file(),
