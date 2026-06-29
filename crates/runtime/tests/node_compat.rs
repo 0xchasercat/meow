@@ -449,8 +449,24 @@ async fn process_argv_cwd_and_platform_are_wired() {
     )
     .await
     .expect("module runs");
+    let platform = if cfg!(target_os = "macos") {
+        "darwin"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "windows") {
+        "win32"
+    } else {
+        "unknown"
+    };
+    let arch = if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else if cfg!(target_arch = "x86_64") {
+        "x64"
+    } else {
+        "unknown"
+    };
     let expected = format!(
-        "meow|{entry}|one|two\n{}\ndarwin:arm64\nnumber:number:string\n",
+        "meow|{entry}|one|two\n{}\n{platform}:{arch}\nnumber:number:string\n",
         proj.to_string_lossy()
     );
     assert_eq!(*out.borrow(), expected);
