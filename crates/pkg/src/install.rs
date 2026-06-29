@@ -21,43 +21,41 @@ struct HostPlatform {
 impl HostPlatform {
     fn current() -> HostPlatform {
         HostPlatform {
-            os: if cfg!(target_os = "macos") {
-                "darwin"
-            } else if cfg!(target_os = "ios") {
-                "ios"
-            } else if cfg!(target_os = "linux") {
-                "linux"
-            } else if cfg!(target_os = "windows") {
-                "win32"
-            } else if cfg!(target_os = "android") {
-                "android"
-            } else if cfg!(target_os = "freebsd") {
-                "freebsd"
-            } else if cfg!(target_os = "openbsd") {
-                "openbsd"
-            } else if cfg!(target_os = "netbsd") {
-                "netbsd"
-            } else if cfg!(target_os = "dragonfly") {
-                "dragonflybsd"
-            } else if cfg!(target_os = "solaris") {
-                "sunos"
-            } else {
-                "unknown"
-            },
-            cpu: if cfg!(target_arch = "x86_64") {
-                "x64"
-            } else if cfg!(target_arch = "aarch64") {
-                "arm64"
-            } else if cfg!(target_arch = "x86") {
-                "ia32"
-            } else if cfg!(target_arch = "arm") {
-                "arm"
-            } else if cfg!(target_arch = "riscv64") {
-                "riscv64"
-            } else {
-                "unknown"
-            },
+            os: runtime_os(),
+            cpu: runtime_cpu(),
         }
+    }
+}
+
+/// Detect the OS at **runtime** rather than compile time.
+/// `cfg!(target_os)` reflects the build host, not the runtime host —
+/// a binary built on macOS and run on Linux would misdetect as "darwin".
+fn runtime_os() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "darwin",
+        "ios" => "ios",
+        "linux" => "linux",
+        "windows" => "win32",
+        "android" => "android",
+        "freebsd" => "freebsd",
+        "openbsd" => "openbsd",
+        "netbsd" => "netbsd",
+        "dragonfly" => "dragonflybsd",
+        "solaris" => "sunos",
+        _ => "unknown",
+    }
+}
+
+/// Detect the CPU architecture at **runtime**.
+/// `cfg!(target_arch)` reflects the build host, not the runtime host.
+fn runtime_cpu() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        "x86" => "ia32",
+        "arm" => "arm",
+        "riscv64" => "riscv64",
+        _ => "unknown",
     }
 }
 
