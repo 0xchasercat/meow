@@ -69,6 +69,41 @@ function def(name, value, enumerable = false) {
 
 const processValue = processModule?.default ?? processModule;
 let meowCwd = "";
+
+function meowPatchProcessTtyStreams(processValue) {
+  const columns = Number(processValue?.env?.COLUMNS ?? 80) || 80;
+  const rows = Number(processValue?.env?.LINES ?? 24) || 24;
+  for (const stream of [processValue?.stdout, processValue?.stderr]) {
+    if (!stream || typeof stream !== "object") continue;
+    if (typeof stream.isTTY !== "boolean") {
+      Object.defineProperty(stream, "isTTY", {
+        value: false,
+        writable: true,
+        configurable: true,
+      });
+    }
+    if (typeof stream.columns !== "number") {
+      Object.defineProperty(stream, "columns", {
+        value: columns,
+        writable: true,
+        configurable: true,
+      });
+    }
+    if (typeof stream.rows !== "number") {
+      Object.defineProperty(stream, "rows", {
+        value: rows,
+        writable: true,
+        configurable: true,
+      });
+    }
+    if (typeof stream.getColorDepth !== "function") {
+      stream.getColorDepth = () => 24;
+    }
+    if (typeof stream.hasColors !== "function") {
+      stream.hasColors = () => true;
+    }
+  }
+}
 if (bootstrapInfo.env && typeof bootstrapInfo.env === "object") {
   Object.defineProperty(globalThis, "__MEOW_BOOTSTRAP_ENV__", {
     value: { ...bootstrapInfo.env },
@@ -515,40 +550,6 @@ if (globalThis.Deno) {
       core.ops.op_meow_record_process_exit(normalized);
     }
     return normalized;
-  }
-  function meowPatchProcessTtyStreams(processValue) {
-    const columns = Number(processValue.env?.COLUMNS ?? 80) || 80;
-    const rows = Number(processValue.env?.LINES ?? 24) || 24;
-    for (const stream of [processValue.stdout, processValue.stderr]) {
-      if (!stream || typeof stream !== "object") continue;
-      if (typeof stream.isTTY !== "boolean") {
-        Object.defineProperty(stream, "isTTY", {
-          value: false,
-          writable: true,
-          configurable: true,
-        });
-      }
-      if (typeof stream.columns !== "number") {
-        Object.defineProperty(stream, "columns", {
-          value: columns,
-          writable: true,
-          configurable: true,
-        });
-      }
-      if (typeof stream.rows !== "number") {
-        Object.defineProperty(stream, "rows", {
-          value: rows,
-          writable: true,
-          configurable: true,
-        });
-      }
-      if (typeof stream.getColorDepth !== "function") {
-        stream.getColorDepth = () => 24;
-      }
-      if (typeof stream.hasColors !== "function") {
-        stream.hasColors = () => true;
-      }
-    }
   }
   if (processValue && typeof processValue === "object") {
     const originalExit = typeof processValue.exit === "function"
