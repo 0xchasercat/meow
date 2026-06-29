@@ -968,7 +968,11 @@ if (
         fs.appendFileSync(String(debugLog), `child<-parent ${line}\n`);
       }
       try {
-        processValue.emit("message", JSON.parse(line));
+        const parsed = JSON.parse(line);
+        if (parsed && typeof parsed === "object" && parsed.__meowProcessExit) {
+          continue;
+        }
+        processValue.emit("message", parsed);
       } catch {
         // Ignore malformed mailbox writes from parent code.
       }

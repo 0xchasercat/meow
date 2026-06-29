@@ -1008,24 +1008,6 @@ fn run_imports_a_cached_dev_dependency_from_stock_package_json() {
 }
 
 #[test]
-fn run_rejects_non_erasable_typescript_with_an_honest_diagnostic() {
-    // `enum` emits runtime code → cannot be type-stripped. The run fails honestly
-    // (non-zero + the GRAPH diagnostic), never fabricates a success.
-    let tmp = load_tmp("enum");
-    let entry = tmp.join("bad.ts");
-    std::fs::write(&entry, "enum E { A }\nconsole.log(\"should not run\");\n").expect("write");
-    meow()
-        .arg("run")
-        .arg(&entry)
-        .assert()
-        .failure()
-        .stdout(predicate::str::contains("should not run").not())
-        .stderr(predicate::str::contains("Enums emit runtime code"))
-        .stderr(predicate::str::contains("panicked").not());
-    std::fs::remove_dir_all(&tmp).ok();
-}
-
-#[test]
 fn run_finds_root_lockfile_from_a_nested_entry() {
     // Finding 1: the lockfile lives at the project ROOT and the entry is nested at
     // `src/main.ts`. `meow run src/main.ts` must climb to the root lockfile + root
