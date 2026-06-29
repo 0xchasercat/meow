@@ -846,14 +846,58 @@ mod impl_ {
     raw_fd: Option<i32>,
   }
 
+  /// Convert a `serde_json::Value` directly to a V8 value.
+  /// This avoids the `serde_v8::to_v8` path which mangles
+  /// `serde_json::Value::Number` into `{"$serde_json::private::Number":"..."}`
+  /// objects instead of plain V8 numbers.
+  fn json_value_to_v8<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: &serde_json::Value,
+  ) -> v8::Local<'s, v8::Value> {
+    match value {
+      serde_json::Value::Null => v8::null(scope).into(),
+      serde_json::Value::Bool(b) => v8::Boolean::new(scope, *b).into(),
+      serde_json::Value::Number(n) => {
+        if let Some(i) = n.as_i64() {
+          v8::Integer::new(scope, i as i32).into()
+        } else if let Some(u) = n.as_u64() {
+          v8::Integer::new_from_unsigned(scope, u as u32).into()
+        } else if let Some(f) = n.as_f64() {
+          v8::Number::new(scope, f).into()
+        } else {
+          v8::null(scope).into()
+        }
+      }
+      serde_json::Value::String(s) => {
+        v8::String::new(scope, s).unwrap().into()
+      }
+      serde_json::Value::Array(arr) => {
+        let v8_arr = v8::Array::new(scope, arr.len() as i32);
+        for (i, item) in arr.iter().enumerate() {
+          let v8_item = json_value_to_v8(scope, item);
+          v8_arr.set_index(scope, i as u32, v8_item);
+        }
+        v8_arr.into()
+      }
+      serde_json::Value::Object(map) => {
+        let v8_obj = v8::Object::new(scope);
+        for (key, val) in map {
+          let v8_key = v8::String::new(scope, key).unwrap();
+          let v8_val = json_value_to_v8(scope, val);
+          v8_obj.set(scope, v8_key.into(), v8_val);
+        }
+        v8_obj.into()
+      }
+    }
+  }
+
   impl<'a> deno_core::ToV8<'a> for IpcJsonReadResult {
     type Error = IpcError;
     fn to_v8(
       self,
       scope: &mut v8::PinScope<'a, '_>,
     ) -> Result<v8::Local<'a, v8::Value>, Self::Error> {
-      let msg = deno_core::serde_v8::to_v8(scope, self.msg)
-        .expect("serde_json::Value to_v8");
+      let msg = json_value_to_v8(scope, &self.msg);
       Ok(make_msg_with_fd_array(scope, msg, self.raw_fd))
     }
   }

@@ -1197,6 +1197,12 @@ fn lifecycle_env(
     Ok(env)
 }
 
+/// Binaries that get proxied directly to meow (Group 1 — runtime shims).
+const RUNTIME_SHIMS: &[&str] = &["node", "npm", "pnpm", "yarn", "bun"];
+
+/// Binaries that get proxied to `meow x` (Group 2 — ephemeral runner shims).
+const EPHEMERAL_SHIMS: &[&str] = &["npx", "pnpx", "bunx"];
+
 fn install_node_shim_env(env: &mut BTreeMap<String, String>) -> Result<(), RunCommandError> {
     let exe = std::env::current_exe().map_err(|source| {
         RunCommandError::Message(format!("cannot resolve current executable: {source}"))
@@ -1205,18 +1211,34 @@ fn install_node_shim_env(env: &mut BTreeMap<String, String>) -> Result<(), RunCo
     let shim_dir = home.join(".meow").join("bin");
     std::fs::create_dir_all(&shim_dir).map_err(|source| {
         RunCommandError::Message(format!(
-            "cannot create node shim directory {}: {source}",
+            "cannot create shim directory {}: {source}",
             shim_dir.display()
         ))
     })?;
-    let shim_path = shim_dir.join(if cfg!(windows) { "node.exe" } else { "node" });
-    install_node_shim(&exe, &shim_path)?;
 
+    // Group 1: runtime shims — proxy directly to meow
+    for name in RUNTIME_SHIMS {
+        let ext = if cfg!(windows) { ".exe" } else { "" };
+        let shim_path = shim_dir.join(format!("{name}{ext}"));
+        install_shim(&exe, &shim_path, name, &[])?;
+    }
+
+    // Group 2: ephemeral runner shims — proxy to `meow x`
+    for name in EPHEMERAL_SHIMS {
+        let ext = if cfg!(windows) { ".exe" } else { "" };
+        let shim_path = shim_dir.join(format!("{name}{ext}"));
+        install_shim(&exe, &shim_path, name, &["x"])?;
+    }
+
+    let node_shim_path = shim_dir.join(if cfg!(windows) { "node.exe" } else { "node" });
     env.insert(
         "npm_node_execpath".to_owned(),
-        shim_path.to_string_lossy().into_owned(),
+        node_shim_path.to_string_lossy().into_owned(),
     );
-    env.insert("NODE".to_owned(), shim_path.to_string_lossy().into_owned());
+    env.insert(
+        "NODE".to_owned(),
+        node_shim_path.to_string_lossy().into_owned(),
+    );
 
     let current_path = env
         .get("PATH")
@@ -1229,18 +1251,39 @@ fn install_node_shim_env(env: &mut BTreeMap<String, String>) -> Result<(), RunCo
         paths.insert(0, shim_dir);
     }
     let joined = std::env::join_paths(paths).map_err(|source| {
-        RunCommandError::Message(format!("cannot construct PATH for node shim: {source}"))
+        RunCommandError::Message(format!("cannot construct PATH for shims: {source}"))
     })?;
     env.insert("PATH".to_owned(), joined.to_string_lossy().into_owned());
     Ok(())
 }
 
+/// Write a shell shim (or `.cmd` on Windows) at `shim_path` that proxies to
+/// the meow binary. `target_name` is the original binary name (used for the
+/// `MEOW_NO_SHIM` escape hatch fallback). `extra_args` are injected between
+/// the meow binary and `"$@"` (e.g. `["x"]` for ephemeral runners).
 #[cfg(unix)]
-fn install_node_shim(exe: &Path, shim_path: &Path) -> Result<(), RunCommandError> {
+fn install_shim(
+    exe: &Path,
+    shim_path: &Path,
+    target_name: &str,
+    extra_args: &[&str],
+) -> Result<(), RunCommandError> {
     use std::os::unix::fs::PermissionsExt;
 
     let quoted_exe = exe.to_string_lossy().replace('\'', "'\\''");
-    let script = format!("#!/bin/sh\nif [ \"$MEOW_NO_SHIM\" = \"1\" ]; then\n  unset MEOW_NODE_SHIM\n  exec /usr/bin/env node \"$@\"\nfi\nMEOW_NODE_SHIM=1 exec '{quoted_exe}' \"$@\"\n");
+    let extra = if extra_args.is_empty() {
+        String::new()
+    } else {
+        format!(" {} ", extra_args.join(" "))
+    };
+    let script = format!(
+        "#!/bin/sh\n\
+         if [ \"$MEOW_NO_SHIM\" = \"1\" ]; then\n\
+         \x20 unset MEOW_NODE_SHIM\n\
+         \x20 exec /usr/bin/env {target_name} \"$@\"\n\
+         fi\n\
+         MEOW_NODE_SHIM=1 exec '{quoted_exe}'{extra} \"$@\"\n"
+    );
     if std::fs::read_to_string(shim_path).is_ok_and(|existing| existing == script) {
         return Ok(());
     }
@@ -1249,21 +1292,21 @@ fn install_node_shim(exe: &Path, shim_path: &Path) -> Result<(), RunCommandError
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(source) => {
             return Err(RunCommandError::Message(format!(
-                "cannot replace node shim {}: {source}",
+                "cannot replace shim {}: {source}",
                 shim_path.display()
             )));
         }
     }
     std::fs::write(shim_path, script).map_err(|source| {
         RunCommandError::Message(format!(
-            "cannot write node shim {}: {source}",
+            "cannot write shim {}: {source}",
             shim_path.display()
         ))
     })?;
     let mut perms = std::fs::metadata(shim_path)
         .map_err(|source| {
             RunCommandError::Message(format!(
-                "cannot stat node shim {}: {source}",
+                "cannot stat shim {}: {source}",
                 shim_path.display()
             ))
         })?
@@ -1271,44 +1314,51 @@ fn install_node_shim(exe: &Path, shim_path: &Path) -> Result<(), RunCommandError
     perms.set_mode(0o755);
     std::fs::set_permissions(shim_path, perms).map_err(|source| {
         RunCommandError::Message(format!(
-            "cannot mark node shim executable {}: {source}",
+            "cannot mark shim executable {}: {source}",
             shim_path.display()
         ))
     })
 }
 
 #[cfg(windows)]
-fn install_node_shim(exe: &Path, shim_path: &Path) -> Result<(), RunCommandError> {
-    // On Windows, copying the running executable fails with "file in use"
-    // (os error 32) when meow is the active process. Use a hard link first
-    // (no file lock, instant), falling back to a batch shim if linking fails
-    // (e.g. cross-volume). The batch shim delegates to the real exe at runtime.
+fn install_shim(
+    exe: &Path,
+    shim_path: &Path,
+    target_name: &str,
+    extra_args: &[&str],
+) -> Result<(), RunCommandError> {
     let quoted_exe = exe.to_string_lossy().replace('\'', "'\\''");
-    let script = format!("@echo off\r\nif \"%MEOW_NO_SHIM%\"==\"1\" (\r\n  set MEOW_NODE_SHIM=\r\n  node %*\r\n  exit /b %ERRORLEVEL%\r\n)\r\nset MEOW_NODE_SHIM=1\r\n\"{quoted_exe}\" %*\r\n");
-
-    // Check if the shim is already correct (idempotent — avoid touching a
-    // locked file when no change is needed).
+    let extra = if extra_args.is_empty() {
+        String::new()
+    } else {
+        format!(" {} ", extra_args.join(" "))
+    };
+    let script = format!(
+        "@echo off\r\n\
+         if \"%MEOW_NO_SHIM%\"==\"1\" (\r\n\
+         \x20 set MEOW_NODE_SHIM=\r\n\
+         \x20 {target_name} %*\r\n\
+         \x20 exit /b %ERRORLEVEL%\r\n\
+         )\r\n\
+         set MEOW_NODE_SHIM=1\r\n\
+         \"{quoted_exe}\"{extra}%*\r\n"
+    );
     if std::fs::read_to_string(shim_path).is_ok_and(|existing| existing == script) {
         return Ok(());
     }
-
-    // Remove any existing shim first.
     match std::fs::remove_file(shim_path) {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(source) => {
             return Err(RunCommandError::Message(format!(
-                "cannot replace node shim {}: {source}",
+                "cannot replace shim {}: {source}",
                 shim_path.display()
             )));
         }
     }
-
-    // Write the batch shim. This avoids the file-lock problem of copying the
-    // running executable, and works across volumes.
     std::fs::write(shim_path, script).map_err(|source| {
         RunCommandError::Message(format!(
-            "cannot write node shim {}: {source}",
+            "cannot write shim {}: {source}",
             shim_path.display()
         ))
     })

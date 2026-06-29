@@ -414,6 +414,7 @@ fn default_install_args() -> InstallArgs {
         vendor_dir: PathBuf::from("vendor"),
         clean: false,
         dev: false,
+        global: false,
         compat_lockfile: false,
         packages: Vec::new(),
     }
@@ -480,8 +481,13 @@ pub fn cmd_add(args: &PkgArgs) -> ExitCode {
     }
     // === /PKG-003 ===
 
+    let section_label = if args.dev {
+        "devDependencies"
+    } else {
+        "dependencies"
+    };
     for (name, req) in resolved {
-        purr(&format!("added {name}@{}", req.as_str()));
+        purr(&format!("added {name}@{} to {section_label}", req.as_str()));
     }
     cmd_install(&default_install_args())
 }
@@ -639,6 +645,25 @@ pub fn cmd_install(args: &InstallArgs) -> ExitCode {
         let t0 = std::time::Instant::now();
         let registry = NpmRegistry::lazy()?;
         // === CFG-003 ===
+        // === PKG-003 (global install) ===
+        if args.global && !args.packages.is_empty() {
+            let mut resolved = Vec::with_capacity(args.packages.len());
+            for package in &args.packages {
+                let (name, req) = requested_dependency(&registry, package)
+                    .await
+                    .map_err(|err| err.to_string())?;
+                resolved.push((name, req));
+            }
+            return Err(format!(
+                "__GLOBAL_INSTALL__:{}",
+                resolved
+                    .iter()
+                    .map(|(n, r)| format!("{}@{}", n, r))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+        // === /PKG-003 ===
         let dependency_section = if args.dev {
             meow_config::DependencySection::DevDependencies
         } else {
@@ -812,6 +837,24 @@ pub fn cmd_install(args: &InstallArgs) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(err) => {
+            // Intercept global install sentinel and redirect to cmd_add_global
+            if let Some(specs) = err.strip_prefix("__GLOBAL_INSTALL__:") {
+                let registry_runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build();
+                if let Ok(rt) = registry_runtime {
+                    let resolved: Vec<_> = specs
+                        .split(',')
+                        .filter_map(|spec| {
+                            rt.block_on(async {
+                                let registry = NpmRegistry::npm().ok()?;
+                                requested_dependency(&registry, spec).await.ok()
+                            })
+                        })
+                        .collect();
+                    return cmd_add_global(resolved);
+                }
+            }
             hiss(&format!("meow install: {err}"));
             ExitCode::FAILURE
         }

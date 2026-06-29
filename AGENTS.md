@@ -66,6 +66,33 @@ These are not suggestions. They are scars from real regressions.
 *   **Project root detection must not leak upward.** `find_project_root` must stop at the nearest independent package boundary (`meow.lock.jsonl`, non-dependency `package.json`, or `.git`). Running inside nested examples/apps must not climb into unrelated parent package manifests and inherit their dependencies.
 *   **Framework lockfile compatibility is a boundary signal, not dependency authority.** `meow.lock.jsonl` remains the authoritative lockfile. Any `package-lock.json`/framework detector shim is only compatibility metadata for tools like Next.js/Turbopack; do not make npm lockfiles authoritative for resolution.
 
+### IPC JSON Deserialization (serde_v8 Trap)
+*   **`serde_json::Value` numbers corrupt IPC messages.** When `serde_json::Value::Number` is converted to V8 via `serde_v8::to_v8`, serde's internal tagged representation (`{"$serde_json::private::Number":"0"}`) leaks through as a V8 Object instead of a plain V8 Number. This breaks `jest-worker` and any IPC protocol expecting raw arrays.
+*   **The fix:** In `vendor/deno_node/ops/ipc.rs`, use `json_value_to_v8()` to manually convert `serde_json::Value` to V8 values, bypassing `serde_v8::to_v8` entirely. The function handles all JSON types (null, bool, number, string, array, object) directly.
+*   **Never use `serde_v8::to_v8` on `serde_json::Value`.** Always convert manually or parse JSON directly into V8 via `v8::json::parse`.
+
+### Oxc SemanticBuilder Node Store
+*   **`SemanticBuilder::new()` defaults to ancestry-only mode.** The default builder does NOT build the full `AstNodes` store — it only maintains a lightweight ancestry stack for the compiler pipeline.
+*   **When to enable:** If your code calls `nodes.iter_enumerated()` or needs random access to AST nodes by `NodeId`, you MUST call `SemanticBuilder::new().with_build_nodes(true)`.
+*   **Where this lives:** `crates/graph/src/semantic.rs` — the `SemanticGraph::build` function.
+*   **Symptom of getting this wrong:** All strip policy tests pass with `Ok(())` instead of rejecting non-erasable TypeScript constructs, because the node iterator yields zero nodes.
+
+### V8 Snapshot Requires Full Rebuild
+*   **JavaScript changes require `cargo build`.** The V8 snapshot bakes JavaScript polyfills into the binary at compile time. Editing `.js`/`.ts` files in `vendor/deno_node/polyfills/` has NO effect until you rebuild.
+*   **Snapshot location:** `target/{debug,release}/build/meow-cli-*/out/meow-snapshot.bin`
+*   **Fast iteration bypass:** Use `meow run dev --no-snapshot` to skip snapshot generation when iterating on JS-only changes.
+
+### Ecosystem Shim Shell Syntax
+*   **Shell shims must have a space before `"$@"`.** The format string `exec '{exe}' "$@"` is correct; `exec '{exe}'"$@"` concatenates the path with the first argument (e.g., `bun run build` becomes `/usr/local/bin/meowrun build`).
+*   **Test location:** The shim tests are in `crates/cli/src/cli.rs` under `mod tests`.
+*   **Shim regeneration:** Shims are created during `meow run` and `meow install` via `install_node_shim_env`. They are NOT created by `meow add` alone.
+
+### Competitor CLI Flag Sanitization
+*   **Competitor-specific flags crash clap.** Flags like `bun run --shell bun` must be stripped before reaching the argument parser.
+*   **The sanitizer:** `sanitize_competitor_flags()` in `crates/cli/src/cli.rs` runs at the very beginning of `normalize_argv`, before any routing logic.
+*   **What gets stripped:** `--shell` (and its value argument), `--silent`, `--no-warnings`, and redundant inner package manager calls (e.g., `bun run bun script` → `bun run script`).
+*   **When to add new flags:** If a framework uses a competitor-specific flag that would crash clap, add it to the sanitizer. Do NOT add flags that have legitimate meow equivalents.
+
 ---
 
 ## 3. Development & Testing

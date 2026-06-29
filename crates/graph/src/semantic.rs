@@ -33,7 +33,9 @@ impl SemanticGraph {
     /// Stage-2 query body: run `SemanticBuilder` over an owned `Rc<Cst>`.
     pub(crate) fn build(cst: Rc<Cst>) -> Self {
         let cell = SemanticCell::new(cst, |cst| {
-            let ret = SemanticBuilder::new().build(cst.program());
+            let ret = SemanticBuilder::new()
+                .with_build_nodes(true)
+                .build(cst.program());
             SemDep {
                 semantic: ret.semantic,
                 errors: ret.diagnostics.to_vec(),

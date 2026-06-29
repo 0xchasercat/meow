@@ -50,7 +50,40 @@ pub struct Cli {
     pub command: Option<Command>,
 }
 
+/// Strip competitor-specific CLI flags that would crash clap.
+/// This allows meow to intercept `bun run --shell bun script` and similar.
+fn sanitize_competitor_flags(argv: Vec<OsString>) -> Vec<OsString> {
+    let mut cleaned = Vec::with_capacity(argv.len());
+    let mut iter = argv.into_iter();
+    while let Some(arg) = iter.next() {
+        let s = arg.to_string_lossy();
+        // Strip --shell and its required value argument
+        if s == "--shell" {
+            iter.next(); // consume the shell value
+            continue;
+        }
+        // Strip known competitor flags that have no meow equivalent
+        if s == "--silent" || s == "--no-warnings" {
+            continue;
+        }
+        // Strip redundant inner package manager calls
+        // e.g., `bun run bun tsc` -> `bun run tsc`
+        if (s == "bun" || s == "npm" || s == "yarn" || s == "pnpm")
+            && cleaned
+                .last()
+                .is_some_and(|v: &OsString| v.to_string_lossy() == "run")
+        {
+            continue;
+        }
+        cleaned.push(arg);
+    }
+    cleaned
+}
+
 pub fn normalize_argv(mut argv: Vec<OsString>) -> Vec<OsString> {
+    // Sanitize competitor-specific flags that would crash clap.
+    argv = sanitize_competitor_flags(argv);
+
     if invoked_as_node(argv.first()) {
         return normalize_node_argv(argv);
     }
@@ -216,7 +249,16 @@ fn invoked_as_meowx(argv0: Option<&OsString>) -> bool {
         .file_name()
         .and_then(OsStr::to_str)
         .is_some_and(|name| {
-            name == "meowx" || name == "meowx.exe" || name == "mwx" || name == "mwx.exe"
+            name == "meowx"
+                || name == "meowx.exe"
+                || name == "mwx"
+                || name == "mwx.exe"
+                || name == "npx"
+                || name == "npx.exe"
+                || name == "pnpx"
+                || name == "pnpx.exe"
+                || name == "bunx"
+                || name == "bunx.exe"
         })
 }
 
@@ -525,6 +567,9 @@ pub struct InstallArgs {
     /// Add package specifier(s) to devDependencies before installing.
     #[arg(short = 'D', long = "dev")]
     pub dev: bool,
+    /// Install globally (writes shim in ~/.meow/bin).
+    #[arg(short = 'g', long)]
+    pub global: bool,
     /// Write a lightweight package-lock.json compatibility marker for framework detectors.
     #[arg(long = "compat-lockfile")]
     pub compat_lockfile: bool,
@@ -1242,5 +1287,55 @@ mod tests {
         let found = find_project_root(&dir);
         assert_eq!(found, dir);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sanitize_strips_shell_flag() {
+        let input: Vec<OsString> = vec![
+            "bun".into(),
+            "run".into(),
+            "--shell".into(),
+            "bun".into(),
+            "remove-dist".into(),
+        ];
+        let cleaned = sanitize_competitor_flags(input);
+        let strs: Vec<String> = cleaned
+            .iter()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(strs, vec!["bun", "run", "remove-dist"]);
+    }
+
+    #[test]
+    fn sanitize_strips_silent_flags() {
+        let input: Vec<OsString> = vec![
+            "npm".into(),
+            "--silent".into(),
+            "run".into(),
+            "--no-warnings".into(),
+            "build".into(),
+        ];
+        let cleaned = sanitize_competitor_flags(input);
+        let strs: Vec<String> = cleaned
+            .iter()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(strs, vec!["npm", "run", "build"]);
+    }
+
+    #[test]
+    fn sanitize_strips_redundant_inner_pm_call() {
+        let input: Vec<OsString> = vec![
+            "bun".into(),
+            "run".into(),
+            "bun".into(),
+            "./build.ts".into(),
+        ];
+        let cleaned = sanitize_competitor_flags(input);
+        let strs: Vec<String> = cleaned
+            .iter()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(strs, vec!["bun", "run", "./build.ts"]);
     }
 }
