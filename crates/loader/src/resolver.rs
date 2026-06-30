@@ -524,12 +524,12 @@ impl Resolver {
                     }
                 })?
             } else {
-                referrer.join(specifier).map_err(|_| {
-                    ResolveError::SpecifierNotFound {
+                referrer
+                    .join(specifier)
+                    .map_err(|_| ResolveError::SpecifierNotFound {
                         specifier: specifier.to_owned(),
                         referrer: referrer.clone(),
-                    }
-                })?
+                    })?
             };
             return self.finalize_joined(file_url, specifier, referrer);
         }
