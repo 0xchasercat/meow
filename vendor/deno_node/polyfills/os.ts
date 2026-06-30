@@ -32,7 +32,9 @@ const {
   op_node_os_user_info,
 } = core.ops;
 
-const { isWindows } = core.loadExtScript("ext:deno_node/_util/os.ts");
+const { osType, isWindows, isLinux } = core.loadExtScript(
+  "ext:deno_node/_util/os.ts",
+);
 const { os } = core.loadExtScript(
   "ext:deno_node/internal_binding/constants.ts",
 );
@@ -83,7 +85,7 @@ function endianness() {
 }
 
 function freemem() {
-  if (Deno.build.os === "linux" || Deno.build.os == "android") {
+  if (isLinux) {
     return Deno.systemMemoryInfo().available;
   } else {
     return Deno.systemMemoryInfo().free;
@@ -209,7 +211,7 @@ function totalmem() {
 }
 
 function type() {
-  switch (Deno.build.os) {
+  switch (osType) {
     case "windows":
       return "Windows_NT";
     case "linux":
@@ -222,7 +224,7 @@ function type() {
     case "openbsd":
       return "OpenBSD";
     default:
-      throw new Error("unreachable");
+      throw new Error(`unsupported os type: ${osType}`);
   }
 }
 
