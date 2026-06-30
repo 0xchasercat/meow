@@ -450,10 +450,10 @@ fn materialize_is_idempotent_and_reconciles_missing_edges() {
     assert_eq!(snapshot, snapshot_tree(&root.join("node_modules")));
 
     let missing_edge = root.join("node_modules/.meow/app@1.0.0/node_modules/dep");
-    if missing_edge.is_dir() {
-        fs::remove_dir(&missing_edge).expect("remove dep edge dir");
-    } else {
-        fs::remove_file(&missing_edge).expect("remove dep edge");
+    if let Err(file_err) = fs::remove_file(&missing_edge) {
+        fs::remove_dir(&missing_edge).unwrap_or_else(|dir_err| {
+            panic!("remove dep edge as file failed: {file_err}; as dir failed: {dir_err}")
+        });
     }
     let third = materializer.materialize(&opts).expect("third materialize");
     assert!(!third.skipped);

@@ -1347,11 +1347,16 @@ fn ensure_dir(path: &Path) -> Result<(), MaterializeError> {
 
 #[cfg(windows)]
 fn create_windows_junction(target: &Path, path: &Path) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let link_name = path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "junction path has no file name")
+    })?;
     let status = Command::new("cmd")
+        .current_dir(parent)
         .arg("/C")
         .arg("mklink")
         .arg("/J")
-        .arg(path)
+        .arg(link_name)
         .arg(target)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1379,8 +1384,7 @@ fn create_edge_link(target: &Path, path: &Path) -> Result<(), MaterializeError> 
         // primitive package managers use for node_modules graphs. Rust's
         // std::os::windows::fs::junction_point is still unstable, so use the
         // stable OS command.
-        let target_abs = path.parent().unwrap_or_else(|| Path::new("")).join(target);
-        create_windows_junction(&target_abs, path).map_err(|_| {
+        create_windows_junction(target, path).map_err(|_| {
             MaterializeError::EdgeLinkUnsupported {
                 path: path.to_path_buf(),
             }
