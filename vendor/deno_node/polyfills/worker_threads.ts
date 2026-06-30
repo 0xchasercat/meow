@@ -55,7 +55,7 @@
   // ESM dispatch derives export names from `Object.keys(exportsObj)`.
   const exportsObj = { __proto__: null };
 
-  // ───────────────────────────── host side ─────────────────────────────
+  // ----------------------------- host side -----------------------------
 
   class Worker extends EventEmitter {
     #id;
@@ -93,7 +93,7 @@
           op_meow_worker_host_recv(this.#id),
           (frame) => {
             if (this.#terminated) return;
-            // First event observed ⇒ the worker isolate is live.
+            // First event observed => the worker isolate is live.
             if (!this.#onlineEmitted) {
               this.#onlineEmitted = true;
               this.emit("online");
@@ -143,7 +143,7 @@
     unref() {}
   }
 
-  // ──────────────────────────── worker side ────────────────────────────
+  // ---------------------------- worker side ----------------------------
 
   function makeParentPort() {
     const port = new EventEmitter();
@@ -157,7 +157,7 @@
     port.start = () => {};
     port.ref = () => {};
     port.unref = () => {};
-    // Pump host→worker messages; dispatch as EventEmitter "message" and the
+    // Pump host->worker messages; dispatch as EventEmitter "message" and the
     // web-style `onmessage` for compatibility.
     const step = () => {
       if (closed) return;
@@ -177,7 +177,7 @@
     return port;
   }
 
-  // ─────────────────────── bootstrap-time state ───────────────────────
+  // ----------------------- bootstrap-time state -----------------------
   // `01_require.js` calls this for the main isolate (runningOnMainThread = true)
   // and for each worker isolate (false; the worker driver passes the id).
   internals.__initWorkerThreads = (
@@ -209,7 +209,7 @@
     internals.__initWorkerThreads(false, workerId, null, moduleSpecifier);
   };
 
-  // ───────────────── minimal MessagePort / MessageChannel ─────────────────
+  // ----------------- minimal MessagePort / MessageChannel -----------------
   // SvelteKit/Vite drive workers through `Worker` + `parentPort` only; these
   // give same-isolate channels for libraries that destructure the names at
   // import time. Cross-isolate port transfer is not supported yet.
