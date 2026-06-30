@@ -928,11 +928,12 @@ pub(super) fn build_worker_runtime(
         meow_runtime::node::DenoNodeServicesBuilder::new(deno_node_bridge).build();
 
     let caps: meow_runtime::web::NetCaps = std::sync::Arc::new(meow_runtime::AllowAll);
-    let mut extensions = Vec::new();
-    extensions.push(meow_runtime::http_extension());
-    extensions.push(meow_runtime::ui_extension());
-    extensions.push(meow_loader::cjs_resolve_extension(resolver.clone()));
-    extensions.push(super::worker::guest_extension());
+    let mut extensions = vec![
+        meow_runtime::http_extension(),
+        meow_runtime::ui_extension(),
+        meow_loader::cjs_resolve_extension(resolver.clone()),
+        super::worker::guest_extension(),
+    ];
     meow_runtime::hermetic::pin_deterministic_intl(&config.hermetic);
     extensions.extend(meow_runtime::hermetic::extensions(config.hermetic.clone()));
 
