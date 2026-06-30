@@ -1635,40 +1635,73 @@ fn cached_file_kind(root: &Path, member: &str) -> ModuleKind {
         Some("mjs") => ModuleKind::Esm,
         Some("cjs") => ModuleKind::Cjs,
         Some("json") => ModuleKind::Json,
-        Some("js") => {
-            let manifest = nearest_cached_manifest(root, member);
-            if manifest.package_type.as_deref() == Some("module") {
-                return ModuleKind::Esm;
-            }
-            if let Some(main) = manifest.main.as_deref().and_then(normalize_legacy_member) {
-                if member == main {
-                    return ModuleKind::Cjs;
-                }
-            }
-            if let Some(module_path) = manifest.module.as_deref().and_then(normalize_legacy_member)
-            {
-                let module_dir = Path::new(&module_path).parent().unwrap_or(Path::new(""));
-                if Path::new(member).starts_with(module_dir) {
-                    return ModuleKind::Esm;
-                }
-            }
-            ModuleKind::Cjs
-        }
-        _ => {
-            let manifest = nearest_cached_manifest(root, member);
-            if manifest.package_type.as_deref() == Some("module") {
-                return ModuleKind::Esm;
-            }
-            if let Some(module_path) = manifest.module.as_deref().and_then(normalize_legacy_member)
-            {
-                let module_dir = Path::new(&module_path).parent().unwrap_or(Path::new(""));
-                if Path::new(member).starts_with(module_dir) {
-                    return ModuleKind::Esm;
-                }
-            }
-            ModuleKind::Cjs
-        }
+        // `.js` and extensionless members are CommonJS unless `type`/`main`/
+        // `module` place them in the package's ESM build.
+        _ => cached_dual_build_kind(&nearest_cached_manifest(root, member), member),
     }
+}
+
+/// Classify a `.js`/extensionless cached member as CJS or ESM from the package's
+/// `type`, `main`, and `module` fields.
+///
+/// A dual package ships a CommonJS build (`main`) and an ESM build (`module`). A
+/// member is ESM only when it lives in the ESM build directory *and not* in the
+/// CommonJS one; directory attribution is component-wise and never keys off an
+/// empty prefix.
+///
+/// This is the fix for the `common-tags`-class regression. A single-segment
+/// `module` field such as `"es"` previously produced `Path::new("es").parent()`
+/// == `Some("")`, and `Path::starts_with("")` is `true` for every path, so the
+/// whole package — including its CommonJS `main` (`"lib"`) tree — was classified
+/// ESM. A CJS `require("common-tags")` was then routed through the ESM facade,
+/// whose own `require()` re-entered the half-built module and snapshotted every
+/// named export as `undefined` (`(0, common_tags_1.oneLine) is not a function`).
+fn cached_dual_build_kind(manifest: &PackageJson, member: &str) -> ModuleKind {
+    if manifest.package_type.as_deref() == Some("module") {
+        return ModuleKind::Esm;
+    }
+    let Some(esm_dir) = manifest.module.as_deref().and_then(entry_build_dir) else {
+        return ModuleKind::Cjs;
+    };
+    if !member_in_build_dir(member, &esm_dir) {
+        return ModuleKind::Cjs;
+    }
+    // The member is under the ESM build dir. When `main` and `module` share a
+    // directory (e.g. both under `dist/`), `require` keeps the CommonJS reading.
+    let under_cjs = manifest
+        .main
+        .as_deref()
+        .and_then(entry_build_dir)
+        .is_some_and(|cjs_dir| member_in_build_dir(member, &cjs_dir));
+    if under_cjs {
+        ModuleKind::Cjs
+    } else {
+        ModuleKind::Esm
+    }
+}
+
+/// The build directory a package entry field (`main`/`module`) covers. An
+/// extensionless field (`"lib"`, `"es"`) is a directory entry that owns its whole
+/// subtree; a field with a file extension (`"./dist/index.mjs"`) contributes the
+/// directory that contains it. Returns `None` when the field resolves to the
+/// package root (an empty prefix), which is too broad to attribute a member to a
+/// single build and must never be used as a `starts_with` key.
+fn entry_build_dir(field: &str) -> Option<String> {
+    let normalized = normalize_legacy_member(field)?;
+    let dir = if Path::new(&normalized).extension().is_some() {
+        Path::new(&normalized)
+            .parent()
+            .map(|parent| parent.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default()
+    } else {
+        normalized
+    };
+    (!dir.is_empty()).then_some(dir)
+}
+
+/// Component-wise containment that never matches on an empty directory prefix.
+fn member_in_build_dir(member: &str, dir: &str) -> bool {
+    !dir.is_empty() && Path::new(member).starts_with(dir)
 }
 
 // === LOAD-004 ===
@@ -1860,6 +1893,110 @@ mod tests {
             .expect(".js resolves");
         assert_eq!(resolved.kind, ModuleKind::Cjs);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dual_build_single_segment_module_field_keeps_commonjs_main_tree() {
+        // Regression: `common-tags` ships `main: "lib"` (CJS) + `module: "es"`
+        // (ESM). A single-segment `module` field must not classify the whole
+        // package — especially its CommonJS `lib/` tree — as ESM. Misclassifying
+        // `lib/index.js` as ESM routed `require("common-tags")` through the ESM
+        // facade, whose own re-`require()` snapshotted every named export as
+        // `undefined` (`(0, common_tags_1.oneLine) is not a function`).
+        let manifest = PackageJson {
+            main: Some("lib".to_owned()),
+            module: Some("es".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(
+            cached_dual_build_kind(&manifest, "lib/index.js"),
+            ModuleKind::Cjs
+        );
+        assert_eq!(
+            cached_dual_build_kind(&manifest, "lib/oneLine/oneLine.js"),
+            ModuleKind::Cjs
+        );
+        // The genuine ESM build is still recognized (for `import`).
+        assert_eq!(
+            cached_dual_build_kind(&manifest, "es/index.js"),
+            ModuleKind::Esm
+        );
+    }
+
+    #[test]
+    fn dual_build_shared_directory_stays_commonjs_for_require() {
+        // `main` and `module` in the same directory: `require` keeps the CommonJS
+        // reading; the `.mjs` ESM entry is classified by extension upstream in
+        // `cached_file_kind`.
+        let manifest = PackageJson {
+            package_type: Some("commonjs".to_owned()),
+            main: Some("./dist/index.cjs.js".to_owned()),
+            module: Some("./dist/index.es.mjs".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(
+            cached_dual_build_kind(&manifest, "dist/index.cjs.js"),
+            ModuleKind::Cjs
+        );
+        assert_eq!(
+            cached_dual_build_kind(&manifest, "dist/shared-helper.js"),
+            ModuleKind::Cjs
+        );
+    }
+
+    #[test]
+    fn dual_build_distinct_esm_directory_is_esm() {
+        let manifest = PackageJson {
+            main: Some("./cjs/index.cjs".to_owned()),
+            module: Some("./esm/index.js".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(
+            cached_dual_build_kind(&manifest, "esm/index.js"),
+            ModuleKind::Esm
+        );
+        assert_eq!(
+            cached_dual_build_kind(&manifest, "cjs/index.cjs"),
+            ModuleKind::Cjs
+        );
+    }
+
+    #[test]
+    fn dual_build_type_module_and_missing_module_field() {
+        let esm = PackageJson {
+            package_type: Some("module".to_owned()),
+            main: Some("lib".to_owned()),
+            module: Some("es".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(
+            cached_dual_build_kind(&esm, "lib/index.js"),
+            ModuleKind::Esm
+        );
+
+        let cjs_only = PackageJson {
+            main: Some("lib/main.js".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(
+            cached_dual_build_kind(&cjs_only, "lib/main.js"),
+            ModuleKind::Cjs
+        );
+    }
+
+    #[test]
+    fn entry_build_dir_resolves_directories_files_and_root() {
+        assert_eq!(entry_build_dir("lib"), Some("lib".to_owned()));
+        assert_eq!(entry_build_dir("es"), Some("es".to_owned()));
+        assert_eq!(entry_build_dir("./esm/index.js"), Some("esm".to_owned()));
+        assert_eq!(
+            entry_build_dir("./dist/index.es.mjs"),
+            Some("dist".to_owned())
+        );
+        // A bare file at the package root has no build directory — it must never
+        // become an empty `starts_with` key that matches every member.
+        assert_eq!(entry_build_dir("index.js"), None);
+        assert_eq!(entry_build_dir("./index.mjs"), None);
     }
 
     #[test]

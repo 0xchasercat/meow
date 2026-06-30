@@ -620,7 +620,33 @@ impl NodeRequireLoader for RuntimeNodeBridge {
     }
 
     fn is_maybe_cjs_from_require(&self, specifier: &Url) -> Result<bool, PackageJsonLoadError> {
-        self.is_maybe_cjs(specifier)
+        // A `require()` resolves to CommonJS unless the target is *unambiguously*
+        // ESM — the Node-correct default for require, and a guard against a
+        // catastrophic failure mode: routing a CJS require through the ESM facade
+        // is a self-cycle. `Module._load` has already inserted an empty, mid-load
+        // entry in the CJS cache, so the facade's own `require()` observes empty
+        // exports and the module body never runs (every named export reads back
+        // `undefined`). `Module._compile` still falls back to the ESM translator on
+        // a genuine ESM `SyntaxError`, so treating an uncertain module as CommonJS
+        // is safe and only rescues modules an incomplete classification would have
+        // mis-sent to the facade. The import side (`is_maybe_cjs`) is unchanged.
+        if let Ok(path) = specifier.to_file_path() {
+            if path.starts_with(self.store.root()) {
+                return Ok(!matches!(
+                    self.module_kind(specifier),
+                    Some(meow_loader::ModuleKind::Esm)
+                ));
+            }
+            match path.extension().and_then(|ext| ext.to_str()) {
+                None | Some("cjs") | Some("cts") => return Ok(true),
+                Some("json") | Some("mjs") | Some("mts") => return Ok(false),
+                _ => {}
+            }
+        }
+        Ok(!matches!(
+            self.module_kind(specifier),
+            Some(meow_loader::ModuleKind::Esm)
+        ))
     }
 
     fn resolve_require_node_module_paths(&self, from: &Path) -> Vec<String> {

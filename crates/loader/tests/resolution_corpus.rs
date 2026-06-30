@@ -786,6 +786,75 @@ fn legacy_package_module_field_is_import_only_entrypoint() {
 }
 
 #[test]
+fn legacy_single_segment_module_field_keeps_commonjs_main_directory_as_cjs() {
+    // Regression for the `common-tags` build failure: a dual package with a
+    // directory `main` ("lib", CommonJS) and a single-segment `module` field
+    // ("es", ESM). `require()` must resolve to `lib/index.js` *as CommonJS*. The
+    // old `module`-field heuristic computed `Path::new("es").parent()` == `""`,
+    // and `Path::starts_with("")` is `true` for every path, so the whole package
+    // — including the CommonJS `lib/` tree — was classified ESM. That routed the
+    // CJS `require` through the ESM facade, whose own re-`require()` observed the
+    // half-built module and snapshotted every named export as `undefined`
+    // (`(0, common_tags_1.oneLine) is not a function`).
+    let proj = unique_dir("legacy-module-field-single-segment");
+    let cache = Arc::new(Cache::with_root(proj.join("cache")));
+    let package_hash = cache
+        .store(&archive(&[
+            (
+                "package.json",
+                br#"{"name":"tags-like","version":"1.0.0","main":"lib","module":"es"}"#,
+            ),
+            (
+                "lib/index.js",
+                b"module.exports = { oneLine: () => 'cjs' };\n",
+            ),
+            ("lib/oneLine/oneLine.js", b"module.exports = () => 'cjs';\n"),
+            ("es/index.js", b"export const oneLine = () => 'esm';\n"),
+        ]))
+        .expect("store tags-like package");
+
+    let mut lockfile = Lockfile::new();
+    lockfile.upsert(lock_entry("tags-like", "1.0.0", package_hash.clone(), &[]));
+    let deps = root_deps(&[("tags-like", "1.0.0")]);
+    let resolver = resolver_with(&proj, cache, lockfile, deps);
+    let referrer = Url::from_file_path(proj.join("main.cjs")).expect("referrer URL");
+
+    // `require("tags-like")` resolves to the CommonJS `lib/index.js` entry.
+    let required = resolver
+        .resolve_require("tags-like", &referrer)
+        .expect("require resolves");
+    assert_eq!(
+        required.url,
+        cache_url(&proj, &package_hash, "lib/index.js")
+    );
+    assert_eq!(required.kind, ModuleKind::Cjs);
+
+    // Re-resolving that file URL (what `is_maybe_cjs`/`module_kind` does) must
+    // also stay CommonJS — the exact classification that previously flipped ESM.
+    let lib_index = cache_url(&proj, &package_hash, "lib/index.js");
+    let reresolved = resolver
+        .resolve_require(lib_index.as_str(), &lib_index)
+        .expect("file-url require resolves");
+    assert_eq!(reresolved.kind, ModuleKind::Cjs);
+
+    // A deep CommonJS member of the same package is CommonJS, not ESM.
+    let leaf = cache_url(&proj, &package_hash, "lib/oneLine/oneLine.js");
+    let leaf_resolved = resolver
+        .resolve_require(leaf.as_str(), &leaf)
+        .expect("leaf require resolves");
+    assert_eq!(leaf_resolved.kind, ModuleKind::Cjs);
+
+    // The genuine ESM build is still import-resolved and classified ESM.
+    let imported = resolver
+        .resolve("tags-like", &referrer)
+        .expect("import resolves");
+    assert_eq!(imported.url, cache_url(&proj, &package_hash, "es/index.js"));
+    assert_eq!(imported.kind, ModuleKind::Esm);
+
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[test]
 fn legacy_module_field_does_not_mark_commonjs_main_directory_as_esm() {
     let proj = unique_dir("legacy-module-field-cjs-main-dir");
     let cache = Arc::new(Cache::with_root(proj.join("cache")));
