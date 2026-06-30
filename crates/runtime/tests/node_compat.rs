@@ -1416,8 +1416,8 @@ async fn commonjs_require_os_type_shape() {
         &entry,
         r#"const os = require("os");
 const hasTypeFunction = typeof os.type === "function";
-const hasStringType = typeof os.type() === "string";
-console.log(`${hasTypeFunction}:${hasStringType}`);
+const type = os.type();
+console.log(`${hasTypeFunction}:${type}`);
 "#,
     )
     .expect("write entry");
@@ -1429,7 +1429,22 @@ console.log(`${hasTypeFunction}:${hasStringType}`);
     run_file(&mut rt, &entry)
         .await
         .expect("CommonJS os.type runs");
-    assert_eq!(*out.borrow(), "true:true\n");
+    let expected = if cfg!(windows) {
+        "true:Windows_NT\n"
+    } else if cfg!(target_os = "macos") {
+        "true:Darwin\n"
+    } else if cfg!(target_os = "linux") {
+        "true:Linux\n"
+    } else {
+        let output = out.borrow();
+        assert!(
+            output.starts_with("true:") && output.trim().len() > "true:".len(),
+            "os.type should return a non-empty string, got: {output:?}"
+        );
+        std::fs::remove_dir_all(&proj).ok();
+        return;
+    };
+    assert_eq!(*out.borrow(), expected);
     std::fs::remove_dir_all(&proj).ok();
 }
 
