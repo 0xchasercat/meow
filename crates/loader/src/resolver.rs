@@ -500,16 +500,38 @@ impl Resolver {
                 && specifier.as_bytes()[1] == b':'
                 && (specifier.as_bytes()[2] == b'/' || specifier.as_bytes()[2] == b'\\'))
         {
-            // Strip Windows extended-length path prefix (\\?\) for URL compatibility
-            let normalized = specifier.strip_prefix("\\\\?\\").unwrap_or(specifier);
-            let joined =
-                referrer
-                    .join(normalized)
-                    .map_err(|_| ResolveError::SpecifierNotFound {
+            // Convert Windows paths to file:// URLs for proper resolution
+            let file_url = if specifier.starts_with("\\\\?\\") {
+                // Strip extended-length prefix and convert to file URL
+                let stripped = &specifier[4..];
+                let normalized = stripped.replace('\\', "/");
+                Url::parse(&format!("file:///{normalized}")).map_err(|_| {
+                    ResolveError::SpecifierNotFound {
                         specifier: specifier.to_owned(),
                         referrer: referrer.clone(),
-                    })?;
-            return self.finalize_joined(joined, specifier, referrer);
+                    }
+                })?
+            } else if specifier.len() >= 3
+                && specifier.as_bytes()[0].is_ascii_alphabetic()
+                && specifier.as_bytes()[1] == b':'
+            {
+                // Windows drive letter path - convert to file URL
+                let normalized = specifier.replace('\\', "/");
+                Url::parse(&format!("file:///{normalized}")).map_err(|_| {
+                    ResolveError::SpecifierNotFound {
+                        specifier: specifier.to_owned(),
+                        referrer: referrer.clone(),
+                    }
+                })?
+            } else {
+                referrer.join(specifier).map_err(|_| {
+                    ResolveError::SpecifierNotFound {
+                        specifier: specifier.to_owned(),
+                        referrer: referrer.clone(),
+                    }
+                })?
+            };
+            return self.finalize_joined(file_url, specifier, referrer);
         }
         if specifier.starts_with('#') {
             return self.locate_package_import(specifier, referrer, context);
