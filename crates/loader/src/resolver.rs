@@ -319,9 +319,12 @@ impl Resolver {
     /// removed virtual cache schemes), so ESM `locate`/`resolve`, the CJS
     /// require path, and owner referrers all agree on one URL per member.
     pub fn cached_url(&self, locator: &ModuleLocator) -> Result<Url, ResolveError> {
-        let path = self
-            .projected_path_for(locator)
-            .unwrap_or_else(|| self.runtime_path_for(locator).unwrap());
+        let path = match locator {
+            ModuleLocator::Cached { .. } => self
+                .projected_path_for(locator)
+                .map_or_else(|| self.runtime_path_for(locator), Ok)?,
+            _ => self.runtime_path_for(locator)?,
+        };
         Url::from_file_path(&path).map_err(|()| ResolveError::SpecifierNotFound {
             specifier: path.display().to_string(),
             referrer: self.project_root.clone(),
@@ -1406,6 +1409,17 @@ fn strip_store_prefix(path: &Path, root: &Path) -> Option<PathBuf> {
     if let Ok(rel) = path.strip_prefix(root) {
         return Some(rel.to_path_buf());
     }
+
+    // The cached file may not exist yet: resolving a file:// URL into the
+    // unpacked store is what triggers `UnpackedStore::ensure`. On Windows,
+    // URL conversion/canonicalization can also introduce or remove the `\\?\`
+    // extended-length prefix. Do a purely lexical normalized-prefix comparison
+    // before attempting canonicalization so missing cached members still classify
+    // as `ModuleLocator::Cached` and get unpacked instead of read as local files.
+    if let Some(rel) = strip_normalized_prefix(path, root) {
+        return Some(rel);
+    }
+
     let canonical_path = strip_unc_prefix(std::fs::canonicalize(path).ok()?);
     let stripped_root = strip_unc_prefix(root.to_path_buf());
     if let Ok(rel) = canonical_path.strip_prefix(&stripped_root) {
@@ -1416,6 +1430,28 @@ fn strip_store_prefix(path: &Path, root: &Path) -> Option<PathBuf> {
         .strip_prefix(&canonical_root)
         .ok()
         .map(|rel| rel.to_path_buf())
+}
+
+fn strip_normalized_prefix(path: &Path, root: &Path) -> Option<PathBuf> {
+    let path_text = normalize_path_text(path);
+    let mut root_text = normalize_path_text(root);
+    while root_text.ends_with('/') && root_text.len() > 1 {
+        root_text.pop();
+    }
+    let rel = path_text.strip_prefix(&root_text)?;
+    let rel = rel.strip_prefix('/').unwrap_or(rel);
+    if rel.is_empty() {
+        return Some(PathBuf::new());
+    }
+    Some(rel.split('/').collect())
+}
+
+fn normalize_path_text(path: &Path) -> String {
+    let mut text = path.to_string_lossy().replace('\\', "/");
+    if let Some(stripped) = text.strip_prefix("//?/") {
+        text = stripped.to_owned();
+    }
+    text
 }
 
 /// Strip Windows UNC extended-length prefix (\\?\) for path comparisons.
