@@ -806,10 +806,16 @@ pub(super) async fn run_native_request(
     // === /RT-007 ===
     // === /RT-006 ===
     // === WORKER-001 === register the cooperative-isolate worker host so JS
-    // `new Worker(...)` spawns worker isolates onto this thread's LocalSet.
-    extensions.push(super::worker::host_extension(WorkerSpawnConfig::new(
-        &ctx, &env, &flags,
-    )));
+    // `new Worker(...)` spawns worker isolates onto this thread's LocalSet. The
+    // ops live in `meow_runtime::worker` (baked into the snapshot); the binary
+    // edge supplies the spawner that builds + drives each worker isolate. MUST
+    // stay LAST so the extension/op order matches `build.rs` and
+    // `build_worker_runtime` (snapshot op indices are positional).
+    let worker_spawner: std::rc::Rc<dyn meow_runtime::worker::WorkerSpawner> =
+        std::rc::Rc::new(super::worker::CliWorkerSpawner {
+            config: WorkerSpawnConfig::new(&ctx, &env, &flags),
+        });
+    extensions.push(meow_runtime::worker::worker_extension(Some(worker_spawner)));
     // === /WORKER-001 ===
     let max_heap_size = flags.max_old_space_size.map(|mib| mib * 1024 * 1024);
     let startup_snapshot = if flags.no_snapshot {
@@ -907,7 +913,7 @@ impl WorkerSpawnConfig {
 pub(super) fn build_worker_runtime(
     config: &WorkerSpawnConfig,
     spec: &meow_runtime::ModuleSpecifier,
-    worker_side: super::worker::WorkerSideState,
+    worker_side: meow_runtime::worker::WorkerSideState,
 ) -> Result<meow_runtime::Runtime, String> {
     let ctx = &config.ctx;
     let env = config.env.clone();
@@ -932,7 +938,6 @@ pub(super) fn build_worker_runtime(
         meow_runtime::http_extension(),
         meow_runtime::ui_extension(),
         meow_loader::cjs_resolve_extension(resolver.clone()),
-        super::worker::guest_extension(),
     ];
     meow_runtime::hermetic::pin_deterministic_intl(&config.hermetic);
     extensions.extend(meow_runtime::hermetic::extensions(config.hermetic.clone()));
@@ -954,6 +959,11 @@ pub(super) fn build_worker_runtime(
             user_agent: Some(format!("meow/{}", env!("CARGO_PKG_VERSION"))),
         },
     ));
+    // WORKER-001: worker ops LAST so the extension/op order matches `build.rs`
+    // and `run_native_request` (snapshot op indices are positional). No spawner
+    // here -> a nested `new Worker(...)` inside a worker is inert for now; this
+    // worker's own channels are installed below as `WorkerSideState`.
+    extensions.push(meow_runtime::worker::worker_extension(None));
 
     let startup_snapshot = if config.no_snapshot {
         None

@@ -55,6 +55,13 @@ pub mod hermetic;
 /// [`node::extensions`].
 pub mod node;
 // === /RT-007 ===
+// === WORKER-001 ===
+/// Cooperative-isolate `node:worker_threads` ops + manager, baked into the V8
+/// snapshot. The host runtime-construction edge (resolver / module graph /
+/// worker-isolate driver) lives at the binary edge and plugs in through the
+/// [`worker::WorkerSpawner`] seam. See [`worker::worker_extension`].
+pub mod worker;
+// === /WORKER-001 ===
 
 use deno_core::{JsRuntime, ModuleId, PollEventLoopOptions, RuntimeOptions as DenoRuntimeOptions};
 

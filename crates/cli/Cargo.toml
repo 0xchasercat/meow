@@ -49,11 +49,12 @@ regex = { workspace = true }
 # === /ADR-5 ===
 
 deno_error = { workspace = true }
-# === WORKER-001 === cooperative-isolate node:worker_threads host. The worker ops
-# (`commands::worker`) use deno_core's `op2`/`extension!` macros directly, so the
-# edge needs deno_core as a runtime dep (already a build-dep for the snapshot).
-# V8 types still flow through the `meow_runtime::v8` re-exports.
-deno_core = { workspace = true }
+# === WORKER-001 === the cooperative-isolate node:worker_threads OPS now live in
+# `meow_runtime::worker` (so they bake into the V8 snapshot). The CLI is only the
+# host edge: it implements `meow_runtime::worker::WorkerSpawner` and drives the
+# worker isolates. It needs NO direct deno_core dep — V8 types flow through the
+# `meow_runtime` re-exports (I-10 single-edge invariant); deno_core remains a
+# build-dep below for snapshot baking.
 deno_node = { workspace = true }
 deno_permissions = { workspace = true }
 deno_semver = { workspace = true }

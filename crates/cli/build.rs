@@ -116,5 +116,14 @@ fn build_full_extension_set() -> Vec<deno_core::Extension> {
         user_agent: Some("meow/snapshot".to_string()),
     };
     extensions.extend(meow_runtime::node::extensions(node_opts));
+
+    // === WORKER-001 === bake the cooperative-isolate worker ops into the
+    // snapshot so `core.ops.op_meow_worker_*` resolve from it (runtime-only
+    // extension ops are NOT exposed on `core.ops` under a snapshot). `None`
+    // spawner at snapshot time — the binary edge installs the real spawner at
+    // runtime via `worker_extension(Some(..))`. MUST stay LAST to match the
+    // order in `run_native_request` + `build_worker_runtime` (op indices are
+    // positional).
+    extensions.push(meow_runtime::worker::worker_extension(None));
     extensions
 }
