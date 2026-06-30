@@ -345,14 +345,44 @@ fn sync_generates_shadow_configs() {
 }
 
 #[test]
-fn sync_missing_config_uses_hiss_envelope_in_plain_output() {
-    let tmp = load_tmp("sync-missing");
+fn sync_without_config_uses_default_config() {
+    let tmp = load_tmp("sync-default");
     let out = meow()
         .current_dir(&tmp)
         .arg("sync")
         .output()
         .expect("run sync");
-    assert!(!out.status.success(), "sync without config should fail");
+    assert!(out.status.success(), "sync without config should succeed");
+    let stdout = String::from_utf8(out.stdout).expect("stdout utf8");
+    let stderr = String::from_utf8(out.stderr).expect("stderr utf8");
+    assert!(
+        stdout.contains("meow sync: regenerated .meow/tsconfig.json"),
+        "sync success should use the purr envelope: {stdout:?}"
+    );
+    assert!(
+        stderr.is_empty(),
+        "sync success keeps stderr empty: {stderr:?}"
+    );
+    assert!(
+        tmp.join(".meow/tsconfig.json").is_file(),
+        "shadow .meow/tsconfig.json generated"
+    );
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[test]
+fn sync_invalid_config_uses_hiss_envelope_in_plain_output() {
+    let tmp = load_tmp("sync-invalid");
+    std::fs::write(tmp.join("meow.config.json"), "{").expect("write config");
+    let out = meow()
+        .current_dir(&tmp)
+        .arg("sync")
+        .output()
+        .expect("run sync");
+    assert!(
+        !out.status.success(),
+        "sync with invalid config should fail"
+    );
     let stdout = String::from_utf8(out.stdout).expect("stdout utf8");
     let stderr = String::from_utf8(out.stderr).expect("stderr utf8");
     assert!(stdout.is_empty(), "sync errors stay off stdout: {stdout:?}");

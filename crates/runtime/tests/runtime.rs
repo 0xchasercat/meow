@@ -33,10 +33,6 @@ fn capture() -> (
     (out, err, print_sink_extension(sink))
 }
 
-fn spec(url: &str) -> ModuleSpecifier {
-    ModuleSpecifier::parse(url).expect("valid specifier")
-}
-
 fn runtime_with(extensions: Vec<deno_core::Extension>) -> (Runtime, std::path::PathBuf) {
     let root = real_loader::unique_dir("runtime");
     Runtime::new(RuntimeOptions {

@@ -207,7 +207,7 @@ pub fn cmd_types(args: &TypesArgs) -> ExitCode {
 /// (`meow-config`) stays free of ambient reads (I-6).
 pub fn cmd_sync() -> ExitCode {
     let root = match std::env::current_dir() {
-        Ok(dir) => dir,
+        Ok(dir) => find_project_root(&dir),
         Err(err) => {
             hiss(&format!(
                 "meow sync: cannot resolve the current directory: {err}"
@@ -217,6 +217,7 @@ pub fn cmd_sync() -> ExitCode {
     };
     let cfg = match meow_config::MeowConfig::load(&root) {
         Ok(cfg) => cfg,
+        Err(meow_config::ConfigError::NotFound(_)) => meow_config::MeowConfig::default(),
         Err(err) => {
             hiss(&format!("meow sync: {err}"));
             return ExitCode::FAILURE;
