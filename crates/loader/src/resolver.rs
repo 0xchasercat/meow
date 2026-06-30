@@ -1406,15 +1406,26 @@ fn strip_store_prefix(path: &Path, root: &Path) -> Option<PathBuf> {
     if let Ok(rel) = path.strip_prefix(root) {
         return Some(rel.to_path_buf());
     }
-    let canonical_path = std::fs::canonicalize(path).ok()?;
-    if let Ok(rel) = canonical_path.strip_prefix(root) {
+    let canonical_path = strip_unc_prefix(std::fs::canonicalize(path).ok()?);
+    let stripped_root = strip_unc_prefix(root.to_path_buf());
+    if let Ok(rel) = canonical_path.strip_prefix(&stripped_root) {
         return Some(rel.to_path_buf());
     }
-    let canonical_root = std::fs::canonicalize(root).ok()?;
+    let canonical_root = strip_unc_prefix(std::fs::canonicalize(root).ok()?);
     canonical_path
         .strip_prefix(&canonical_root)
         .ok()
         .map(|rel| rel.to_path_buf())
+}
+
+/// Strip Windows UNC extended-length prefix (\\?\) for path comparisons.
+fn strip_unc_prefix(path: PathBuf) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(stripped) = s.strip_prefix("\\\\?\\") {
+        PathBuf::from(stripped)
+    } else {
+        path
+    }
 }
 
 fn finalize_local_path(path: &Path) -> Option<PathBuf> {

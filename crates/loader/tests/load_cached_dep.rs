@@ -28,7 +28,17 @@ fn unique_dir(tag: &str) -> std::path::PathBuf {
     let mut dir = std::env::temp_dir();
     dir.push(format!("meow-loader-test-{tag}-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temp dir");
-    std::fs::canonicalize(dir).expect("canonicalize temp dir")
+    strip_unc_prefix(std::fs::canonicalize(dir).expect("canonicalize temp dir"))
+}
+
+/// Strip Windows UNC extended-length prefix (\\?\) for path comparisons.
+fn strip_unc_prefix(path: std::path::PathBuf) -> std::path::PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(stripped) = s.strip_prefix("\\\\?\\") {
+        std::path::PathBuf::from(stripped)
+    } else {
+        path
+    }
 }
 
 fn cache_arc(root: &Path) -> Arc<Cache> {
