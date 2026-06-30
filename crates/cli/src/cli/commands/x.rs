@@ -137,6 +137,10 @@ pub fn cmd_x(args: &XArgs) -> ExitCode {
             let installer =
                 meow_pkg::Installer::new(registry.clone(), &cache, registry.base_url(), meow_req)
                     .with_overrides(overrides);
+            let u = ui();
+            // Branded paw spinner in a TTY; inert (no thread, no control chars)
+            // when piped/CI, so ephemeral installs never leak ANSI into logs.
+            let spinner = u.spinner("resolving dependencies");
             let lockfile = installer
                 .resolve_with_progress_async(&dep_map, |progress| {
                     let label = match progress {
@@ -150,12 +154,11 @@ pub fn cmd_x(args: &XArgs) -> ExitCode {
                             format!("linking {package}")
                         }
                     };
-                    // Quick feedback via stderr — no spinner needed for ephemeral installs
-                    eprint!("\r  \u{1b}[2m{label}\u{1b}[0m");
+                    spinner.set_label(label);
                 })
                 .await
                 .map_err(|err| format!("{err}"))?;
-            eprint!("\r\u{1b}[2K"); // clear the progress line
+            spinner.clear();
             let lock_path = temp_dir.join("meow.lock.jsonl");
             lockfile
                 .write_canonical(&lock_path)

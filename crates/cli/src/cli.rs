@@ -296,6 +296,9 @@ const KNOWN_COMMANDS: &[&str] = &[
     "del",
     "delete",
     "uninstall",
+    "search",
+    "s",
+    "find",
     "task",
     "test",
     "check",
@@ -380,6 +383,9 @@ pub enum Command {
     /// Remove a dependency + update the lockfile.
     #[command(alias = "rm", alias = "del", alias = "delete", alias = "uninstall")]
     Remove(PkgArgs),
+    /// Search the npm registry for packages.
+    #[command(alias = "s", alias = "find")]
+    Search(SearchArgs),
     /// Run a typed task from meow.tasks.ts.
     Task(TaskArgs),
     /// Isolate-backed test runner.
@@ -422,6 +428,19 @@ pub struct InitArgs {
     /// Skip installing dependencies after creating config files.
     #[arg(long)]
     pub no_install: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SearchArgs {
+    /// Text to search for on the registry (multiple words are joined).
+    #[arg(required = true, num_args = 1.., value_name = "QUERY")]
+    pub query: Vec<String>,
+    /// Maximum number of results to show (default 20, max 250).
+    #[arg(long, short = 'n', value_name = "N")]
+    pub limit: Option<usize>,
+    /// Emit raw JSON results instead of the formatted table.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -679,6 +698,7 @@ impl Cli {
             Command::Install(args) => commands::cmd_install(&args),
             Command::Add(args) => commands::cmd_add(&args),
             Command::Remove(args) => commands::cmd_remove(&args),
+            Command::Search(args) => commands::cmd_search(&args),
             // === /PKG-002 ===
             // === RT-005 ===
             Command::Types(args) => commands::cmd_types(&args),
@@ -960,6 +980,7 @@ fn command_catalog() -> Vec<meow_ui::CommandGroup<'static>> {
                 ("install", "Resolve and install dependencies"),
                 ("add", "Add a dependency and update the lockfile"),
                 ("remove", "Remove a dependency"),
+                ("search", "Search the registry for packages"),
                 ("why-dep", "Explain why a package is in the tree"),
             ],
         },

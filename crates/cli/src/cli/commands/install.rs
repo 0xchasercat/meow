@@ -19,6 +19,13 @@ const NPM_TARBALL_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
 const NPM_FETCH_RETRIES: usize = 5;
 const NPM_HTTP_CONCURRENCY: usize = 40;
 const NPM_FETCH_INITIAL_RETRY_DELAY_MS: u64 = 100;
+/// Freshness window for cached registry metadata, matching the npm registry's own
+/// `Cache-Control: max-age`. Past this age meow revalidates against the registry,
+/// so a newly published version is not invisible forever (the stale-cache bug
+/// where `meow install` reported "no published version satisfies <req>" for a
+/// version that existed upstream). Override with `MEOW_METADATA_MAX_AGE_SECS`
+/// (`0` always revalidates; a large value stays effectively offline).
+const NPM_METADATA_MAX_AGE_SECS: u64 = 300;
 
 fn transient_registry_status(status: u16) -> bool {
     matches!(status, 408 | 425 | 429 | 500 | 502 | 503 | 504)
@@ -30,6 +37,25 @@ async fn sleep_before_retry(attempt: usize) {
         NPM_FETCH_INITIAL_RETRY_DELAY_MS * factor,
     ))
     .await;
+}
+
+/// The freshness window for cached registry metadata. Defaults to
+/// [`NPM_METADATA_MAX_AGE_SECS`]; `MEOW_METADATA_MAX_AGE_SECS` overrides it.
+fn metadata_max_age() -> std::time::Duration {
+    std::env::var("MEOW_METADATA_MAX_AGE_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(std::time::Duration::from_secs(NPM_METADATA_MAX_AGE_SECS))
+}
+
+/// Whether the cache file at `path` was last modified within `max_age` of now.
+fn cache_is_fresh(path: &Path, max_age: std::time::Duration) -> bool {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age <= max_age)
 }
 
 /// Production npm registry client. Lives at the CLI edge so `meow-pkg` stays
@@ -137,39 +163,79 @@ impl NpmRegistry {
         let trace = std::env::var_os("MEOW_INSTALL_TRACE").is_some();
         let t0 = std::time::Instant::now();
 
-        // Compact metadata cache: synchronous read + parse for small files.
-        // The compact cache is 10-100x smaller than the raw npm document,
-        // so reading + parsing on the async thread is faster than the
-        // spawn_blocking thread pool hop overhead (~1ms per hop).
-        let compact_path = self.metadata_cache_compact_path(name);
-        if let Ok(bytes) = std::fs::read(&compact_path) {
-            if let Ok(meta) = serde_json::from_slice::<meow_pkg::PackageMetadata>(&bytes) {
-                if trace {
-                    eprintln!(
-                        "[trace] metadata compact HIT {name}: {}μs",
-                        t0.elapsed().as_micros()
-                    );
+        // Fast path: a cached metadata document that is still fresh. Unlike a
+        // forever cache, this revalidates against the registry once the entry
+        // ages past `metadata_max_age()` (default: the npm registry's own
+        // `Cache-Control: max-age`), so a newly published version (e.g. a fresh
+        // `vite`) is not invisible forever.
+        if let Some(meta) = self
+            .read_cached_metadata(name, Some(metadata_max_age()))
+            .await
+        {
+            if trace {
+                eprintln!(
+                    "[trace] metadata fresh-cache HIT {name}: {}μs",
+                    t0.elapsed().as_micros()
+                );
+            }
+            return Ok(meta);
+        }
+
+        if trace {
+            eprintln!("[trace] metadata cache MISS/stale {name}, fetching from network");
+        }
+
+        match self.fetch_metadata_network(name).await {
+            Ok(meta) => Ok(meta),
+            Err(err) => {
+                // Offline / registry-failure resilience: serve any cached copy,
+                // even if stale, rather than failing the install outright.
+                if let Some(meta) = self.read_cached_metadata(name, None).await {
+                    if trace {
+                        eprintln!(
+                            "[trace] metadata network failed ({err}), serving stale cache {name}"
+                        );
+                    }
+                    return Ok(meta);
                 }
-                return Ok(meta);
+                Err(err)
+            }
+        }
+    }
+
+    /// Read package metadata from the on-disk cache. With `max_age` set, only an
+    /// entry modified within that window is returned (the fresh probe); with
+    /// `None`, any cached copy is accepted (the offline / stale fallback). Reads
+    /// the compact cache first, then the raw npm document (refreshing the compact
+    /// cache from it).
+    async fn read_cached_metadata(
+        &self,
+        name: &meow_pkg::PackageName,
+        max_age: Option<std::time::Duration>,
+    ) -> Option<meow_pkg::PackageMetadata> {
+        let fresh_enough = |path: &Path| max_age.is_none_or(|age| cache_is_fresh(path, age));
+
+        let compact_path = self.metadata_cache_compact_path(name);
+        if fresh_enough(&compact_path) {
+            if let Ok(bytes) = std::fs::read(&compact_path) {
+                if let Ok(meta) = serde_json::from_slice::<meow_pkg::PackageMetadata>(&bytes) {
+                    return Some(meta);
+                }
             }
         }
 
-        // Fall back to raw JSON cache (larger, needs spawn_blocking for parse).
         let raw_path = self.metadata_cache_path(name);
-        if let Ok(bytes) = std::fs::read(&raw_path) {
-            let bytes_for_parse = bytes.clone();
-            let parse_result = tokio::task::spawn_blocking(move || {
-                serde_json::from_slice::<meow_pkg::PackageMetadata>(&bytes_for_parse)
-            })
-            .await
-            .map_err(|err| meow_pkg::RegistryError::Fetch {
-                target: "metadata cache parse".to_owned(),
-                reason: err.to_string(),
-            })?;
-            if let Ok(meta) = parse_result {
-                // Write compact cache from the parsed metadata.
+        if fresh_enough(&raw_path) {
+            if let Ok(bytes) = std::fs::read(&raw_path) {
+                let parsed = tokio::task::spawn_blocking(move || {
+                    serde_json::from_slice::<meow_pkg::PackageMetadata>(&bytes)
+                })
+                .await
+                .ok()?
+                .ok()?;
+                // Refresh the compact cache from the parsed raw document.
                 let compact_path = compact_path.clone();
-                let meta_clone = meta.clone();
+                let meta_clone = parsed.clone();
                 tokio::task::spawn_blocking(move || {
                     let _ = std::fs::create_dir_all(compact_path.parent().unwrap_or(&compact_path));
                     if let Ok(compact) = serde_json::to_vec(&meta_clone) {
@@ -180,20 +246,19 @@ impl NpmRegistry {
                 })
                 .await
                 .ok();
-                if trace {
-                    eprintln!(
-                        "[trace] metadata raw HIT {name}: {}μs",
-                        t0.elapsed().as_micros()
-                    );
-                }
-                return Ok(meta);
+                return Some(parsed);
             }
         }
 
-        if trace {
-            eprintln!("[trace] metadata cache MISS {name}, fetching from network");
-        }
+        None
+    }
 
+    /// Fetch package metadata from the npm registry over the network, writing the
+    /// raw + compact caches on success. Retries transient failures.
+    async fn fetch_metadata_network(
+        &self,
+        name: &meow_pkg::PackageName,
+    ) -> Result<meow_pkg::PackageMetadata, meow_pkg::RegistryError> {
         let url = self.metadata_url(name);
         let client = self.client()?;
         for attempt in 0..NPM_FETCH_RETRIES {

@@ -314,7 +314,7 @@ pub fn cmd_why_dep(args: &WhyDepArgs) -> ExitCode {
 
     if args.json {
         match serde_json::to_string_pretty(&report) {
-            Ok(json) => println!("{json}"),
+            Ok(json) => ui().out(&json),
             Err(err) => {
                 hiss(&format!("meow why-dep: {err}"));
                 return ExitCode::FAILURE;

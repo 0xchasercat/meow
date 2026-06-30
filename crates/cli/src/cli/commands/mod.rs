@@ -8,6 +8,7 @@
 pub mod info;
 pub mod install;
 pub mod run;
+pub mod search;
 pub mod test;
 pub mod tool;
 pub mod x;
@@ -17,6 +18,7 @@ pub use info::{
 };
 pub use install::{cmd_add, cmd_install, cmd_remove};
 pub use run::{cmd_dev, cmd_node_eval, cmd_run, cmd_task};
+pub use search::cmd_search;
 pub use test::cmd_test;
 pub use tool::{cmd_bundle, cmd_check, cmd_fmt, cmd_lint};
 pub use x::cmd_x;
