@@ -451,7 +451,7 @@ fn materialize_is_idempotent_and_reconciles_missing_edges() {
 
     let missing_edge = root.join("node_modules/.meow/app@1.0.0/node_modules/dep");
     if missing_edge.is_dir() {
-        fs::remove_dir_all(&missing_edge).expect("remove dep edge dir");
+        fs::remove_dir(&missing_edge).expect("remove dep edge dir");
     } else {
         fs::remove_file(&missing_edge).expect("remove dep edge");
     }

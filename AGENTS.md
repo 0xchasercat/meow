@@ -35,7 +35,7 @@ Before you generate a single line of code, you must pass your proposed solution 
 ### Package Management & Materialization
 *   **No Symlinks for Packages:** We do not use symlinks to materialize `node_modules` packages, as this breaks V8 and Vite's `fs.realpath` resolution.
 *   **The APFS / Hardlink Strategy:** Packages are materialized into project-local `node_modules` using the macOS `clonefile(2)` kernel syscall for O(1) cloning. On Linux/Windows, we fall back to recursive hardlinking. 
-*   Dependency *edges* (the pointers inside a package's `node_modules` linking to another package) remain symlinks/junctions on Unix-like systems. On Windows CI and default Windows developer machines, symlink/junction privileges are not guaranteed; `node_modules` materialization must fall back to copy-based edges instead of failing with `SymlinkUnsupported`.
+*   Dependency *edges* (the pointers inside a package's `node_modules` linking to another package) remain links, not copies: Unix uses symlinks; Windows uses NTFS directory junctions because directory symlinks require privileges in CI. Do not replace Windows edges with deep copies — that hides graph bugs and bloats node_modules.
 
 ### Cryptography and Network I/O
 *   **No Network Starvation:** Downloading tarballs and fetching metadata is network-I/O bound (Tokio async). Decompressing tarballs (`zlib-ng`) and validating SHA-512 integrity is CPU-bound. 

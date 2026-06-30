@@ -5,6 +5,8 @@ use std::io::{self, ErrorKind, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+#[cfg(windows)]
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use rayon::prelude::*;
@@ -1343,6 +1345,25 @@ fn ensure_dir(path: &Path) -> Result<(), MaterializeError> {
     ensure_dir_fast(path)
 }
 
+#[cfg(windows)]
+fn create_windows_junction(target: &Path, path: &Path) -> io::Result<()> {
+    let status = Command::new("cmd")
+        .arg("/C")
+        .arg("mklink")
+        .arg("/J")
+        .arg(path)
+        .arg(target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other("mklink /J failed"))
+    }
+}
+
 fn create_symlink(target: &Path, path: &Path) -> Result<(), MaterializeError> {
     #[cfg(unix)]
     {
@@ -1350,7 +1371,25 @@ fn create_symlink(target: &Path, path: &Path) -> Result<(), MaterializeError> {
             path: path.to_path_buf(),
         })
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // Dependency edges are directories. On Windows, use an NTFS junction
+        // instead of a symlink: directory symlinks require developer-mode/admin
+        // privileges in CI, while junctions are the native unprivileged edge
+        // primitive package managers use for node_modules graphs. Rust's
+        // std::os::windows::fs::junction_point is still unstable, so use the
+        // stable OS command.
+        let target_abs = path
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(target);
+        create_windows_junction(&target_abs, path).map_err(|_| {
+            MaterializeError::SymlinkUnsupported {
+                path: path.to_path_buf(),
+            }
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = target;
         let _ = path;
@@ -1504,13 +1543,7 @@ fn parts_to_path(parts: &[String]) -> PathBuf {
 
 fn effective_link(opts: &MaterializeOptions) -> LinkStrategy {
     match opts.projection {
-        Projection::NodeModules => {
-            if cfg!(windows) {
-                LinkStrategy::Copy
-            } else {
-                LinkStrategy::Symlink
-            }
-        }
+        Projection::NodeModules => LinkStrategy::Symlink,
         Projection::Vendor => LinkStrategy::Copy,
     }
 }
@@ -1599,19 +1632,14 @@ mod tests {
 
     #[test]
     fn projection_link_policy_is_strict() {
-        let expected_node_modules = if cfg!(windows) {
-            LinkStrategy::Copy
-        } else {
-            LinkStrategy::Symlink
-        };
         let mut node_modules = MaterializeOptions::node_modules();
-        assert_eq!(effective_link(&node_modules), expected_node_modules);
+        assert_eq!(effective_link(&node_modules), LinkStrategy::Symlink);
 
         node_modules.link = LinkStrategy::Copy;
-        assert_eq!(effective_link(&node_modules), expected_node_modules);
+        assert_eq!(effective_link(&node_modules), LinkStrategy::Symlink);
 
         node_modules.link = LinkStrategy::Auto;
-        assert_eq!(effective_link(&node_modules), expected_node_modules);
+        assert_eq!(effective_link(&node_modules), LinkStrategy::Symlink);
 
         let mut vendor = MaterializeOptions::vendor();
         vendor.link = LinkStrategy::Symlink;
