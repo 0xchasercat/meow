@@ -500,8 +500,12 @@ impl Resolver {
                 && specifier.as_bytes()[1] == b':'
                 && (specifier.as_bytes()[2] == b'/' || specifier.as_bytes()[2] == b'\\'))
         {
+            // Strip Windows extended-length path prefix (\\?\) for URL compatibility
+            let normalized = specifier
+                .strip_prefix("\\\\?\\")
+                .unwrap_or(specifier);
             let joined = referrer
-                .join(specifier)
+                .join(normalized)
                 .map_err(|_| ResolveError::SpecifierNotFound {
                     specifier: specifier.to_owned(),
                     referrer: referrer.clone(),
