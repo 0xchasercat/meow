@@ -501,9 +501,8 @@ impl Resolver {
                 && (specifier.as_bytes()[2] == b'/' || specifier.as_bytes()[2] == b'\\'))
         {
             // Convert Windows paths to file:// URLs for proper resolution
-            let file_url = if specifier.starts_with("\\\\?\\") {
+            let file_url = if let Some(stripped) = specifier.strip_prefix("\\\\?\\") {
                 // Strip extended-length prefix and convert to file URL
-                let stripped = &specifier[4..];
                 let normalized = stripped.replace('\\', "/");
                 Url::parse(&format!("file:///{normalized}")).map_err(|_| {
                     ResolveError::SpecifierNotFound {
