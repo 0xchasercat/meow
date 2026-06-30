@@ -11,6 +11,7 @@ pub mod run;
 pub mod search;
 pub mod test;
 pub mod tool;
+pub mod worker;
 pub mod x;
 
 pub use info::{

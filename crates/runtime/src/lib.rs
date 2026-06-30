@@ -301,6 +301,21 @@ impl Runtime {
             .map_err(|err| RuntimeError::EventLoop(Box::new(err)))
     }
 
+    /// The runtime's shared op-state. Used to install per-worker channel state
+    /// for the cooperative-isolate `node:worker_threads` host (the worker driver
+    /// inserts the worker side's message queues + serialized `workerData`).
+    pub fn op_state(&self) -> std::rc::Rc<std::cell::RefCell<deno_core::OpState>> {
+        self.js_runtime.op_state()
+    }
+
+    /// A thread-safe handle to this runtime's V8 isolate. The cooperative worker
+    /// host calls `terminate_execution()` on a worker's handle to stop it without
+    /// borrowing the worker's single-owner `JsRuntime` (which its own driver task
+    /// holds across `run_event_loop().await`).
+    pub fn isolate_handle(&mut self) -> deno_core::v8::IsolateHandle {
+        self.js_runtime.v8_isolate().thread_safe_handle()
+    }
+
     /// Take and clear a `process.exit(code)` request recorded by RT-007's node
     /// bootstrap, if the run triggered one.
     pub fn take_process_exit_code(&mut self) -> Option<i32> {

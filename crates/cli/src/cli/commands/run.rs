@@ -286,11 +286,13 @@ pub fn cmd_node_eval(args: NodeEvalArgs) -> ExitCode {
         .enable_all()
         .build()
     {
-        Ok(rt) => match rt.block_on(run_native_request(
+        // LocalSet so `node:worker_threads` workers can `spawn_local` onto this
+        // thread (see `commands::worker`).
+        Ok(rt) => match rt.block_on(tokio::task::LocalSet::new().run_until(run_native_request(
             &request,
             flags,
             host_env_map(flags.allow_env, meow_runtime::node::NodeMode::Enabled),
-        )) {
+        ))) {
             Ok(code) => code,
             Err(err) => {
                 hiss(&format!("node: {err}"));
@@ -337,7 +339,11 @@ fn cmd_run_result(target: &str, flags: RunFlagView<'_>) -> Result<ExitCode, RunC
         .enable_all()
         .build()
         .map_err(RunCommandError::AsyncRuntime)?;
-    async_rt.block_on(async move {
+    // Cooperative-isolate workers (`node:worker_threads`) run as `spawn_local`
+    // tasks on this thread, so the main module must be driven inside a `LocalSet`
+    // (see `commands::worker`). No behavior change when no worker is spawned.
+    let local = tokio::task::LocalSet::new();
+    async_rt.block_on(local.run_until(async move {
         if let Some(project_dir) = find_package_root(&cwd) {
             let package_json = meow_config::PackageJson::read(&project_dir)?;
             if package_json.scripts.contains_key(target) {
@@ -353,7 +359,7 @@ fn cmd_run_result(target: &str, flags: RunFlagView<'_>) -> Result<ExitCode, RunC
             host_env_map(flags.allow_env, meow_runtime::node::NodeMode::Enabled),
         )
         .await
-    })
+    }))
 }
 
 async fn execute_package_script(
@@ -799,6 +805,12 @@ pub(super) async fn run_native_request(
     ));
     // === /RT-007 ===
     // === /RT-006 ===
+    // === WORKER-001 === register the cooperative-isolate worker host so JS
+    // `new Worker(...)` spawns worker isolates onto this thread's LocalSet.
+    extensions.push(super::worker::host_extension(WorkerSpawnConfig::new(
+        &ctx, &env, &flags,
+    )));
+    // === /WORKER-001 ===
     let max_heap_size = flags.max_old_space_size.map(|mib| mib * 1024 * 1024);
     let startup_snapshot = if flags.no_snapshot {
         None
@@ -861,6 +873,126 @@ pub(super) async fn run_native_request(
         },
     }
 }
+
+// === WORKER-001 ===
+/// Owned inputs captured from a `run_native_request` so a cooperative-isolate
+/// worker (`commands::worker`) can build its own runtime later, on the LocalSet.
+#[derive(Clone)]
+pub(super) struct WorkerSpawnConfig {
+    ctx: RuntimeContext,
+    env: BTreeMap<String, String>,
+    hermetic: meow_runtime::hermetic::HermeticConfig,
+    max_heap_size: Option<usize>,
+    no_snapshot: bool,
+    v8_flags: Option<String>,
+}
+
+impl WorkerSpawnConfig {
+    fn new(ctx: &RuntimeContext, env: &BTreeMap<String, String>, flags: &RunFlagView<'_>) -> Self {
+        WorkerSpawnConfig {
+            ctx: ctx.clone(),
+            env: env.clone(),
+            hermetic: run_hermetic_config(flags, ctx.node_mode),
+            max_heap_size: flags.max_old_space_size.map(|mib| mib * 1024 * 1024),
+            no_snapshot: flags.no_snapshot,
+            v8_flags: flags.v8_flags.map(str::to_owned),
+        }
+    }
+}
+
+/// Build a worker isolate's runtime. Reuses the project's resolver + Oxc module
+/// graph by `Rc`/`Arc` clone (the worker lives on the same OS thread), and keys
+/// the runtime to the worker module + the worker-side message channels. Mirrors
+/// `run_native_request`'s construction; the caller drives the runtime.
+pub(super) fn build_worker_runtime(
+    config: &WorkerSpawnConfig,
+    spec: &meow_runtime::ModuleSpecifier,
+    worker_side: super::worker::WorkerSideState,
+) -> Result<meow_runtime::Runtime, String> {
+    let ctx = &config.ctx;
+    let env = config.env.clone();
+    let resolver = meow_loader::Resolver::from_resolution(
+        &ctx.graph,
+        ctx.cache.clone(),
+        ctx.project_root.clone(),
+        meow_runtime::native::native_module_registry(),
+    );
+    let loader: std::rc::Rc<dyn meow_runtime::deno_core::ModuleLoader> =
+        std::rc::Rc::new(meow_loader::MeowModuleLoader::new(
+            resolver.clone(),
+            std::rc::Rc::new(std::cell::RefCell::new(meow_graph::GraphDb::new())),
+        ));
+    let deno_node_bridge: std::rc::Rc<dyn meow_runtime::node::DenoNodeBridge> =
+        std::rc::Rc::new(RuntimeNodeBridge::new(resolver.clone(), ctx.cache.clone()));
+    let deno_node_services =
+        meow_runtime::node::DenoNodeServicesBuilder::new(deno_node_bridge).build();
+
+    let caps: meow_runtime::web::NetCaps = std::sync::Arc::new(meow_runtime::AllowAll);
+    let mut extensions = Vec::new();
+    extensions.push(meow_runtime::http_extension());
+    extensions.push(meow_runtime::ui_extension());
+    extensions.push(meow_loader::cjs_resolve_extension(resolver.clone()));
+    extensions.push(super::worker::guest_extension());
+    meow_runtime::hermetic::pin_deterministic_intl(&config.hermetic);
+    extensions.extend(meow_runtime::hermetic::extensions(config.hermetic.clone()));
+
+    let worker_path = spec
+        .to_file_path()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| spec.to_string());
+    let node_argv = vec!["meow".to_owned(), worker_path];
+    extensions.extend(meow_runtime::node::extensions(
+        meow_runtime::node::NodeOptions {
+            mode: ctx.node_mode,
+            argv: node_argv.clone(),
+            main_module: Some(spec.to_string()),
+            cwd: ctx.project_dir.clone(),
+            env: env.clone(),
+            deno_node_services: Some(deno_node_services),
+            caps: Some(caps),
+            user_agent: Some(format!("meow/{}", env!("CARGO_PKG_VERSION"))),
+        },
+    ));
+
+    let startup_snapshot = if config.no_snapshot {
+        None
+    } else {
+        Some(crate::SNAPSHOT_BLOB)
+    };
+    let (residual_lazy_js, residual_lazy_esm): ResidualLazySources = if startup_snapshot.is_some() {
+        (crate::RESIDUAL_LAZY_JS, crate::RESIDUAL_LAZY_ESM)
+    } else {
+        (&[], &[])
+    };
+    let mut runtime = meow_runtime::Runtime::new(meow_runtime::RuntimeOptions {
+        module_loader: loader,
+        extensions,
+        max_heap_size: config.max_heap_size,
+        startup_snapshot,
+        residual_lazy_js_sources: residual_lazy_js,
+        residual_lazy_esm_sources: residual_lazy_esm,
+        v8_flags: config.v8_flags.clone(),
+    })
+    .map_err(|err| err.to_string())?;
+    runtime
+        .apply_hermetic_shadows()
+        .map_err(|err| err.to_string())?;
+    if startup_snapshot.is_some() {
+        runtime
+            .refresh_node_bootstrap(
+                node_argv,
+                Some(spec.to_string()),
+                ctx.project_dir.clone(),
+                env,
+            )
+            .map_err(|err| err.to_string())?;
+    }
+    // Install the worker side's channels + serialized workerData so the guest ops
+    // (`op_meow_worker_*`) reach them.
+    runtime.op_state().borrow_mut().put(worker_side);
+    Ok(runtime)
+}
+// === /WORKER-001 ===
 
 fn prepare_direct_file_run(
     cwd: &Path,

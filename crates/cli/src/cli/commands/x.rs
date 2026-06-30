@@ -280,11 +280,13 @@ pub fn cmd_x(args: &XArgs) -> ExitCode {
         .enable_all()
         .build()
     {
-        Ok(rt) => match rt.block_on(run_native_request(
+        // LocalSet so `node:worker_threads` workers can `spawn_local` onto this
+        // thread (see `commands::worker`).
+        Ok(rt) => match rt.block_on(tokio::task::LocalSet::new().run_until(run_native_request(
             &request,
             flags,
             host_env_map(flags.allow_env, meow_runtime::node::NodeMode::Enabled),
-        )) {
+        ))) {
             Ok(code) => code,
             Err(err) => {
                 hiss(&format!("meow x: execution failed: {err}"));
