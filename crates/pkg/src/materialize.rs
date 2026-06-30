@@ -1504,7 +1504,13 @@ fn parts_to_path(parts: &[String]) -> PathBuf {
 
 fn effective_link(opts: &MaterializeOptions) -> LinkStrategy {
     match opts.projection {
-        Projection::NodeModules => LinkStrategy::Symlink,
+        Projection::NodeModules => {
+            if cfg!(windows) {
+                LinkStrategy::Copy
+            } else {
+                LinkStrategy::Symlink
+            }
+        }
         Projection::Vendor => LinkStrategy::Copy,
     }
 }
@@ -1593,14 +1599,19 @@ mod tests {
 
     #[test]
     fn projection_link_policy_is_strict() {
+        let expected_node_modules = if cfg!(windows) {
+            LinkStrategy::Copy
+        } else {
+            LinkStrategy::Symlink
+        };
         let mut node_modules = MaterializeOptions::node_modules();
-        assert_eq!(effective_link(&node_modules), LinkStrategy::Symlink);
+        assert_eq!(effective_link(&node_modules), expected_node_modules);
 
         node_modules.link = LinkStrategy::Copy;
-        assert_eq!(effective_link(&node_modules), LinkStrategy::Symlink);
+        assert_eq!(effective_link(&node_modules), expected_node_modules);
 
         node_modules.link = LinkStrategy::Auto;
-        assert_eq!(effective_link(&node_modules), LinkStrategy::Symlink);
+        assert_eq!(effective_link(&node_modules), expected_node_modules);
 
         let mut vendor = MaterializeOptions::vendor();
         vendor.link = LinkStrategy::Symlink;
