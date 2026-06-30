@@ -17,16 +17,14 @@
 // are meow-owned (`op_meow_worker_*`).
 (function () {
   const { core, internals, primordials } = __bootstrap;
-  const {
-    op_meow_worker_create,
-    op_meow_worker_host_post,
-    op_meow_worker_host_recv,
-    op_meow_worker_terminate,
-    op_meow_worker_post,
-    op_meow_worker_recv,
-    op_meow_worker_data,
-    op_worker_threads_filename,
-  } = core.ops;
+  // NOTE: the `op_meow_worker_*` ops are registered by a RUNTIME extension
+  // (`commands::worker`), not baked into the V8 snapshot -- this module IS in the
+  // snapshot, so destructuring them here would capture `undefined` (the snapshot's
+  // build.rs only knows the dependency-crate extensions). Reach them lazily via
+  // `core.ops.<op>` at call time, when the runtime extension has registered them.
+  // `op_worker_threads_filename` IS a snapshot op (deno_node), so destructure it.
+  const { op_worker_threads_filename } = core.ops;
+  const ops = core.ops;
   const {
     ObjectAssign,
     ObjectDefineProperty,
@@ -80,7 +78,7 @@
         ? null
         : options.workerData;
 
-      this.#id = op_meow_worker_create(spec, serialize(workerData));
+      this.#id = ops.op_meow_worker_create(spec, serialize(workerData));
       this.threadId = this.#id;
       this.resourceLimits = { ...(options.resourceLimits ?? {}) };
       this.#pump();
@@ -90,7 +88,7 @@
       const step = () => {
         if (this.#terminated) return;
         PromisePrototypeThen(
-          op_meow_worker_host_recv(this.#id),
+          ops.op_meow_worker_host_recv(this.#id),
           (frame) => {
             if (this.#terminated) return;
             // First event observed => the worker isolate is live.
@@ -126,13 +124,13 @@
 
     postMessage(value) {
       if (this.#terminated) return;
-      op_meow_worker_host_post(this.#id, serialize(value));
+      ops.op_meow_worker_host_post(this.#id, serialize(value));
     }
 
     terminate() {
       if (this.#terminated) return PromiseResolve(1);
       this.#terminated = true;
-      op_meow_worker_terminate(this.#id);
+      ops.op_meow_worker_terminate(this.#id);
       this.emit("exit", 1);
       return PromiseResolve(1);
     }
@@ -149,7 +147,7 @@
     const port = new EventEmitter();
     let closed = false;
     port.postMessage = (value) => {
-      if (!closed) op_meow_worker_post(serialize(value));
+      if (!closed) ops.op_meow_worker_post(serialize(value));
     };
     port.close = () => {
       closed = true;
@@ -161,7 +159,7 @@
     // web-style `onmessage` for compatibility.
     const step = () => {
       if (closed) return;
-      PromisePrototypeThen(op_meow_worker_recv(), (bytes) => {
+      PromisePrototypeThen(ops.op_meow_worker_recv(), (bytes) => {
         if (closed) return;
         if (bytes.length === 0) {
           closed = true;
@@ -192,7 +190,7 @@
     exportsObj.threadId = workerId ?? 0;
 
     if (!isMainThread) {
-      const dataBytes = op_meow_worker_data();
+      const dataBytes = ops.op_meow_worker_data();
       exportsObj.workerData = dataBytes && dataBytes.length > 0
         ? deserialize(dataBytes)
         : null;
