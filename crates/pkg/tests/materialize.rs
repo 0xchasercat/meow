@@ -170,7 +170,7 @@ fn walk_tree(root: &Path, path: &Path, out: &mut Vec<SnapshotEntry>) {
             kind: "symlink",
             mode,
             bytes: vec![],
-            target: Some(target.to_string_lossy().replace('\\', "/")),
+            target: Some(snapshot_link_target(root, &target)),
         });
         return;
     }
@@ -199,6 +199,24 @@ fn walk_tree(root: &Path, path: &Path, out: &mut Vec<SnapshotEntry>) {
     for child in children {
         walk_tree(root, &child, out);
     }
+}
+
+fn snapshot_link_target(root: &Path, target: &Path) -> String {
+    #[cfg(windows)]
+    {
+        if target.is_absolute() {
+            if let Ok(relative) = target.strip_prefix(root) {
+                return relative.to_string_lossy().replace('\\', "/");
+            }
+            if let (Ok(root), Ok(target)) = (fs::canonicalize(root), fs::canonicalize(target)) {
+                if let Ok(relative) = target.strip_prefix(root) {
+                    return relative.to_string_lossy().replace('\\', "/");
+                }
+            }
+        }
+    }
+    let _ = root;
+    target.to_string_lossy().replace('\\', "/")
 }
 
 #[cfg(unix)]
@@ -244,7 +262,7 @@ fn resolve_in_projection(
         } else {
             current.join("node_modules").join(&spec_path)
         };
-        if candidate.exists() {
+        if candidate.join("package.json").is_file() {
             return Some(read_package_identity(&candidate));
         }
         let parent = current.parent()?;
@@ -260,6 +278,23 @@ fn read_package_identity(path: &Path) -> (String, String) {
     let manifest: PackageJson = serde_json::from_slice(&json).expect("parse package.json");
     (manifest.name, manifest.version)
 }
+
+#[cfg(windows)]
+fn assert_resolves_to_package(path: &Path, name: &str, version: &str) {
+    assert_eq!(
+        read_package_identity(path),
+        (name.to_owned(), version.to_owned())
+    );
+}
+
+#[cfg(unix)]
+fn assert_link_target(path: &Path, target: &str) {
+    assert_eq!(
+        fs::read_link(path).expect("edge target").to_string_lossy(),
+        target
+    );
+}
+
 fn package_integrity(graph: &ResolutionGraph, name: &str, version: &str) -> ContentHash {
     graph
         .packages()
@@ -550,30 +585,20 @@ fn materialized_tree_matches_graph_and_preserves_multi_version_edges() {
 
     let a_link = projection.join(".meow/a@1.0.0/node_modules/b");
     let c_link = projection.join(".meow/c@1.0.0/node_modules/b");
-    assert_eq!(
-        fs::read_link(&a_link)
-            .expect("a dep target")
-            .to_string_lossy(),
-        "../../b@1.0.0/node_modules/b"
-    );
-    assert_eq!(
-        fs::read_link(&c_link)
-            .expect("c dep target")
-            .to_string_lossy(),
-        "../../b@2.0.0/node_modules/b"
-    );
-    assert_eq!(
-        fs::read_link(projection.join("a"))
-            .expect("root a target")
-            .to_string_lossy(),
-        ".meow/a@1.0.0/node_modules/a"
-    );
-    assert_eq!(
-        fs::read_link(projection.join("c"))
-            .expect("root c target")
-            .to_string_lossy(),
-        ".meow/c@1.0.0/node_modules/c"
-    );
+    #[cfg(unix)]
+    {
+        assert_link_target(&a_link, "../../b@1.0.0/node_modules/b");
+        assert_link_target(&c_link, "../../b@2.0.0/node_modules/b");
+        assert_link_target(&projection.join("a"), ".meow/a@1.0.0/node_modules/a");
+        assert_link_target(&projection.join("c"), ".meow/c@1.0.0/node_modules/c");
+    }
+    #[cfg(windows)]
+    {
+        assert_resolves_to_package(&a_link, "b", "1.0.0");
+        assert_resolves_to_package(&c_link, "b", "2.0.0");
+        assert_resolves_to_package(&projection.join("a"), "a", "1.0.0");
+        assert_resolves_to_package(&projection.join("c"), "c", "1.0.0");
+    }
     assert_eq!(
         resolve_in_projection(&projection, &projection, "a"),
         Some(("a".to_owned(), "1.0.0".to_owned()))
@@ -724,6 +749,11 @@ fn node_modules_projection_hidden_hoists_unambiguous_packages_for_tooling() {
         ("leaf".to_owned(), "1.0.0".to_owned()),
         "unambiguous transitive packages are public-hoisted for root-scoped tooling"
     );
+    #[cfg(windows)]
+    {
+        assert_resolves_to_package(&projection.join(".meow/node_modules/leaf"), "leaf", "1.0.0");
+        assert_resolves_to_package(&projection.join("leaf"), "leaf", "1.0.0");
+    }
 
     fs::remove_dir_all(cache.root()).ok();
     fs::remove_dir_all(root).ok();
@@ -923,12 +953,10 @@ fn scoped_package_names_use_escaped_store_keys_and_relative_edges() {
     );
     assert!(scoped_store.join("package.json").is_file());
     let edge = projection.join(".meow/consumer@1.0.0/node_modules/@scope/pkg");
-    assert_eq!(
-        fs::read_link(&edge)
-            .expect("scoped dep target")
-            .to_string_lossy(),
-        "../../../@scope+pkg@1.2.0/node_modules/@scope/pkg"
-    );
+    #[cfg(unix)]
+    assert_link_target(&edge, "../../../@scope+pkg@1.2.0/node_modules/@scope/pkg");
+    #[cfg(windows)]
+    assert_resolves_to_package(&edge, "@scope/pkg", "1.2.0");
     let consumer_dir = store_package_dir(&projection, "consumer", "1.0.0");
     assert_eq!(
         resolve_in_projection(&projection, &consumer_dir, "@scope/pkg"),

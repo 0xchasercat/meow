@@ -483,7 +483,9 @@ impl<'a> Materializer<'a> {
                 };
                 match link {
                     LinkStrategy::EdgeLink => {
-                        create_edge_link(target, &abs)?;
+                        if !edge_links_need_final_root(link) {
+                            create_edge_link(target, &abs)?;
+                        }
                     }
                     LinkStrategy::Copy => {
                         bytes_written +=
@@ -493,14 +495,16 @@ impl<'a> Materializer<'a> {
                 }
             }
 
-            write_sidecar(
-                &tmp_root,
-                &Sidecar {
-                    version: SIDECAR_VERSION,
-                    projection: projection_name(opts.projection).to_owned(),
-                    tree_hash: tree_hash.to_sri(),
-                },
-            )?;
+            if !edge_links_need_final_root(link) {
+                write_sidecar(
+                    &tmp_root,
+                    &Sidecar {
+                        version: SIDECAR_VERSION,
+                        projection: projection_name(opts.projection).to_owned(),
+                        tree_hash: tree_hash.to_sri(),
+                    },
+                )?;
+            }
             Ok(())
         })();
 
@@ -522,11 +526,27 @@ impl<'a> Materializer<'a> {
                 }
                 return Err(MaterializeError::io(plan.root(), source));
             }
+            if edge_links_need_final_root(effective_link(opts)) {
+                if let Err(err) =
+                    finalize_edge_links_at_root(&plan, &root_rel, &path_index, opts, &tree_hash)
+                {
+                    rollback_finalized_root(plan.root(), &backup)?;
+                    return Err(err);
+                }
+            }
             remove_path(&backup)?;
         } else {
             ensure_projection_parent(plan.root())?;
             fs::rename(&tmp_root, plan.root())
                 .map_err(|source| MaterializeError::io(plan.root(), source))?;
+            if edge_links_need_final_root(effective_link(opts)) {
+                if let Err(err) =
+                    finalize_edge_links_at_root(&plan, &root_rel, &path_index, opts, &tree_hash)
+                {
+                    cleanup_best_effort(plan.root());
+                    return Err(err);
+                }
+            }
         }
 
         Ok(MaterializeReport {
@@ -751,7 +771,9 @@ impl<'a> Materializer<'a> {
                 };
                 match link {
                     LinkStrategy::EdgeLink => {
-                        create_edge_link(target, &abs)?;
+                        if !edge_links_need_final_root(link) {
+                            create_edge_link(target, &abs)?;
+                        }
                     }
                     LinkStrategy::Copy => {
                         let dest = abs.clone();
@@ -771,14 +793,16 @@ impl<'a> Materializer<'a> {
             }
             if trace { eprintln!("[trace] mat edges: {}ms", t_edge.elapsed().as_millis()); }
 
-            write_sidecar(
-                &tmp_root,
-                &Sidecar {
-                    version: SIDECAR_VERSION,
-                    projection: projection_name(opts.projection).to_owned(),
-                    tree_hash: tree_hash.to_sri(),
-                },
-            )?;
+            if !edge_links_need_final_root(link) {
+                write_sidecar(
+                    &tmp_root,
+                    &Sidecar {
+                        version: SIDECAR_VERSION,
+                        projection: projection_name(opts.projection).to_owned(),
+                        tree_hash: tree_hash.to_sri(),
+                    },
+                )?;
+            }
             Ok::<(), MaterializeError>(())
         }
         .await;
@@ -804,11 +828,27 @@ impl<'a> Materializer<'a> {
                 }
                 return Err(MaterializeError::io(plan.root(), source));
             }
+            if edge_links_need_final_root(effective_link(opts)) {
+                if let Err(err) =
+                    finalize_edge_links_at_root(&plan, &root_rel, &path_index, opts, &tree_hash)
+                {
+                    rollback_finalized_root(plan.root(), &backup)?;
+                    return Err(err);
+                }
+            }
             remove_path(&backup)?;
         } else {
             ensure_projection_parent(plan.root())?;
             fs::rename(&tmp_root, plan.root())
                 .map_err(|source| MaterializeError::io(plan.root(), source))?;
+            if edge_links_need_final_root(effective_link(opts)) {
+                if let Err(err) =
+                    finalize_edge_links_at_root(&plan, &root_rel, &path_index, opts, &tree_hash)
+                {
+                    cleanup_best_effort(plan.root());
+                    return Err(err);
+                }
+            }
         }
 
         Ok(MaterializeReport {
@@ -919,6 +959,52 @@ fn tree_is_current(
         }
     }
     Ok(true)
+}
+
+fn edge_links_need_final_root(link: LinkStrategy) -> bool {
+    cfg!(windows) && matches!(link, LinkStrategy::EdgeLink)
+}
+
+fn finalize_edge_links_at_root(
+    plan: &MaterializePlan,
+    root_rel: &Path,
+    path_index: &BTreeMap<PathBuf, (PackageName, Version)>,
+    opts: &MaterializeOptions,
+    tree_hash: &ContentHash,
+) -> Result<(), MaterializeError> {
+    for node in &plan.nodes {
+        let PlanEntry::Edge { target } = &node.entry else {
+            continue;
+        };
+        let rel = path_inside_root(&node.path, root_rel)?;
+        let abs = plan.root.join(&rel);
+        let parent_rel = rel.parent().unwrap_or(Path::new(""));
+        let parent_abs = abs.parent().unwrap_or(plan.root()).to_path_buf();
+        ensure_dir_fast(&parent_abs)?;
+        let target_rel = normalize_relative_join(parent_rel, target)?;
+        if !path_index.contains_key(&target_rel) {
+            return Err(MaterializeError::DanglingEdge {
+                name: rel.display().to_string(),
+                version: rel.display().to_string(),
+                dep: target.display().to_string(),
+                ver: target_rel.display().to_string(),
+            });
+        }
+        create_edge_link(target, &abs)?;
+    }
+    write_sidecar(
+        plan.root(),
+        &Sidecar {
+            version: SIDECAR_VERSION,
+            projection: projection_name(opts.projection).to_owned(),
+            tree_hash: tree_hash.to_sri(),
+        },
+    )
+}
+
+fn rollback_finalized_root(root: &Path, backup: &Path) -> Result<(), MaterializeError> {
+    remove_path(root)?;
+    fs::rename(backup, root).map_err(|source| MaterializeError::io(root, source))
 }
 
 fn copy_edge_tree_deep(
@@ -1349,15 +1435,19 @@ fn ensure_dir(path: &Path) -> Result<(), MaterializeError> {
 fn create_windows_junction(target: &Path, path: &Path) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let link_name = path.file_name().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "junction path has no file name")
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "junction path has no file name",
+        )
     })?;
+    let absolute_target = parent.join(target).canonicalize()?;
     let status = Command::new("cmd")
         .current_dir(parent)
         .arg("/C")
         .arg("mklink")
         .arg("/J")
         .arg(link_name)
-        .arg(target)
+        .arg(&absolute_target)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1384,10 +1474,8 @@ fn create_edge_link(target: &Path, path: &Path) -> Result<(), MaterializeError> 
         // primitive package managers use for node_modules graphs. Rust's
         // std::os::windows::fs::junction_point is still unstable, so use the
         // stable OS command.
-        create_windows_junction(target, path).map_err(|_| {
-            MaterializeError::EdgeLinkUnsupported {
-                path: path.to_path_buf(),
-            }
+        create_windows_junction(target, path).map_err(|_| MaterializeError::EdgeLinkUnsupported {
+            path: path.to_path_buf(),
         })
     }
     #[cfg(not(any(unix, windows)))]
