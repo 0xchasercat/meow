@@ -37,9 +37,10 @@ fn spec(url: &str) -> ModuleSpecifier {
     ModuleSpecifier::parse(url).expect("valid specifier")
 }
 
-fn runtime_with(extensions: Vec<deno_core::Extension>) -> Runtime {
+fn runtime_with(extensions: Vec<deno_core::Extension>) -> (Runtime, std::path::PathBuf) {
+    let root = real_loader::unique_dir("runtime");
     Runtime::new(RuntimeOptions {
-        module_loader: real_loader::loader_for(&real_loader::unique_dir("runtime")),
+        module_loader: real_loader::loader_for(&root),
         extensions,
         max_heap_size: None,
         startup_snapshot: None,
@@ -47,24 +48,31 @@ fn runtime_with(extensions: Vec<deno_core::Extension>) -> Runtime {
         residual_lazy_esm_sources: &[],
         v8_flags: None,
     })
+    .map(|runtime| (runtime, root))
     .expect("runtime initializes")
 }
 
 /// Run an ESM source string as the main module. `ModuleCodeString` has no
 /// `From<&str>`, so own the source here (the public API takes `Into<ModuleCodeString>`).
-async fn run_src(rt: &mut Runtime, url: &str, src: &str) -> Result<(), RuntimeError> {
-    rt.run_main_module_from_source(&spec(url), src.to_string())
-        .await
+async fn run_src(
+    rt: &mut Runtime,
+    root: &std::path::Path,
+    name: &str,
+    src: &str,
+) -> Result<(), RuntimeError> {
+    let spec = ModuleSpecifier::from_file_path(root.join(name)).expect("valid specifier");
+    rt.run_main_module_from_source(&spec, src.to_string()).await
 }
 
 // T1 · a trivial ESM module runs end-to-end and its output is observable.
 #[tokio::test]
 async fn trivial_esm_runs_and_is_observable() {
     let (out, _err, sink_ext) = capture();
-    let mut rt = runtime_with(vec![sink_ext]);
+    let (mut rt, root) = runtime_with(vec![sink_ext]);
     run_src(
         &mut rt,
-        "file:///main.mjs",
+        &root,
+        "main.mjs",
         r#"console.log("hello from meow")"#,
     )
     .await
@@ -76,8 +84,8 @@ async fn trivial_esm_runs_and_is_observable() {
 #[tokio::test]
 async fn console_error_routes_to_stderr_sink() {
     let (out, err, sink_ext) = capture();
-    let mut rt = runtime_with(vec![sink_ext]);
-    run_src(&mut rt, "file:///main.mjs", r#"console.error("oops")"#)
+    let (mut rt, root) = runtime_with(vec![sink_ext]);
+    run_src(&mut rt, &root, "main.mjs", r#"console.error("oops")"#)
         .await
         .expect("module runs");
     assert_eq!(*err.borrow(), "oops\n");
@@ -97,10 +105,11 @@ extension!(test_echo, ops = [op_echo]);
 #[tokio::test]
 async fn op_round_trips_through_extension_seam() {
     let (out, _err, sink_ext) = capture();
-    let mut rt = runtime_with(vec![sink_ext, test_echo::init()]);
+    let (mut rt, root) = runtime_with(vec![sink_ext, test_echo::init()]);
     run_src(
         &mut rt,
-        "file:///main.mjs",
+        &root,
+        "main.mjs",
         r#"console.log(Deno.core.ops.op_echo("ping-pong"))"#,
     )
     .await
@@ -111,8 +120,8 @@ async fn op_round_trips_through_extension_seam() {
 // T3 · an uncaught synchronous throw becomes a typed error, not a panic.
 #[tokio::test]
 async fn uncaught_throw_becomes_typed_error() {
-    let mut rt = runtime_with(vec![]);
-    let result = run_src(&mut rt, "file:///boom.mjs", "throw new Error(\"boom\")").await;
+    let (mut rt, root) = runtime_with(vec![]);
+    let result = run_src(&mut rt, &root, "boom.mjs", "throw new Error(\"boom\")").await;
     match result {
         Err(RuntimeError::Uncaught { report, specifier }) => {
             assert!(
@@ -133,10 +142,11 @@ async fn uncaught_throw_becomes_typed_error() {
 // T3 (cont.) · a rejected top-level await also surfaces as Uncaught.
 #[tokio::test]
 async fn rejected_top_level_await_becomes_typed_error() {
-    let mut rt = runtime_with(vec![]);
+    let (mut rt, root) = runtime_with(vec![]);
     let result = run_src(
         &mut rt,
-        "file:///reject.mjs",
+        &root,
+        "reject.mjs",
         "await Promise.reject(new Error(\"boom-await\"))",
     )
     .await;
@@ -155,8 +165,8 @@ async fn rejected_top_level_await_becomes_typed_error() {
 // T3 (cont.) · a syntax error is a module error (load-time), not an Uncaught.
 #[tokio::test]
 async fn syntax_error_is_a_module_error() {
-    let mut rt = runtime_with(vec![]);
-    let result = run_src(&mut rt, "file:///bad.mjs", "const = ;").await;
+    let (mut rt, root) = runtime_with(vec![]);
+    let result = run_src(&mut rt, &root, "bad.mjs", "const = ;").await;
     assert!(
         matches!(result, Err(RuntimeError::Module { .. })),
         "expected RuntimeError::Module, got {result:?}"
@@ -167,10 +177,11 @@ async fn syntax_error_is_a_module_error() {
 #[tokio::test]
 async fn top_level_await_resolves_before_return() {
     let (out, _err, sink_ext) = capture();
-    let mut rt = runtime_with(vec![sink_ext]);
+    let (mut rt, root) = runtime_with(vec![sink_ext]);
     run_src(
         &mut rt,
-        "file:///tla.mjs",
+        &root,
+        "tla.mjs",
         r#"
             await Promise.resolve();
             await new Promise((r) => queueMicrotask(r));
@@ -193,7 +204,7 @@ async fn file_specifier_runs_from_disk() {
     std::fs::write(&path, "console.log(\"from-disk\")").unwrap();
     let url = ModuleSpecifier::from_file_path(&path).unwrap();
 
-    let mut rt = runtime_with(vec![sink_ext]);
+    let (mut rt, _root) = runtime_with(vec![sink_ext]);
     rt.run_main_module(&url).await.expect("file module runs");
     assert_eq!(*out.borrow(), "from-disk\n");
     std::fs::remove_dir_all(&dir).ok();
@@ -209,7 +220,7 @@ async fn typescript_entry_runs_through_real_loader() {
     let url = ModuleSpecifier::from_file_path(&path).unwrap();
 
     let (out, _err, sink_ext) = capture();
-    let mut rt = runtime_with(vec![sink_ext]);
+    let (mut rt, _root) = runtime_with(vec![sink_ext]);
     rt.run_main_module(&url)
         .await
         .expect("typescript module runs");

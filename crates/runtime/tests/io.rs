@@ -28,9 +28,10 @@ fn capture() -> (Rc<RefCell<String>>, deno_core::Extension) {
     (out, print_sink_extension(sink))
 }
 
-fn runtime_with(extensions: Vec<deno_core::Extension>) -> Runtime {
+fn runtime_with(extensions: Vec<deno_core::Extension>) -> (Runtime, std::path::PathBuf) {
+    let root = real_loader::unique_dir("runtime");
     Runtime::new(RuntimeOptions {
-        module_loader: real_loader::loader_for(&real_loader::unique_dir("runtime")),
+        module_loader: real_loader::loader_for(&root),
         extensions,
         max_heap_size: None,
         startup_snapshot: None,
@@ -38,6 +39,7 @@ fn runtime_with(extensions: Vec<deno_core::Extension>) -> Runtime {
         residual_lazy_esm_sources: &[],
         v8_flags: None,
     })
+    .map(|runtime| (runtime, root))
     .expect("runtime initializes")
 }
 
@@ -48,8 +50,13 @@ fn io_ext() -> deno_core::Extension {
     meow_runtime::io::meow_io::init()
 }
 
-async fn run_src(rt: &mut Runtime, url: &str, src: &str) -> Result<(), RuntimeError> {
-    let spec = ModuleSpecifier::parse(url).expect("valid specifier");
+async fn run_src(
+    rt: &mut Runtime,
+    root: &std::path::Path,
+    name: &str,
+    src: &str,
+) -> Result<(), RuntimeError> {
+    let spec = ModuleSpecifier::from_file_path(root.join(name)).expect("valid specifier");
     rt.run_main_module_from_source(&spec, src.to_string()).await
 }
 
@@ -76,10 +83,11 @@ async fn io_async_read_resolves_from_js() {
     let contents = "meow-async-io-payload";
     let path = temp_file(contents);
     let (out, sink) = capture();
-    let mut rt = runtime_with(vec![sink, io_ext()]);
+    let (mut rt, root) = runtime_with(vec![sink, io_ext()]);
     run_src(
         &mut rt,
-        "file:///read.mjs",
+        &root,
+        "read.mjs",
         &format!(
             r#"
             const bytes = await Deno.core.ops.op_read_file({path});
@@ -121,10 +129,11 @@ async fn io_concurrent_ops_resolve() {
     });
 
     let (out, sink) = capture();
-    let mut rt = runtime_with(vec![sink, io_ext()]);
+    let (mut rt, root) = runtime_with(vec![sink, io_ext()]);
     run_src(
         &mut rt,
-        "file:///concurrent.mjs",
+        &root,
+        "concurrent.mjs",
         &format!(
             r#"
             const reads = await Promise.all([
@@ -183,14 +192,15 @@ async fn io_seam_denies_with_typed_error() {
         reads: Cell::new(0),
     });
     let (out, sink) = capture();
-    let mut rt = runtime_with(vec![
+    let (mut rt, root) = runtime_with(vec![
         sink,
         io_ext(),
         io_capability_extension(recorder.clone()),
     ]);
     run_src(
         &mut rt,
-        "file:///deny.mjs",
+        &root,
+        "deny.mjs",
         &format!(
             r#"
             let denied = false;
@@ -241,10 +251,11 @@ async fn io_tcp_connect_ok_and_refused() {
     });
 
     let (out, sink) = capture();
-    let mut rt = runtime_with(vec![sink, io_ext()]);
+    let (mut rt, root) = runtime_with(vec![sink, io_ext()]);
     run_src(
         &mut rt,
-        "file:///tcp.mjs",
+        &root,
+        "tcp.mjs",
         &format!(
             r#"
             const rid = await Deno.core.ops.op_tcp_connect({live});
@@ -276,10 +287,11 @@ async fn io_tcp_connect_ok_and_refused() {
 #[tokio::test]
 async fn io_no_panic_on_bad_input() {
     let (out, sink) = capture();
-    let mut rt = runtime_with(vec![sink, io_ext()]);
+    let (mut rt, root) = runtime_with(vec![sink, io_ext()]);
     run_src(
         &mut rt,
-        "file:///bad.mjs",
+        &root,
+        "bad.mjs",
         r#"
         let missing = false, badAddr = false;
         try { await Deno.core.ops.op_read_file("/no/such/meow/file/xyz"); }
@@ -302,10 +314,11 @@ async fn io_no_panic_on_bad_input() {
 async fn io_ops_absent_by_default() {
     let (out, sink) = capture();
     // Note: only the print sink — NO `io_ext()`.
-    let mut rt = runtime_with(vec![sink]);
+    let (mut rt, root) = runtime_with(vec![sink]);
     run_src(
         &mut rt,
-        "file:///default.mjs",
+        &root,
+        "default.mjs",
         r#"
         const readMissing = typeof Deno.core.ops.op_read_file === "undefined";
         const tcpMissing = typeof Deno.core.ops.op_tcp_connect === "undefined";

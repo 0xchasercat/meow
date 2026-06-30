@@ -295,8 +295,8 @@ fn node_runtime(
     (out, runtime)
 }
 
-async fn run_src(rt: &mut Runtime, spec: &str, src: &str) -> Result<(), RuntimeError> {
-    let specifier = ModuleSpecifier::parse(spec).expect("valid specifier");
+async fn run_src(rt: &mut Runtime, root: &Path, name: &str, src: &str) -> Result<(), RuntimeError> {
+    let specifier = ModuleSpecifier::from_file_path(root.join(name)).expect("valid specifier");
     rt.run_main_module_from_source(&specifier, src.to_owned())
         .await
 }
@@ -319,7 +319,7 @@ async fn node_path_bare_and_node_round_trip() {
     );
     run_src(
         &mut rt,
-        "file:///path.mjs",
+        &proj, "path.mjs",
         r#"
         import path from "path";
         import nodePath from "node:path";
@@ -346,7 +346,8 @@ async fn node_dns_bare_and_node_import_round_trip() {
     );
     run_src(
         &mut rt,
-        "file:///dns.mjs",
+        &proj,
+        "dns.mjs",
         r#"
         import dns from "dns";
         import nodeDns from "node:dns";
@@ -382,7 +383,7 @@ async fn node_http_import_loads_telemetry_dependency() {
     );
     run_src(
         &mut rt,
-        "file:///http-telemetry.mjs",
+        &proj, "http-telemetry.mjs",
         r#"
         import http from "node:http";
         import https from "node:https";
@@ -410,7 +411,8 @@ async fn buffer_from_and_to_string() {
     );
     run_src(
         &mut rt,
-        "file:///buffer.mjs",
+        &proj,
+        "buffer.mjs",
         r#"
         const first = Buffer.from("meow");
         const second = Buffer.from("meow");
@@ -439,7 +441,7 @@ async fn process_argv_cwd_and_platform_are_wired() {
     );
     run_src(
         &mut rt,
-        "file:///process.mjs",
+        &proj, "process.mjs",
         r#"
         console.log(process.argv.join("|"));
         console.log(process.cwd());
@@ -485,7 +487,7 @@ async fn process_hrtime_shape_is_compatible() {
     );
     run_src(
         &mut rt,
-        "file:///process.hrtime.mjs",
+        &proj, "process.hrtime.mjs",
         r#"
         const hrtime = process.hrtime;
         const isHrtimeFunction = typeof hrtime === "function";
@@ -523,7 +525,8 @@ async fn process_memory_usage_shape_is_compatible() {
     );
     run_src(
         &mut rt,
-        "file:///process.memoryUsage.mjs",
+        &proj,
+        "process.memoryUsage.mjs",
         r#"
         const memoryUsage = process.memoryUsage;
         const isFunction = typeof memoryUsage === "function";
@@ -559,7 +562,8 @@ async fn process_umask_shape_is_compatible() {
     );
     run_src(
         &mut rt,
-        "file:///process.umask.mjs",
+        &proj,
+        "process.umask.mjs",
         r#"
         const isFunction = typeof process.umask === "function";
         const hasNumericReturn = isFunction ? typeof process.umask() === "number" : false;
@@ -646,7 +650,8 @@ async fn global_aliases_global_this_in_node_mode() {
     );
     run_src(
         &mut rt,
-        "file:///global.mjs",
+        &proj,
+        "global.mjs",
         r#"
         console.log(String(global === globalThis) + ":" + typeof global.process);
         "#,
@@ -669,7 +674,8 @@ async fn node_mode_global_atob_and_btoa_are_functions() {
     );
     run_src(
         &mut rt,
-        "file:///atob-btoa.mjs",
+        &proj,
+        "atob-btoa.mjs",
         r#"
         console.log(typeof atob + ":" + typeof btoa);
         "#,
@@ -692,7 +698,8 @@ async fn node_mode_console_methods_are_functions() {
     );
     run_src(
         &mut rt,
-        "file:///console-global.mjs",
+        &proj,
+        "console-global.mjs",
         r#"
         console.log(
             typeof console.assert + ":" +
@@ -727,7 +734,8 @@ async fn buffer_alloc_unsafe_shape_exists() {
     );
     run_src(
         &mut rt,
-        "file:///buffer-alloc-unsafe.mjs",
+        &proj,
+        "buffer-alloc-unsafe.mjs",
         r#"
         import { Buffer } from "node:buffer";
         const buf = Buffer.allocUnsafe(4);
@@ -879,7 +887,8 @@ async fn node_mode_event_and_event_target_are_functions() {
     );
     run_src(
         &mut rt,
-        "file:///events-global.mjs",
+        &proj,
+        "events-global.mjs",
         r#"
         console.log(typeof Event + ":" + typeof EventTarget);
         "#,
@@ -903,7 +912,8 @@ async fn node_mode_structured_clone_is_function() {
     );
     run_src(
         &mut rt,
-        "file:///structured-clone.mjs",
+        &proj,
+        "structured-clone.mjs",
         r#"
         console.log(typeof structuredClone);
         "#,
@@ -927,7 +937,8 @@ async fn node_mode_stream_globals_are_functions() {
     );
     run_src(
         &mut rt,
-        "file:///streams.mjs",
+        &proj,
+        "streams.mjs",
         r#"
         let writableOk = false;
         try {
@@ -1035,7 +1046,7 @@ async fn node_path_default_exposes_posix_and_win32() {
     );
     run_src(
         &mut rt,
-        "file:///path-default.mjs",
+        &proj, "path-default.mjs",
         r#"
         import path from "path";
         console.log(`${typeof path.win32}:${typeof path.win32?.isAbsolute}:${typeof path.posix}:${typeof path.posix?.isAbsolute}`);
@@ -1062,7 +1073,7 @@ async fn fs_default_runtime_read_write_and_stat_through_temp_dir() {
     );
     run_src(
         &mut rt,
-        "file:///fs-default.mjs",
+        &proj, "fs-default.mjs",
         &format!(
             r#"
             import fs from "fs";
@@ -1105,7 +1116,7 @@ async fn fs_readdir_with_file_types_and_missing_stat_shape() {
     );
     run_src(
         &mut rt,
-        "file:///fs-dirent.mjs",
+        &proj, "fs-dirent.mjs",
         &format!(
             r#"
             import fs from "fs";
@@ -1233,7 +1244,8 @@ async fn node_fs_descriptor_apis_are_implemented() {
     );
     run_src(
         &mut rt,
-        "file:///fs-descriptor-apis.mjs",
+        &proj,
+        "fs-descriptor-apis.mjs",
         &format!(
             r#"
             import fs from "fs";
@@ -1290,7 +1302,8 @@ async fn node_fs_equals_bare_fs() {
     );
     run_src(
         &mut rt,
-        "file:///fs-eq.mjs",
+        &proj,
+        "fs-eq.mjs",
         r#"
         import fs from "fs";
         import nodeFs from "node:fs";
@@ -1717,7 +1730,7 @@ async fn strict_web_withdraws_fs_and_real_env() {
     );
     run_src(
         &mut rt,
-        "file:///strict-web.mjs",
+        &proj, "strict-web.mjs",
         r#"
         import fs from "node:fs";
         import process from "node:process";
@@ -1956,7 +1969,8 @@ async fn event_emitter_emit_and_on() {
     );
     run_src(
         &mut rt,
-        "file:///events.mjs",
+        &proj,
+        "events.mjs",
         r#"
         import { EventEmitter } from "node:events";
         const events = new EventEmitter();
@@ -1986,7 +2000,8 @@ async fn node_assert_module_works() {
     );
     run_src(
         &mut rt,
-        "file:///assert.mjs",
+        &proj,
+        "assert.mjs",
         r#"
         import assert from "node:assert";
         assert.strictEqual(1 + 1, 2);
@@ -2018,7 +2033,7 @@ async fn node_mode_timer_globals_are_functions() {
     );
     run_src(
         &mut rt,
-        "file:///timers.mjs",
+        &proj, "timers.mjs",
         r#"
         console.log(`${typeof setTimeout}:${typeof clearTimeout}:${typeof setInterval}:${typeof clearInterval}`);
         "#,
@@ -2042,7 +2057,7 @@ async fn node_crypto_hash_hmac_random_and_bare_round_trip() {
     );
     run_src(
         &mut rt,
-        "file:///crypto.mjs",
+        &proj, "crypto.mjs",
         r#"
         import crypto from "crypto";
         import nodeCrypto, { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
