@@ -928,7 +928,7 @@ async fn extensionless_cached_commonjs_bin_runs_via_native_cjs_runtime() {
             ),
             (
                 "dist/server/require-hook.js",
-                b"process.env.MEOW_TEST_NEXT = 'yes';\nconst os = require('os');\nconst target = require(require.resolve(__dirname + '/require-target'));\nconst packageRoot = __dirname.slice(0, __dirname.indexOf('/dist/server'));\nconst rootTarget = require(require.resolve(packageRoot));\nexports.value = typeof process + ':' + typeof process.env + ':' + process.env.MEOW_TEST_NEXT + ':' + String(typeof os.tmpdir() === 'string') + ':' + String(global === globalThis) + ':' + typeof performance.now + ':' + typeof TextEncoderStream + ':' + typeof atob + ':' + typeof setInterval + ':' + typeof Event + ':' + target.value + ':' + rootTarget.value;\n",
+                b"process.env.MEOW_TEST_NEXT = 'yes';\nconst os = require('os');\nconst path = require('path');\nconst target = require(require.resolve(__dirname + '/require-target'));\nconst packageRoot = path.resolve(__dirname, '../..');\nconst rootTarget = require(require.resolve(packageRoot));\nexports.value = typeof process + ':' + typeof process.env + ':' + process.env.MEOW_TEST_NEXT + ':' + String(typeof os.tmpdir() === 'string') + ':' + String(global === globalThis) + ':' + typeof performance.now + ':' + typeof TextEncoderStream + ':' + typeof atob + ':' + typeof setInterval + ':' + typeof Event + ':' + target.value + ':' + rootTarget.value;\n",
             ),
             (
                 "dist/server/require-target.js",
