@@ -1058,6 +1058,16 @@ try {
   def("CloseEvent", event.CloseEvent);
   def("ProgressEvent", event.ProgressEvent);
 
+  // Node exposes these as globals (via worker_threads + the WHATWG channel
+  // messaging spec). Libraries like undici reference `MessagePort` at module load
+  // for webidl type assertions, so install the real deno_web implementations.
+  const messagePort = load("ext:deno_web/13_message_port.js");
+  def("MessagePort", messagePort.MessagePort);
+  def("MessageChannel", messagePort.MessageChannel);
+
+  const broadcastChannel = load("ext:deno_web/01_broadcast_channel.js");
+  def("BroadcastChannel", broadcastChannel.BroadcastChannel);
+
   const compression = load("ext:deno_web/14_compression.js");
   def("CompressionStream", compression.CompressionStream);
   def("DecompressionStream", compression.DecompressionStream);
