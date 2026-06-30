@@ -1024,6 +1024,6 @@ mod tests {
         assert!(!args.vendor);
         let opts = super::install_projection(&args).expect("projection selection");
         assert!(matches!(opts.projection, meow_pkg::Projection::NodeModules));
-        assert!(matches!(opts.link, meow_pkg::LinkStrategy::Symlink));
+        assert!(matches!(opts.link, meow_pkg::LinkStrategy::EdgeLink));
     }
 }

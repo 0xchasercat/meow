@@ -30,7 +30,7 @@ pub enum Projection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkStrategy {
-    Symlink,
+    EdgeLink,
     Copy,
     Auto,
 }
@@ -52,7 +52,7 @@ impl MaterializeOptions {
     pub fn node_modules() -> Self {
         MaterializeOptions {
             projection: Projection::NodeModules,
-            link: LinkStrategy::Symlink,
+            link: LinkStrategy::EdgeLink,
             clean: false,
             vendor_dir: PathBuf::from("vendor"),
             normalize_metadata: false,
@@ -144,8 +144,8 @@ pub enum MaterializeError {
         version: String,
         member: String,
     },
-    #[error("symlinks unsupported at {} on this filesystem; use --vendor for a copy-based projection", .path.display())]
-    SymlinkUnsupported { path: PathBuf },
+    #[error("dependency edge links unsupported at {} on this filesystem; use --vendor for a copy-based projection", .path.display())]
+    EdgeLinkUnsupported { path: PathBuf },
     #[error("blocking materialization task {operation} failed: {reason}")]
     BlockingTask {
         operation: &'static str,
@@ -410,7 +410,7 @@ impl<'a> Materializer<'a> {
             ensure_dir(&tmp_root)?;
             ensure_dir(&tmp_root.join(STORE_DIR))?;
             let link = effective_link(opts);
-            let unpacked_store = if matches!(link, LinkStrategy::Symlink) {
+            let unpacked_store = if matches!(link, LinkStrategy::EdgeLink) {
                 let cache_root = self.cache.root().to_path_buf();
                 Some(UnpackedStore::new(
                     cache_root.join("unpacked"),
@@ -446,7 +446,7 @@ impl<'a> Materializer<'a> {
                             .map_err(|err| err.with_package(name, version))?;
                         bytes_written += stats.bytes;
                     }
-                    LinkStrategy::Symlink => {
+                    LinkStrategy::EdgeLink => {
                         let store = unpacked_store.as_ref().expect("unpacked store");
                         let source = store.ensure(integrity)?;
                         ensure_dir(abs.parent().unwrap_or(&tmp_root))?;
@@ -455,7 +455,7 @@ impl<'a> Materializer<'a> {
                         }
                         bytes_written += copy_dir_recursive_with_hardlinks(&source, &abs)?;
                     }
-                    LinkStrategy::Auto => unreachable!("effective link policy resolves auto"),
+                    LinkStrategy::Auto => unreachable!("effective edge policy resolves auto"),
                 }
             }
 
@@ -468,9 +468,9 @@ impl<'a> Materializer<'a> {
                 let parent_rel = rel.parent().unwrap_or(Path::new(""));
                 let parent_abs = abs.parent().unwrap_or(&tmp_root).to_path_buf();
                 match link {
-                    LinkStrategy::Symlink => ensure_dir_fast(&parent_abs)?,
+                    LinkStrategy::EdgeLink => ensure_dir_fast(&parent_abs)?,
                     LinkStrategy::Copy => ensure_dir(&parent_abs)?,
-                    LinkStrategy::Auto => unreachable!("effective link policy resolves auto"),
+                    LinkStrategy::Auto => unreachable!("effective edge policy resolves auto"),
                 }
                 let target_rel = normalize_relative_join(parent_rel, target)?;
                 let Some(key) = path_index.get(&target_rel) else {
@@ -482,14 +482,14 @@ impl<'a> Materializer<'a> {
                     });
                 };
                 match link {
-                    LinkStrategy::Symlink => {
-                        create_symlink(target, &abs)?;
+                    LinkStrategy::EdgeLink => {
+                        create_edge_link(target, &abs)?;
                     }
                     LinkStrategy::Copy => {
                         bytes_written +=
                             copy_edge_tree_deep(&abs, key, &catalog, &tmp_root, &mut Vec::new())?;
                     }
-                    LinkStrategy::Auto => unreachable!("effective link policy resolves auto"),
+                    LinkStrategy::Auto => unreachable!("effective edge policy resolves auto"),
                 }
             }
 
@@ -591,7 +591,7 @@ impl<'a> Materializer<'a> {
             ensure_dir_fast(&tmp_root)?;
             ensure_dir_fast(&tmp_root.join(STORE_DIR))?;
             let link = effective_link(opts);
-            let unpacked_store = if matches!(link, LinkStrategy::Symlink) {
+            let unpacked_store = if matches!(link, LinkStrategy::EdgeLink) {
                 let cache_root = self.cache.root().to_path_buf();
                 Some(UnpackedStore::new(
                     cache_root.join("unpacked"),
@@ -609,7 +609,7 @@ impl<'a> Materializer<'a> {
             let limit = Arc::new(tokio::sync::Semaphore::new(concurrency));
             let package_cache = Arc::new(Cache::with_root(self.cache.root().to_path_buf()));
 
-            if matches!(link, LinkStrategy::Symlink) {
+            if matches!(link, LinkStrategy::EdgeLink) {
                 let t_unpack = std::time::Instant::now();
                 let store = unpacked_store.as_ref().expect("unpacked store").clone();
                 let mut seen = BTreeSet::new();
@@ -670,7 +670,7 @@ impl<'a> Materializer<'a> {
                 .collect();
 
             match link {
-                LinkStrategy::Symlink => {
+                LinkStrategy::EdgeLink => {
                     let store = unpacked_store.as_ref().expect("unpacked store").clone();
                     let entries = package_entries;
                     let bytes = tokio::task::spawn_blocking(move || -> Result<u64, MaterializeError> {
@@ -721,7 +721,7 @@ impl<'a> Materializer<'a> {
                             .map_err(|err| MaterializeError::blocking_task("materialize package", err))??;
                     }
                 }
-                LinkStrategy::Auto => unreachable!("effective link policy resolves auto"),
+                LinkStrategy::Auto => unreachable!("effective edge policy resolves auto"),
             }
             if trace { eprintln!("[trace] mat project: {}ms", t_proj.elapsed().as_millis()); }
 
@@ -736,9 +736,9 @@ impl<'a> Materializer<'a> {
                 let parent_rel = rel.parent().unwrap_or(Path::new(""));
                 let parent_abs = abs.parent().unwrap_or(&tmp_root).to_path_buf();
                 match link {
-                    LinkStrategy::Symlink => ensure_dir_fast(&parent_abs)?,
+                    LinkStrategy::EdgeLink => ensure_dir_fast(&parent_abs)?,
                     LinkStrategy::Copy => ensure_dir_fast(&parent_abs)?,
-                    LinkStrategy::Auto => unreachable!("effective link policy resolves auto"),
+                    LinkStrategy::Auto => unreachable!("effective edge policy resolves auto"),
                 }
                 let target_rel = normalize_relative_join(parent_rel, target)?;
                 let Some(key) = path_index.get(&target_rel) else {
@@ -750,8 +750,8 @@ impl<'a> Materializer<'a> {
                     });
                 };
                 match link {
-                    LinkStrategy::Symlink => {
-                        create_symlink(target, &abs)?;
+                    LinkStrategy::EdgeLink => {
+                        create_edge_link(target, &abs)?;
                     }
                     LinkStrategy::Copy => {
                         let dest = abs.clone();
@@ -766,7 +766,7 @@ impl<'a> Materializer<'a> {
                             MaterializeError::blocking_task("copy dependency edge", err)
                         })??;
                     }
-                    LinkStrategy::Auto => unreachable!("effective link policy resolves auto"),
+                    LinkStrategy::Auto => unreachable!("effective edge policy resolves auto"),
                 }
             }
             if trace { eprintln!("[trace] mat edges: {}ms", t_edge.elapsed().as_millis()); }
@@ -1364,10 +1364,10 @@ fn create_windows_junction(target: &Path, path: &Path) -> io::Result<()> {
     }
 }
 
-fn create_symlink(target: &Path, path: &Path) -> Result<(), MaterializeError> {
+fn create_edge_link(target: &Path, path: &Path) -> Result<(), MaterializeError> {
     #[cfg(unix)]
     {
-        symlink(target, path).map_err(|_| MaterializeError::SymlinkUnsupported {
+        symlink(target, path).map_err(|_| MaterializeError::EdgeLinkUnsupported {
             path: path.to_path_buf(),
         })
     }
@@ -1381,7 +1381,7 @@ fn create_symlink(target: &Path, path: &Path) -> Result<(), MaterializeError> {
         // stable OS command.
         let target_abs = path.parent().unwrap_or_else(|| Path::new("")).join(target);
         create_windows_junction(&target_abs, path).map_err(|_| {
-            MaterializeError::SymlinkUnsupported {
+            MaterializeError::EdgeLinkUnsupported {
                 path: path.to_path_buf(),
             }
         })
@@ -1390,7 +1390,7 @@ fn create_symlink(target: &Path, path: &Path) -> Result<(), MaterializeError> {
     {
         let _ = target;
         let _ = path;
-        Err(MaterializeError::SymlinkUnsupported {
+        Err(MaterializeError::EdgeLinkUnsupported {
             path: path.to_path_buf(),
         })
     }
@@ -1540,7 +1540,7 @@ fn parts_to_path(parts: &[String]) -> PathBuf {
 
 fn effective_link(opts: &MaterializeOptions) -> LinkStrategy {
     match opts.projection {
-        Projection::NodeModules => LinkStrategy::Symlink,
+        Projection::NodeModules => LinkStrategy::EdgeLink,
         Projection::Vendor => LinkStrategy::Copy,
     }
 }
@@ -1630,16 +1630,16 @@ mod tests {
     #[test]
     fn projection_link_policy_is_strict() {
         let mut node_modules = MaterializeOptions::node_modules();
-        assert_eq!(effective_link(&node_modules), LinkStrategy::Symlink);
+        assert_eq!(effective_link(&node_modules), LinkStrategy::EdgeLink);
 
         node_modules.link = LinkStrategy::Copy;
-        assert_eq!(effective_link(&node_modules), LinkStrategy::Symlink);
+        assert_eq!(effective_link(&node_modules), LinkStrategy::EdgeLink);
 
         node_modules.link = LinkStrategy::Auto;
-        assert_eq!(effective_link(&node_modules), LinkStrategy::Symlink);
+        assert_eq!(effective_link(&node_modules), LinkStrategy::EdgeLink);
 
         let mut vendor = MaterializeOptions::vendor();
-        vendor.link = LinkStrategy::Symlink;
+        vendor.link = LinkStrategy::EdgeLink;
         assert_eq!(effective_link(&vendor), LinkStrategy::Copy);
     }
 

@@ -14,7 +14,7 @@
 //! - [`ResolutionGraph`] — the validated resolved tree consumed by runtime,
 //!   materialization, and editor tooling. [`UnpackedStore`] supplies stable real
 //!   package directories; packages are real directories containing hardlinks/clones,
-//!   and only dependency edges use symlinks.
+//!   and only dependency edges use links (Unix symlinks, Windows NTFS junctions).
 //!
 //! All hashes/specifiers are newtypes ([`ContentHash`], [`PackageName`],
 //! [`Version`], [`VersionReq`]) and every reachable failure is a typed
