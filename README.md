@@ -4,166 +4,169 @@
 
 <div align="center">
   <h1>meow</h1>
-  <p><strong>Looks like a kitten. Runs like Rust.</strong></p>
+  <p><strong>Purrs like a kitten. Runs like Rust.</strong></p>
   <p>
-    <a href="https://github.com/meowmeow-sh/meow/actions"><img src="https://img.shields.io/badge/build-passing-brightgreen?style=flat-square&color=98FF98" alt="Build Status"></a>
-    <a href="https://github.com/meowmeow-sh/meow/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT_/_Apache--2.0-blue?style=flat-square&color=89CFF0" alt="License"></a>
+    <a href="https://github.com/0xchasercat/meow/actions"><img src="https://img.shields.io/badge/build-passing-brightgreen?style=flat-square&color=98FF98" alt="Build Status"></a>
+    <a href="https://github.com/0xchasercat/meow/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT_/_Apache--2.0-blue?style=flat-square&color=89CFF0" alt="License"></a>
     <a href="https://meow.style"><img src="https://img.shields.io/badge/website-meow.style-lightgrey?style=flat-square&color=FFB7C5" alt="Website"></a>
-    <a href="https://github.com/meowmeow-sh/meow/stars"><img src="https://img.shields.io/github/stars/meowmeow-sh/meow?style=flat-square&color=FF6FA0" alt="GitHub Stars"></a>
+    <a href="https://github.com/0xchasercat/meow/stars"><img src="https://img.shields.io/github/stars/0xchasercat/meow?style=flat-square&color=Floof" alt="GitHub Stars"></a>
   </p>
 </div>
 
 ---
 
-`meow` is a JavaScript and TypeScript runtime, package manager, test runner, linter, formatter, and typechecker — delivered as a single Rust binary.
+# 🐾 meow
 
-It is not a Node.js wrapper. It is not an academically pure runtime that asks you to abandon npm. It is a drop-in replacement: your `package.json` stays, your code stays, your existing dependencies work. The toolchain gets replaced.
+> **The last JavaScript runtime.** > *Purrs like a kitten. Runs like Rust.*
 
-```ts
-import { serve } from "meow:http";
+`meow` is an adorable, all-in-one JavaScript/TypeScript runtime, blazing-fast package manager, deterministic test runner, and unified quality-assurance toolchain delivered as a single, self-contained Rust binary. 
 
-serve({
-  port: 3000,
-  fetch(req) {
-    return new Response("meow! v8 isolate booted in 18ms");
-  }
-});
-```
+We didn't set out to reinvent the wheel or add yet another competing standard to a fractured landscape. Instead, `meow` is built as the ultimate **connective tissue** for modern web development. By leveraging the battle-tested, ironclad runtime layers engineered by the Deno team and marrying them directly to the ultra-fast Oxc parsing pipeline, `meow` collapses your entire workspace stack into a unified, secure-by-default environment. 
+
+One AST parsed exactly once in memory. Zero redundant allocations. Zero configurations. Complete engineering harmony.
 
 ---
 
-## Quick start
+## ⚡ Brutal Performance. Adorable UX.
+
+* **The Parse-Once Pipeline:** Webpack, ESLint, Prettier, and Jest all drag your code through separate parsers, melting your CPU. `meow` maps your codebase **exactly once** in memory using the Oxc parser, natively feeding that single AST to the runtime, linter, formatter, typechecker, and bundler simultaneously.
+* **Soft Paws, Zero Waste Installs:** Packages download to a global content-addressed cache exactly once and instantly project into your workspace via Copy-on-Write (`clonefile` on macOS APFS) or highly parallel hardlinking (Linux/Windows). You get millisecond warm installs, zero messy symlink loops, and **0 bytes of duplicated disk space**.
+* **Fast by Math, Not by Cheating:** We don't skip cryptographic supply-chain signatures just to win Twitter speed benchmarks. `meow` executes full, ironclad **SHA-512 verification** by offloading heavy hashing to background OS threads so your network never stalls.
+* **Hermetic & Deterministic by Default:** Third-party execution utilities (like `npx` or dynamic imports) are a massive supply-chain security hazard. `meow` executes in a strict isolation sandbox by default: the system clock is frozen, environmental variables are hidden, and randomness is seeded. 
+* **Framework Ready from Day 1:** No magic, no toy examples. Powered by a highly tuned V8 engine, `meow` natively boots Next.js 15, Astro, Vite, Playwright, and Puppeteer right out of the box with full support for CommonJS and Node built-ins.
+
+---
+
+## 🏗️ Architectural Layout
+
+`meow` is architected with strict structural separation to isolate side effects from core compiler and runtime execution states, driven by a cooperative, single-threaded async scheduler:
+
+
+```
+
+```
+              ┌───────────────────────────────────┐
+              │         Main OS Thread            │
+              │   (tokio LocalSet Execution)      │
+              └─────────────────┬─────────────────┘
+                                │
+     ┌──────────────────────────┼──────────────────────────┐
+     ▼                          ▼                          ▼
+
+```
+
+┌──────────────────┐       ┌──────────────────┐       ┌──────────────────┐
+│   Main Isolate   │       │ Worker Isolate 1 │       │ Worker Isolate 2 │
+│ (JsRuntime !Send)│       │ (JsRuntime !Send)│       │ (JsRuntime !Send)│
+└──────────────────┘       └──────────────────┘       └──────────────────┘
+
+```
+
+* **`meow-graph` (Incremental Oxc Pipeline):** The single parsing and semantic analysis entrance for the workspace. Manages lossless syntax trees (CST), scopes, and references as lazy, invalidatable queries.
+* **`meow-runtime` (V8 Embedding):** Manages V8 isolate orchestration. Implements a cooperative, single-threaded, multi-isolate event loop allowing workers (like Svelte/Vite parallel bundling pipelines) to interleave perfectly without the heavy context-switching overhead of OS threads.
+* **`meow-pkg` (Package & Cache Layer):** Models the `meow.lock.jsonl` schema (strictly sorted, git-merge resistant JSON-lines) and coordinates fast, semaphore-guarded filesystem materialization to completely eliminate `EMFILE` crashes.
+* **`meow-ui` (Terminal UX Engine):** A dependency-free terminal rendering engine that turns cryptic compiler traces into beautifully structured panels, line gutters, and inline carets, gracefully degrading to plain text in CI pipelines.
+
+---
+
+## 🚀 Getting Started
+
+### 1. Install meow
+Bring the engine to your machine instantly:
+```bash
+curl -fSL [https://meow.sh/install](https://meow.sh/install) | sh
+
+```
+
+### 2. Initialize a Project
+
+Scaffold a clean workspace:
 
 ```bash
-# 1. install
-curl -fsSL https://meow.style/install | sh
+meow init
 
-# 2. drop into any existing project
-git clone https://github.com/your/project.git
-cd project
-
-# 3. install and run
-meow install
-meow run dev
 ```
 
-Your `package.json` scripts work unchanged. `meow run <script>` executes them; `meow <script>` is shorthand.
+This writes your `package.json`, generates a unified `meow.config.json`, and sets up editor shims automatically.
 
----
+### 3. Add Dependencies
 
-## Why meow
-
-### One parse
-
-Webpack, ESLint, Prettier, and Jest all parse your TypeScript independently. meow uses the Oxc parser to parse your codebase exactly once in memory. The same AST feeds the runtime, linter, formatter, and bundler. Re-parsing is a bug.
-
-TypeScript annotations are erased in-place — zero-allocation whitespace stripping that preserves 1:1 byte offsets. No sourcemaps. No emit step. No transpilation.
-
-### Drop-in compatibility
-
-meow boots Next.js, Astro, and Vite without configuration changes. Node built-ins (`fs`, `path`, `crypto`), `process`, `Buffer`, CommonJS, and N-API addons work natively through upstream Deno crates (`deno_node`, `deno_napi`, `deno_crypto`).
-
-When invoked as `node`, meow normalizes Node-style arguments and responds as a drop-in. Your existing projects run.
-
-### Fast installs
-
-Packages download to a global content-addressed cache once. On macOS, they project into your project's `node_modules` using the kernel's `clonefile(2)` syscall — milliseconds, zero duplicated bytes. Linux and Windows fall back to hardlinks.
-
-If a package is locked in `meow.lock.jsonl`, meow bypasses npm registry metadata fetching entirely. Warm installs drop to ~20ms. Every tarball is verified with SHA-256, but cryptography and decompression run on background OS threads to keep the network pool saturated.
-
-### Hermetic tests
-
-`meow test` freezes the system clock at a virtual epoch, seeds the RNG with a deterministic ChaCha20 stream, and hides environment variables by default. Flaky tests stop being flaky.
-
-Network and filesystem access are explicit grants, not assumptions. `--allow-net`, `--allow-read`, `--allow-env` — or nothing.
-
----
-
-## Performance
-
-meow runs on V8 — the same engine as Node.js. Hot-loop JavaScript throughput is at parity, not 10× faster. The wins are in the native toolchain: cold start, install, lint, format, and test orchestration.
-
-| Metric | Node.js | meow |
-| :--- | :--- | :--- |
-| Cold install (1,600+ packages) | ~45–60s | **12.5s** |
-| Warm install (lockfile hit) | ~10s | **0.8s** |
-| TypeScript execution startup | ~180ms | **18ms** |
-| Linter throughput | ~200 files/s | **11,000+ files/s** |
-
-We won't claim what won't benchmark. (=^・ω・^=)
-
----
-
-## CLI
+Add packages securely with background-threaded verification:
 
 ```bash
-meow install                # resolve, cache, lock, materialize node_modules
-meow add <pkg>               # add to package.json, then install
-meow remove <pkg>            # remove from package.json, then reinstall
-meow run <script|file>       # execute a package.json script or file
-meow dev                     # shorthand for meow run dev
-meow test                    # hermetic test runner (meow:test API)
-meow check                   # typecheck via tsc/tsgo over shadow tsconfig
-meow lint [--fix]            # lint over the shared Oxc graph
-meow fmt [--check]           # format via Oxc codegen
-meow bundle <entries>        # bundle over the shared module graph
-meow task <name>             # run a typed task from meow.tasks.ts
-meow x <pkg>                 # ephemeral package execution (npx/bunx equivalent)
-meow why-dep <pkg>           # trace dependency ancestry through the lockfile
-meow why-slow                # cold-start timing breakdown
-meow why-large               # largest modules and duplicate packages
-meow doctor                  # environment, config, and lockfile health
-meow sync                    # regenerate shadow TypeScript config
-meow types [--emit|--check]  # regenerate or verify meow:* type declarations
+meow add lodash-es
+meow add -D svelte
+
 ```
 
-Opt-in flags for stricter profiles:
+### 4. Execute and Build
+
+Run a TypeScript entry file, dev server, or build pipeline directly:
 
 ```bash
-meow run --mode strict-web              # withdraw Node globals for portable edge projects
-meow test --allow-clock                  # use real system clock instead of frozen time
-meow run --allow-net=api.example.com:443 # grant scoped network access
-meow run --frozen                        # refuse lockfile or graph changes
+meow run main.ts
+meow dev
+meow run build
+
 ```
 
 ---
 
-## What doesn't work yet
+## 🐾 Command Catalog
 
-Trust is the only currency that matters for a runtime. Here is what meow **cannot** do today:
+`meow` bundles all ambient developer capabilities into clean, lightning-fast verbs:
 
-- **Native C++ addons (.node):** The N-API bridge is incomplete. Packages that rely on precompiled C++ binaries (like older `bcrypt`) will fail. WASM-based alternatives work.
-- **The linter is minimal:** It catches `debugger` statements and `console.log` calls. Full rule sets are on the roadmap.
+```
+RUN
+  run       Execute a file or a package.json script
+  dev       Start the dev script (meow run dev)
+  task      Run a typed task from meow.tasks.ts
+  test      Run the isolate-backed, deterministic test runner
 
-We'd rather tell you now than have you find out in production.
+PACKAGES
+  install   Resolve and install dependencies from the lockfile
+  add       Add a dependency and update the lockfile
+  remove    Remove a dependency
+  why-dep   Explain precisely why a package exists in the dependency tree
 
----
+QUALITY
+  check     Typecheck the project via tsc shims
+  lint      Analyze source files over the shared Oxc AST pipeline
+  fmt       Format source files natively with white-space preservation
+  bundle    Bundle the module graph via embedded Rolldown pipelines
 
-## Architecture
+INSIGHT
+  why-slow  Visualize module-load timelines and cold-start drag
+  why-large Analyze the heaviest modules and duplicate packages in the tree
+  doctor    Verify environment, config, and lockfile health checks
+  sync      Regenerate shadow configurations and types
+  ls        List active dev servers and processes running in the workspace
 
-meow is a Cargo workspace with strict crate boundaries:
-
-| Crate | Role |
-|---|---|
-| `meow-runtime` | The V8 embedding. Sole `deno_core` edge. Owns `JsRuntime`, ops, extensions. |
-| `meow-graph` | The single Oxc parser. Incremental query system: CST → Semantic → RuntimeIR. |
-| `meow-loader` | Module resolution + loading. Bridges runtime and graph. |
-| `meow-pkg` | Lockfile, cache, install, resolution graph, materialization. |
-| `meow-config` | `meow.config.json` schema, shadow tsconfig generation, package.json helpers. |
-| `meow-tool` | Lint, format, bundle — all consume the shared `GraphDb`. |
-| `meow-obs` | Dependency path tracing (`why-dep`). |
-| `meow-cli` | The binary edge. Wires all crates together. |
-
-Key boundaries: only `meow-runtime` touches V8. Only `meow-graph` parses. Only `meow-cli` reads host state. The hermetic seam (`crates/runtime/src/hermetic/`) is the sole location where `SystemTime::now`, `getrandom`, and `std::env::var` may appear.
-
----
-
-## Community
-
-Issues and PRs welcome on [GitHub](https://github.com/meowmeow-sh/meow).
-
-Documentation at [meow.style/docs](https://meow.style/docs/).
+```
 
 ---
 
-MIT / Apache-2.0 licensed. Built in Rust. Says nyaa~
+## 🛡️ Security Boundaries & Opt-Outs
+
+To protect you against malicious npm updates, `meow` isolates script execution by default:
+
+```bash
+🐾 Executing create-next-app in strict isolation.
+Set MEOW_DANGEROUSLY_DISABLE_SECURITY=1 or pass --trust to bypass.
+
+```
+
+We treat you like an adult. If you want to take the training wheels off completely and skip the flag typing, just run:
+
+```bash
+echo "export MEOW_DANGEROUSLY_DISABLE_SECURITY=1" >> ~/.zshrc
+
+```
+
+Power users can haul ass with zero nag screens; security-conscious CI environments stay completely locked down.
+
+---
+
+## ✦ The Equation
+
+0 config + 0 duplicated bytes + 1 binary = meow
