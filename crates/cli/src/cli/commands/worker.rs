@@ -183,7 +183,7 @@ async fn op_meow_worker_host_recv(
     })
 }
 
-#[op2]
+#[op2(fast)]
 fn op_meow_worker_terminate(state: &mut OpState, #[smi] id: u32) {
     let manager = state.borrow::<Rc<RefCell<WorkerManager>>>().clone();
     let mut mgr = manager.borrow_mut();
