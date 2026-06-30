@@ -501,15 +501,14 @@ impl Resolver {
                 && (specifier.as_bytes()[2] == b'/' || specifier.as_bytes()[2] == b'\\'))
         {
             // Strip Windows extended-length path prefix (\\?\) for URL compatibility
-            let normalized = specifier
-                .strip_prefix("\\\\?\\")
-                .unwrap_or(specifier);
-            let joined = referrer
-                .join(normalized)
-                .map_err(|_| ResolveError::SpecifierNotFound {
-                    specifier: specifier.to_owned(),
-                    referrer: referrer.clone(),
-                })?;
+            let normalized = specifier.strip_prefix("\\\\?\\").unwrap_or(specifier);
+            let joined =
+                referrer
+                    .join(normalized)
+                    .map_err(|_| ResolveError::SpecifierNotFound {
+                        specifier: specifier.to_owned(),
+                        referrer: referrer.clone(),
+                    })?;
             return self.finalize_joined(joined, specifier, referrer);
         }
         if specifier.starts_with('#') {
