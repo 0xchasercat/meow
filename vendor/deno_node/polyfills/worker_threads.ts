@@ -66,23 +66,33 @@
 
     constructor(specifier, options = {}) {
       super();
+      const isEval = options.eval === true;
       let spec;
-      if (typeof specifier === "string") {
-        spec = specifier;
-      } else if (specifier && typeof specifier.href === "string") {
-        spec = specifier.href; // URL
+      if (isEval) {
+        // `new Worker(code, { eval: true })`: the first argument is inline
+        // source code, NOT a path. Pass it through untouched; the worker driver
+        // materialises + runs it (do NOT resolve it as a filename).
+        spec = typeof specifier === "string" ? specifier : String(specifier);
       } else {
-        throw new TypeError("The 'specifier' argument must be a string or URL.");
+        if (typeof specifier === "string") {
+          spec = specifier;
+        } else if (specifier && typeof specifier.href === "string") {
+          spec = specifier.href; // URL
+        } else {
+          throw new TypeError(
+            "The 'specifier' argument must be a string or URL.",
+          );
+        }
+        // Modern TS projects pass a `.js` specifier for a `.ts` source on disk;
+        // reuse the resolver's source-fallback (also normalizes a file URL).
+        spec = op_worker_threads_filename(spec) ?? spec;
       }
-      // Modern TS projects pass a `.js` specifier for a `.ts` source on disk;
-      // reuse the resolver's source-fallback (also normalizes a file URL).
-      spec = op_worker_threads_filename(spec) ?? spec;
 
       const workerData = options.workerData === undefined
         ? null
         : options.workerData;
 
-      this.#id = ops.op_meow_worker_create(spec, serialize(workerData));
+      this.#id = ops.op_meow_worker_create(spec, serialize(workerData), isEval);
       this.threadId = this.#id;
       this.resourceLimits = { ...(options.resourceLimits ?? {}) };
       this.#pump();

@@ -114,12 +114,41 @@ async fn drive_worker(config: WorkerSpawnConfig, req: WorkerSpawnRequest) {
     // Keep a sender clone for the online signal + early-failure reporting before
     // the worker side takes ownership of the original.
     let outbox = req.outbox.clone();
-    let Some(spec) = worker_module_specifier(&req.specifier) else {
-        let _ = outbox.send(HostEvent::Error(format!(
-            "worker_threads: invalid worker specifier `{}`",
-            req.specifier
-        )));
-        return;
+
+    // Resolve the worker's main module. For `new Worker(code, { eval: true })`
+    // the "specifier" is inline SOURCE CODE (e.g. miniflare's CommonJS
+    // WORKER_SCRIPT), so materialise it as a temp `.cjs` file and run it through
+    // meow's normal module machinery. The temp file is removed when this task
+    // ends (`_eval_module` drops).
+    let _eval_module;
+    let spec = if req.eval {
+        match TempEvalModule::write(id, &req.specifier) {
+            Ok(module) => {
+                let Some(spec) = module.specifier() else {
+                    let _ = outbox.send(HostEvent::Error(
+                        "worker_threads: could not build a URL for the eval worker".to_string(),
+                    ));
+                    return;
+                };
+                _eval_module = module;
+                spec
+            }
+            Err(err) => {
+                let _ = outbox.send(HostEvent::Error(format!(
+                    "worker_threads: could not stage eval worker source: {err}"
+                )));
+                return;
+            }
+        }
+    } else {
+        let Some(spec) = worker_module_specifier(&req.specifier) else {
+            let _ = outbox.send(HostEvent::Error(format!(
+                "worker_threads: invalid worker specifier `{}`",
+                req.specifier
+            )));
+            return;
+        };
+        spec
     };
 
     wtrace!(id, "building runtime");
@@ -187,4 +216,36 @@ fn worker_module_specifier(raw: &str) -> Option<ModuleSpecifier> {
 
 fn json_string(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+/// Inline (`eval: true`) worker source materialised to a temp `.cjs` file so
+/// meow's normal CommonJS/ESM module machinery can load + run it. Node defaults
+/// eval workers to CommonJS, and the real-world users of this (miniflare's
+/// synchronous-fetch WORKER_SCRIPT) are CommonJS + `createRequire`, so `.cjs` is
+/// the right extension. Removed on drop, i.e. when the worker task ends.
+struct TempEvalModule {
+    path: std::path::PathBuf,
+}
+
+impl TempEvalModule {
+    fn write(id: u32, source: &str) -> std::io::Result<TempEvalModule> {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "meow-worker-eval-{}-{}.cjs",
+            std::process::id(),
+            id
+        ));
+        std::fs::write(&path, source)?;
+        Ok(TempEvalModule { path })
+    }
+
+    fn specifier(&self) -> Option<ModuleSpecifier> {
+        ModuleSpecifier::from_file_path(&self.path).ok()
+    }
+}
+
+impl Drop for TempEvalModule {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }

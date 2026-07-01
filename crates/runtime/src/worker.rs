@@ -154,7 +154,12 @@ impl WorkerSideState {
 /// into a `std::thread::spawn` closure.
 pub struct WorkerSpawnRequest {
     pub id: u32,
+    /// When `eval` is false this is the worker module specifier; when `eval` is
+    /// true it is the worker's inline SOURCE CODE (Node `new Worker(code,
+    /// { eval: true })`).
     pub specifier: String,
+    /// `new Worker(code, { eval: true })` — `specifier` holds source, not a path.
+    pub eval: bool,
     pub worker_data: Vec<u8>,
     /// host -> worker messages (bare receiver; wrapped via [`WorkerSideState::new`]
     /// on the worker thread).
@@ -218,6 +223,7 @@ fn op_meow_worker_create(
     state: &mut OpState,
     #[string] specifier: String,
     #[buffer] worker_data: JsBuffer,
+    is_eval: bool,
 ) -> u32 {
     let manager = state.borrow::<Rc<RefCell<WorkerManager>>>().clone();
     let Some(spawner) = state.try_borrow::<Rc<dyn WorkerSpawner>>().cloned() else {
@@ -249,10 +255,20 @@ fn op_meow_worker_create(
         id
     };
 
-    wtrace!(id, "create spec={specifier} data={}B", worker_data.len());
+    wtrace!(
+        id,
+        "create eval={is_eval} spec={} data={}B",
+        if is_eval {
+            "<inline>"
+        } else {
+            specifier.as_str()
+        },
+        worker_data.len()
+    );
     spawner.spawn(WorkerSpawnRequest {
         id,
         specifier,
+        eval: is_eval,
         worker_data: worker_data.to_vec(),
         inbox: worker_inbox,
         outbox: worker_outbox,

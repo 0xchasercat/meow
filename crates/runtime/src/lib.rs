@@ -72,6 +72,7 @@ pub use deno_core;
 pub use deno_core::v8;
 pub use deno_core::ModuleCodeString;
 pub use deno_core::ModuleSpecifier;
+pub use deno_core::SharedArrayBufferStore;
 
 pub use error::{JsExceptionReport, RuntimeError};
 pub use ext::http::ops::HttpError;
@@ -195,6 +196,23 @@ fn maximize_fd_limit() {
 #[cfg(not(unix))]
 fn maximize_fd_limit() {}
 
+/// The process-wide [`SharedArrayBufferStore`], shared by EVERY runtime in this
+/// process (the main isolate and every `node:worker_threads` worker isolate).
+///
+/// `deno_core`'s structured clone only serializes a `SharedArrayBuffer` (and
+/// only *transfers* an `ArrayBuffer`) when the runtime has a store, and cross-
+/// isolate sharing requires all participating isolates to use the SAME store
+/// (backing stores are handed off by integer id). A process-global singleton
+/// gives every worker the same store with zero plumbing through `RuntimeOptions`
+/// — the ids are globally unique (one counter), so there is no cross-runtime
+/// collision. This is what lets `worker_threads` `workerData` / `postMessage`
+/// carry a `SharedArrayBuffer` whose `Atomics.wait`/`notify` then work across
+/// threads (e.g. miniflare's synchronous fetch).
+fn shared_array_buffer_store() -> SharedArrayBufferStore {
+    static STORE: std::sync::OnceLock<SharedArrayBufferStore> = std::sync::OnceLock::new();
+    STORE.get_or_init(SharedArrayBufferStore::default).clone()
+}
+
 /// Apply raw V8 engine flags before any isolate is created.
 /// Calls `v8::V8::set_flags_from_command_line` which is a process-global
 /// init point — must be invoked before any `JsRuntime` is constructed.
@@ -241,6 +259,10 @@ impl Runtime {
             startup_snapshot: options.startup_snapshot,
             residual_lazy_js_sources: options.residual_lazy_js_sources,
             residual_lazy_esm_sources: options.residual_lazy_esm_sources,
+            // Share ONE store across all isolates in the process so
+            // `SharedArrayBuffer`s (and transferred `ArrayBuffer`s) survive
+            // structured clone between the main isolate and worker isolates.
+            shared_array_buffer_store: Some(shared_array_buffer_store()),
             ..Default::default()
         })
         .map_err(|err| RuntimeError::Init(err.to_string()))?;
