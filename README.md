@@ -74,7 +74,7 @@ One AST parsed exactly once in memory. Zero redundant allocations. Zero configur
 ### 1. Install meow
 Bring the engine to your machine instantly:
 ```bash
-curl -fSL [https://meow.sh/install](https://meow.sh/install) | sh
+curl -fsSL https://meow.style/install | sh
 
 ```
 
