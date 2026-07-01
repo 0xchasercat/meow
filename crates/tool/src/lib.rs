@@ -8,7 +8,7 @@ use std::{
 use meow_graph::{GraphDb, SemanticGraph, SourceType};
 use meow_loader::Resolver;
 use oxc_ast::AstKind;
-use oxc_codegen::Codegen;
+use oxc_codegen::{Codegen, CodegenOptions, CommentOptions};
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_span::Span;
 
@@ -116,8 +116,24 @@ pub fn format_paths(
             continue;
         }
 
+        // Format via the Oxc code printer (meow's documented formatter). Pass the
+        // source text + enable comment emission so comments are PRESERVED (the
+        // printer drops them otherwise -- it needs the source to slice comment
+        // text). Canonical codegen formatting, not Prettier-grade, but comment-safe.
         let formatted = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            Codegen::new().build(cst.program()).code
+            Codegen::new()
+                .with_source_text(&source)
+                .with_options(CodegenOptions {
+                    comments: CommentOptions {
+                        normal: true,
+                        jsdoc: true,
+                        annotation: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .build(cst.program())
+                .code
         })) {
             Ok(formatted) => formatted,
             Err(err) => {
