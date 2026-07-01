@@ -161,6 +161,11 @@ pub struct WorkerSpawnRequest {
     pub specifier: String,
     /// `new Worker(code, { eval: true })` — `specifier` holds source, not a path.
     pub eval: bool,
+    /// The `env` worker option as a JSON object string, or "" to inherit the
+    /// parent's env. Node's `new Worker(x, { env })` sets the worker's
+    /// `process.env`; tools rely on it (e.g. SvelteKit signals fork mode via
+    /// `SVELTEKIT_FORK`). Parsed at the binary edge (which owns env handling).
+    pub env_json: String,
     pub worker_data: Vec<u8>,
     /// host -> worker messages (bare receiver; wrapped via [`WorkerSideState::new`]
     /// on the worker thread).
@@ -230,6 +235,7 @@ fn op_meow_worker_create(
     #[string] specifier: String,
     #[buffer] worker_data: JsBuffer,
     is_eval: bool,
+    #[string] env_json: String,
 ) -> u32 {
     let manager = state.borrow::<Rc<RefCell<WorkerManager>>>().clone();
     let Some(spawner) = state.try_borrow::<Rc<dyn WorkerSpawner>>().cloned() else {
@@ -275,6 +281,7 @@ fn op_meow_worker_create(
         id,
         specifier,
         eval: is_eval,
+        env_json,
         worker_data: worker_data.to_vec(),
         inbox: worker_inbox,
         outbox: worker_outbox,

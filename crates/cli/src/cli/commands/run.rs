@@ -924,9 +924,14 @@ pub(super) fn build_worker_runtime(
     config: &WorkerSpawnConfig,
     spec: &meow_runtime::ModuleSpecifier,
     worker_side: meow_runtime::worker::WorkerSideState,
+    env_override: Option<BTreeMap<String, String>>,
 ) -> Result<meow_runtime::Runtime, String> {
     let ctx = &config.ctx;
-    let env = config.env.clone();
+    // Node's `new Worker(x, { env })` sets the worker's `process.env`. When the
+    // caller supplied one, it fully replaces the inherited parent env (the JS
+    // side spreads `...process.env` when it wants both); otherwise inherit the
+    // run's env.
+    let env = env_override.unwrap_or_else(|| config.env.clone());
     let resolver = meow_loader::Resolver::from_resolution(
         &ctx.graph,
         ctx.cache.clone(),

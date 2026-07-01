@@ -63,6 +63,8 @@
     #id;
     #terminated = false;
     #onlineEmitted = false;
+    #unref = false;
+    #pendingRecv = null;
 
     constructor(specifier, options = {}) {
       super();
@@ -92,10 +94,25 @@
         ? null
         : options.workerData;
 
+      // Node `env` worker option: a plain object becomes the worker's
+      // `process.env` (tools signal fork mode this way, e.g. SvelteKit's
+      // SVELTEKIT_FORK). `SHARE_ENV` (a symbol) and `undefined` inherit the
+      // parent's env, which is meow's default, so leave `envJson` empty.
+      let envJson = "";
+      const envOption = options.env;
+      if (envOption && typeof envOption === "object") {
+        try {
+          envJson = JSON.stringify(envOption);
+        } catch (_err) {
+          envJson = "";
+        }
+      }
+
       this.#id = ops.op_meow_worker_create(
         spec,
         serializeForPort(workerData, options.transferList),
         isEval,
+        envJson,
       );
       this.threadId = this.#id;
       this.resourceLimits = { ...(options.resourceLimits ?? {}) };
@@ -105,9 +122,16 @@
     #pump() {
       const step = () => {
         if (this.#terminated) return;
+        const promise = ops.op_meow_worker_host_recv(this.#id);
+        this.#pendingRecv = promise;
+        // Honor `unref()`: an unref'd worker's pending receive must not keep the
+        // parent event loop alive (SvelteKit's `forked` unref's the worker after
+        // the result and relies on the build process exiting).
+        if (this.#unref) core.unrefOpPromise(promise);
         PromisePrototypeThen(
-          ops.op_meow_worker_host_recv(this.#id),
+          promise,
           (frame) => {
+            this.#pendingRecv = null;
             if (this.#terminated) return;
             if (frame.length === 0) {
               this.#terminated = true;
@@ -141,6 +165,7 @@
             step();
           },
           (err) => {
+            this.#pendingRecv = null;
             if (this.#terminated) return;
             this.#terminated = true;
             this.emit("error", err);
@@ -167,10 +192,17 @@
       return PromiseResolve(1);
     }
 
-    // Cooperative single-thread workers have no separate libuv loop to hold
-    // open, so ref/unref are no-ops.
-    ref() {}
-    unref() {}
+    // ref/unref via deno_core op-promise ref counting: an unref'd worker's
+    // pending host receive must not keep the parent event loop alive, so a build
+    // that unref's its workers can still exit once its own work is done.
+    ref() {
+      this.#unref = false;
+      if (this.#pendingRecv) core.refOpPromise(this.#pendingRecv);
+    }
+    unref() {
+      this.#unref = true;
+      if (this.#pendingRecv) core.unrefOpPromise(this.#pendingRecv);
+    }
   }
 
   // ---------------------------- worker side ----------------------------

@@ -151,9 +151,23 @@ async fn drive_worker(config: WorkerSpawnConfig, req: WorkerSpawnRequest) {
         spec
     };
 
+    // Node `new Worker(x, { env })` sets the worker's process.env. Parse it here
+    // (the binary edge owns env handling); empty means inherit the run's env.
+    let env_override = if req.env_json.is_empty() {
+        None
+    } else {
+        match serde_json::from_str::<std::collections::BTreeMap<String, String>>(&req.env_json) {
+            Ok(env) => Some(env),
+            Err(err) => {
+                wtrace!(id, "ignoring invalid worker env json: {err}");
+                None
+            }
+        }
+    };
+
     wtrace!(id, "building runtime");
     let worker_side = WorkerSideState::new(id, req.worker_data, req.inbox, req.outbox);
-    let mut runtime = match build_worker_runtime(&config, &spec, worker_side) {
+    let mut runtime = match build_worker_runtime(&config, &spec, worker_side, env_override) {
         Ok(runtime) => runtime,
         Err(err) => {
             wtrace!(id, "build failed: {err}");
