@@ -828,9 +828,10 @@ pub(super) async fn run_native_request(
     // === RT-004 === / === SEC-001 ===
     // Trusted runs (default `meow run`) keep AllowAll — byte-identical to before.
     // Sandboxed runs (`meow x` by default, `meow run --sandbox`) enforce fs/net:
-    // the one policy drives the fetch gate's NetCaps here, meow's io/http seam
-    // (io_capability_extension below), and the Node stack's PermissionsContainer
-    // (NodeOptions.sandbox). Workers inherit it via WorkerSpawnConfig.
+    // the one policy drives the fetch gate's NetCaps here, and (inside
+    // node::extensions) meow's Rc io/http seam + the Node stack's
+    // PermissionsContainer -- all via NodeOptions.sandbox. Workers inherit it via
+    // WorkerSpawnConfig.
     let sandbox = flags
         .sandbox
         .then(|| sandbox_policy_for(&request.project_dir, &request.process_cwd));
@@ -846,13 +847,10 @@ pub(super) async fn run_native_request(
     extensions.push(meow_loader::cjs_resolve_extension(resolver.clone()));
     // === /UI-001 ===
     // === /RT-005 ===
-    // Seed meow's own capability seam (meow:http listen, meow-native io ops) with
-    // the sandbox too, so net/write enforcement is consistent across every seam.
-    if let Some(policy) = &sandbox {
-        extensions.push(meow_runtime::io_capability_extension(std::rc::Rc::new(
-            meow_runtime::SandboxCaps::new(policy.clone()),
-        )));
-    }
+    // NOTE: meow's Rc capability seam (meow:http/io ops) is seeded INSIDE
+    // node::extensions (folded into meow_web_fetch_perms), not as a separate
+    // extension here -- deno_core validates the whole extension-name order against
+    // the snapshot, so a new extension would break snapshot loading.
     // === /RT-004 === / === /SEC-001 ===
 
     // === RT-006 ===
@@ -1040,11 +1038,9 @@ pub(super) fn build_worker_runtime(
         meow_runtime::ui_extension(),
         meow_loader::cjs_resolve_extension(resolver.clone()),
     ];
-    if let Some(policy) = &config.sandbox {
-        extensions.push(meow_runtime::io_capability_extension(std::rc::Rc::new(
-            meow_runtime::SandboxCaps::new(policy.clone()),
-        )));
-    }
+    // Worker inherits the sandbox via NodeOptions.sandbox below (which seeds both
+    // the deno permission container and meow's Rc seam inside node::extensions) --
+    // no separate extension here, to keep the snapshot extension order intact.
     meow_runtime::hermetic::pin_deterministic_intl(&config.hermetic);
     extensions.extend(meow_runtime::hermetic::extensions(config.hermetic.clone()));
 

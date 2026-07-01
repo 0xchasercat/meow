@@ -196,12 +196,25 @@ pub fn extensions(opts: NodeOptions) -> Vec<Extension> {
         ..Default::default()
     };
 
+    // === SEC-001 === also seed meow's own Rc capability seam (meow:http serve
+    // NetListen + any meow-native io ops) with the sandbox. Folded into this
+    // EXISTING, snapshot-ordered extension rather than a new one: deno_core
+    // validates the whole extension-name order against the snapshot, so inserting
+    // a fresh extension would break snapshot loading. The `SandboxPolicy` is
+    // `Send`; the `!Send` `Rc` is built inside the op_state_fn on the runtime
+    // thread. `None` (trusted) leaves the default AllowAll seam untouched.
+    let io_seam_policy = sandbox.clone();
     exts.push(crate::web::meow_web_fetch::init());
     exts.push(Extension {
         name: "meow_web_fetch_perms",
         op_state_fn: Some(Box::new(move |state| {
             state.put::<DenoPermissionsContainer>(perms_container.clone());
             state.put::<crate::web::NetCaps>(caps.clone());
+            if let Some(policy) = &io_seam_policy {
+                state.put::<std::rc::Rc<dyn crate::io::CapabilityCheck>>(std::rc::Rc::new(
+                    crate::io::SandboxCaps::new(policy.clone()),
+                ));
+            }
         })),
         ..Default::default()
     });
