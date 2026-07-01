@@ -1404,13 +1404,23 @@ fn install_node_shim_env(env: &mut BTreeMap<String, String>) -> Result<(), RunCo
         RunCommandError::Message(format!("cannot resolve current executable: {source}"))
     })?;
     let home = host::host_home();
-    let shim_dir = home.join(".meow").join("bin");
+    let meow_dir = home.join(".meow");
+    // Runtime/PM interception shims (node/npm/pnpm/yarn/bun + npx/pnpx/bunx) live
+    // in a PRIVATE `~/.meow/shims` that meow prepends to the PATH of its OWN child
+    // processes only. They must NOT sit in `~/.meow/bin`: users add that to their
+    // shell PATH for `meow i -g` package bins, and mixing the runtime shims in
+    // there hijacks the real node/bun/pnpm across the user's whole shell.
+    let shim_dir = meow_dir.join("shims");
     std::fs::create_dir_all(&shim_dir).map_err(|source| {
         RunCommandError::Message(format!(
             "cannot create shim directory {}: {source}",
             shim_dir.display()
         ))
     })?;
+    // Migration: older meow wrote these shims into `~/.meow/bin`, where they
+    // shadowed the real tools in the user's shell once that dir was on PATH.
+    // Remove only the meow-authored shim files (never a real `meow i -g` bin).
+    remove_legacy_bin_shims(&meow_dir.join("bin"));
 
     // Group 1: runtime shims — proxy directly to meow
     for name in RUNTIME_SHIMS {
@@ -1451,6 +1461,21 @@ fn install_node_shim_env(env: &mut BTreeMap<String, String>) -> Result<(), RunCo
     })?;
     env.insert("PATH".to_owned(), joined.to_string_lossy().into_owned());
     Ok(())
+}
+
+/// Remove runtime/ephemeral interception shims that older meow versions wrote
+/// into `~/.meow/bin` (now `~/.meow/shims`). Only meow-authored shim files are
+/// removed — identified by the `MEOW_NODE_SHIM` marker their scripts carry — so a
+/// genuine `meow i -g` bin that happens to share a name is left untouched. Best
+/// effort: failures are ignored (the dir may not exist, or a bin may be busy).
+fn remove_legacy_bin_shims(bin_dir: &Path) {
+    let ext = if cfg!(windows) { ".exe" } else { "" };
+    for name in RUNTIME_SHIMS.iter().chain(EPHEMERAL_SHIMS.iter()) {
+        let path = bin_dir.join(format!("{name}{ext}"));
+        if std::fs::read_to_string(&path).is_ok_and(|content| content.contains("MEOW_NODE_SHIM")) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// Write a shell shim (or `.cmd` on Windows) at `shim_path` that proxies to
