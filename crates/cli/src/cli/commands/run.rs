@@ -65,6 +65,7 @@ fn sandbox_policy_for(project_dir: &Path, process_cwd: &Path) -> meow_runtime::S
         std::env::temp_dir(),
     ] {
         let canonical = std::fs::canonicalize(&root).unwrap_or(root);
+        let canonical = meow_runtime::strip_windows_verbatim_prefix(canonical);
         if !write_roots.contains(&canonical) {
             write_roots.push(canonical);
         }

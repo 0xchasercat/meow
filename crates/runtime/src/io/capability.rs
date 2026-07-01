@@ -20,6 +20,26 @@
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+/// Strip the Windows extended-length (verbatim) prefix from a path so it
+/// matches the non-verbatim form the OS/Node present at I/O time. This is the
+/// classic `std::fs::canonicalize` `\\?\` mismatch fix. Pure/lexical (I-6):
+/// touches no filesystem and reads no ambient state. No-op on non-Windows.
+#[cfg(windows)]
+pub fn strip_windows_verbatim_prefix(path: std::path::PathBuf) -> std::path::PathBuf {
+    let s = path.as_os_str().to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return std::path::PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return std::path::PathBuf::from(rest);
+    }
+    path
+}
+#[cfg(not(windows))]
+pub fn strip_windows_verbatim_prefix(path: std::path::PathBuf) -> std::path::PathBuf {
+    path
+}
+
 /// A host-I/O request presented to the capability seam before the op acts.
 /// Borrows its subject so the check allocates nothing on the hot path.
 pub enum CapRequest<'a> {
@@ -113,10 +133,11 @@ impl SandboxCaps {
     fn write_allowed(&self, path: &Path) -> bool {
         let normalized = lexically_normalize(path);
         if normalized.is_absolute() {
-            self.policy
-                .write_roots
-                .iter()
-                .any(|root| normalized.starts_with(root))
+            let normalized = strip_windows_verbatim_prefix(normalized);
+            self.policy.write_roots.iter().any(|root| {
+                let root = strip_windows_verbatim_prefix(root.clone());
+                normalized.starts_with(root)
+            })
         } else {
             // Relative paths resolve against the process cwd, which is always a
             // write root for a sandboxed run; allow unless the normalized form
@@ -193,4 +214,44 @@ fn lexically_normalize(path: &Path) -> PathBuf {
         }
     }
     out
+}
+
+#[cfg(test)]
+#[cfg(windows)]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn strips_windows_drive_verbatim_prefix() {
+        assert_eq!(
+            strip_windows_verbatim_prefix(PathBuf::from(r"\\?\C:\a\b")),
+            PathBuf::from(r"C:\a\b")
+        );
+    }
+
+    #[test]
+    fn strips_windows_unc_verbatim_prefix() {
+        assert_eq!(
+            strip_windows_verbatim_prefix(PathBuf::from(r"\\?\UNC\server\share\x")),
+            PathBuf::from(r"\\server\share\x")
+        );
+    }
+
+    #[test]
+    fn leaves_non_verbatim_windows_path_unchanged() {
+        let path = PathBuf::from(r"C:\a\b");
+        assert_eq!(strip_windows_verbatim_prefix(path.clone()), path);
+    }
+
+    #[test]
+    fn sandbox_caps_accepts_verbatim_child_under_non_verbatim_root() {
+        let caps = SandboxCaps::new(SandboxPolicy {
+            write_roots: vec![PathBuf::from(r"C:\proj")],
+            allow_net: false,
+        });
+
+        assert!(caps
+            .check(&CapRequest::WriteFile(Path::new(r"\\?\C:\proj\inside.txt")))
+            .is_ok());
+    }
 }
