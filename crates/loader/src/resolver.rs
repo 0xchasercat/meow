@@ -1685,18 +1685,36 @@ fn cached_dual_build_kind(manifest: &PackageJson, member: &str) -> ModuleKind {
     if !member_in_build_dir(member, &esm_dir) {
         return ModuleKind::Cjs;
     }
-    // The member is under the ESM build dir. When `main` and `module` share a
-    // directory (e.g. both under `dist/`), `require` keeps the CommonJS reading.
+    // The member is under the ESM build dir. If it is ALSO under the CommonJS
+    // `main` dir, the MORE SPECIFIC (deeper) directory wins:
+    //   * ESM build NESTED under the CJS dir -- `main: dist/public_api.js`,
+    //     `module: dist/module/public_api.js` (@ctrl/tinycolor). The whole
+    //     `dist/module/` subtree is ESM, including barrel siblings the ESM entry
+    //     re-exports (`export * from './index.js'`); classifying those as CJS
+    //     loads real ESM through the CJS facade and drops the named exports
+    //     (`does not provide an export named 'TinyColor'`).
+    //   * SHARED directory -- `main` and `module` both in `dist/` -- keeps the
+    //     CommonJS reading for `require` (the ESM entry itself is caught by the
+    //     exact-`module`-file match above).
     let under_cjs = manifest
         .main
         .as_deref()
         .and_then(entry_build_dir)
-        .is_some_and(|cjs_dir| member_in_build_dir(member, &cjs_dir));
+        .is_some_and(|cjs_dir| {
+            member_in_build_dir(member, &cjs_dir) && !dir_is_strictly_under(&esm_dir, &cjs_dir)
+        });
     if under_cjs {
         ModuleKind::Cjs
     } else {
         ModuleKind::Esm
     }
+}
+
+/// True when `inner` is a strict subdirectory of `outer` (nested deeper), so a
+/// member under both should follow `inner`. Equal paths are NOT "strictly under"
+/// (a shared build directory keeps the CommonJS reading).
+fn dir_is_strictly_under(inner: &str, outer: &str) -> bool {
+    inner != outer && Path::new(inner).starts_with(outer)
 }
 
 /// The build directory a package entry field (`main`/`module`) covers. An
@@ -1998,8 +2016,23 @@ mod tests {
             cached_dual_build_kind(&manifest, "dist/module/public_api.js"),
             ModuleKind::Esm
         );
+        // The barrel entry re-exports siblings (`export * from './index.js'`),
+        // so the WHOLE nested ESM subtree must be ESM -- not just the entry file.
+        assert_eq!(
+            cached_dual_build_kind(&manifest, "dist/module/index.js"),
+            ModuleKind::Esm
+        );
+        assert_eq!(
+            cached_dual_build_kind(&manifest, "dist/module/conversion.js"),
+            ModuleKind::Esm
+        );
+        // The CommonJS `main` tree stays CommonJS.
         assert_eq!(
             cached_dual_build_kind(&manifest, "dist/public_api.js"),
+            ModuleKind::Cjs
+        );
+        assert_eq!(
+            cached_dual_build_kind(&manifest, "dist/index.js"),
             ModuleKind::Cjs
         );
         // A `./`-prefixed module field still matches the resolved member.
