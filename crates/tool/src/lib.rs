@@ -5,10 +5,12 @@ use std::{
     sync::Arc,
 };
 
-use meow_graph::{GraphDb, SourceType};
+use meow_graph::{GraphDb, SemanticGraph, SourceType};
 use meow_loader::Resolver;
+use oxc_ast::AstKind;
 use oxc_codegen::Codegen;
 use oxc_diagnostics::OxcDiagnostic;
+use oxc_span::Span;
 
 #[derive(Debug)]
 pub struct ToolDiagnostic {
@@ -49,7 +51,7 @@ pub fn lint_paths(root: &Path, paths: &[PathBuf]) -> Result<LintReport, ToolErro
 
         append_diagnostics(&path, &source, cst.errors(), &mut report.diagnostics);
         append_diagnostics(&path, &source, semantic.errors(), &mut report.diagnostics);
-        append_starter_lints(&path, &source, &mut report.diagnostics);
+        append_ast_lints(&path, &source, semantic, &mut report.diagnostics);
 
         if cst.panicked() {
             report.diagnostics.push(ToolDiagnostic {
@@ -508,81 +510,83 @@ fn append_diagnostics(
     }
 }
 
-// Starter bridge until oxc_linter is available in this pinned Oxc generation.
-// This intentionally only scans source bytes for a small recommended-set subset.
-fn append_starter_lints(path: &Path, source: &Arc<str>, out: &mut Vec<ToolDiagnostic>) {
-    for (start, end) in scan_pattern(source.as_bytes(), b"debugger") {
-        out.push(ToolDiagnostic {
-            path: path.to_path_buf(),
-            source: Arc::clone(source),
-            span: (start, end),
-            message: "`debugger` statements are not allowed".to_string(),
-            label: Some("avoid debugger statements".to_string()),
-        });
-    }
+/// Real AST/semantic lints over the shared graph (I-1): each rule is a genuine
+/// node match on meow-graph's single parse, not a byte scan. This is the
+/// recommended default set; the rule ids match `meow.config.json` `lint.rules`
+/// so per-rule severities can gate them (see `cmd_lint`).
+fn append_ast_lints(
+    path: &Path,
+    source: &Arc<str>,
+    semantic: &SemanticGraph,
+    out: &mut Vec<ToolDiagnostic>,
+) {
+    // Common `console.*` methods flagged by `no-console`.
+    const CONSOLE_METHODS: [&str; 14] = [
+        "log", "warn", "error", "info", "debug", "trace", "dir", "table", "group", "groupEnd",
+        "count", "assert", "time", "timeEnd",
+    ];
 
-    let console_len = b"console.log".len();
-    for (start, end) in scan_pattern(source.as_bytes(), b"console.log") {
-        if start > 0 {
-            let prev = source.as_bytes()[start - 1];
-            if prev == b'.' {
-                continue;
+    for (_, node) in semantic.nodes().iter_enumerated() {
+        match node.kind() {
+            AstKind::DebuggerStatement(stmt) => push_lint(
+                path,
+                source,
+                stmt.span,
+                "no-debugger",
+                "`debugger` statements are not allowed",
+                out,
+            ),
+            AstKind::VariableDeclaration(decl) if decl.kind.is_var() => push_lint(
+                path,
+                source,
+                decl.span,
+                "no-var",
+                "`var` is not allowed; use `let` or `const`",
+                out,
+            ),
+            AstKind::BlockStatement(block) if block.body.is_empty() => push_lint(
+                path,
+                source,
+                block.span,
+                "no-empty",
+                "empty block statement",
+                out,
+            ),
+            AstKind::CallExpression(call)
+                if CONSOLE_METHODS
+                    .iter()
+                    .any(|method| call.callee.is_specific_member_access("console", method)) =>
+            {
+                push_lint(
+                    path,
+                    source,
+                    call.span,
+                    "no-console",
+                    "unexpected `console` statement",
+                    out,
+                );
             }
+            _ => {}
         }
-
-        match source.as_bytes().get(start + console_len).copied() {
-            Some(b'(' | b' ' | b'\t' | b'\n' | b'\r' | b';') => {}
-            None => continue,
-            _ => continue,
-        }
-
-        out.push(ToolDiagnostic {
-            path: path.to_path_buf(),
-            source: Arc::clone(source),
-            span: (start, end),
-            message: "`console.log` calls are not recommended".to_string(),
-            label: Some("avoid console logging".to_string()),
-        });
     }
 }
 
-fn scan_pattern(source: &[u8], pattern: &[u8]) -> impl Iterator<Item = (usize, usize)> {
-    let mut out = Vec::new();
-    let mut index = 0usize;
-    while let Some(found) = find_from(source, pattern, index) {
-        if is_isolated_word(source, found, found + pattern.len()) {
-            out.push((found, found + pattern.len()));
-        }
-        index = found + 1;
-    }
-
-    out.into_iter()
-}
-
-fn find_from(source: &[u8], needle: &[u8], start: usize) -> Option<usize> {
-    if needle.is_empty() || start >= source.len() {
-        return None;
-    }
-
-    source
-        .windows(needle.len())
-        .enumerate()
-        .skip(start)
-        .find_map(|(index, window)| if window == needle { Some(index) } else { None })
-}
-
-fn is_isolated_word(source: &[u8], start: usize, end: usize) -> bool {
-    let before = start == 0 || !is_ident_byte(source[start - 1]);
-    let after = if end >= source.len() {
-        true
-    } else {
-        !is_ident_byte(source[end])
-    };
-    before && after
-}
-
-fn is_ident_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$'
+/// Emit one lint diagnostic, carrying the rule id in `label`.
+fn push_lint(
+    path: &Path,
+    source: &Arc<str>,
+    span: Span,
+    rule: &str,
+    message: &str,
+    out: &mut Vec<ToolDiagnostic>,
+) {
+    out.push(ToolDiagnostic {
+        path: path.to_path_buf(),
+        source: Arc::clone(source),
+        span: (span.start as usize, span.end as usize),
+        message: message.to_string(),
+        label: Some(rule.to_string()),
+    });
 }
 
 const TOOL_EXTENSIONS: [&str; 8] = ["js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx"];

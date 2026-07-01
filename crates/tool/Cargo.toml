@@ -11,6 +11,7 @@ meow-graph = { path = "../graph" }
 meow-pkg = { path = "../pkg" }
 meow-loader = { path = "../loader" }
 thiserror = { workspace = true }
+oxc_ast = { workspace = true }
 oxc_codegen = { workspace = true }
 oxc_diagnostics = { workspace = true }
 oxc_allocator = { workspace = true }
