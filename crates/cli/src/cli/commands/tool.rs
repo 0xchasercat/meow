@@ -20,7 +20,18 @@ pub fn cmd_lint(args: &PathArgs) -> ExitCode {
         }
     };
 
-    let report = match meow_tool::lint_paths(&root, &args.paths) {
+    // Per-rule severities from meow.config.json `lint.rules` (rules not listed use
+    // the recommended default). A missing config is fine -- defaults apply.
+    let severities = match meow_config::MeowConfig::load(&find_project_root(&root)) {
+        Ok(cfg) => lint_severities(&cfg),
+        Err(meow_config::ConfigError::NotFound(_)) => std::collections::BTreeMap::new(),
+        Err(err) => {
+            hiss(&format!("meow lint: invalid meow.config.json: {err}"));
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let report = match meow_tool::lint_paths(&root, &args.paths, &severities) {
         Ok(report) => report,
         Err(err) => {
             hiss(&format!("meow lint: {err}"));
@@ -40,12 +51,34 @@ pub fn cmd_lint(args: &PathArgs) -> ExitCode {
         });
     }
 
-    if report.diagnostics.is_empty() {
+    // Errors fail the run; warnings print but pass (proper lint semantics).
+    if report.had_error {
+        ExitCode::FAILURE
+    } else if report.diagnostics.is_empty() {
         purr("meow lint: no diagnostics");
         ExitCode::SUCCESS
     } else {
-        ExitCode::FAILURE
+        purr("meow lint: warnings only, no errors");
+        ExitCode::SUCCESS
     }
+}
+
+/// Map `meow.config.json` `lint.rules` severities onto the tool's `LintSeverity`.
+fn lint_severities(
+    cfg: &meow_config::MeowConfig,
+) -> std::collections::BTreeMap<String, meow_tool::LintSeverity> {
+    cfg.lint
+        .rules
+        .iter()
+        .map(|(rule, severity)| {
+            let mapped = match severity {
+                meow_config::Severity::Off => meow_tool::LintSeverity::Off,
+                meow_config::Severity::Warn => meow_tool::LintSeverity::Warn,
+                meow_config::Severity::Error => meow_tool::LintSeverity::Error,
+            };
+            (rule.clone(), mapped)
+        })
+        .collect()
 }
 
 pub fn cmd_fmt(args: &FmtArgs) -> ExitCode {

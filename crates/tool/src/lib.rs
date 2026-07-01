@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{BTreeMap, HashSet, VecDeque},
     fs, io,
     path::{Component, Path, PathBuf},
     sync::Arc,
@@ -21,17 +21,34 @@ pub struct ToolDiagnostic {
     pub label: Option<String>,
 }
 
+/// Severity for a lint rule, resolved from `meow.config.json` `lint.rules`
+/// (falling back to the recommended default per rule).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LintSeverity {
+    Off,
+    Warn,
+    Error,
+}
+
 pub struct LintReport {
     pub checked: usize,
     pub diagnostics: Vec<ToolDiagnostic>,
+    /// True if any error-severity diagnostic fired (a rule set to `error`, or a
+    /// parse/semantic error). `meow lint` exits non-zero on this; warnings pass.
+    pub had_error: bool,
 }
 
-pub fn lint_paths(root: &Path, paths: &[PathBuf]) -> Result<LintReport, ToolError> {
+pub fn lint_paths(
+    root: &Path,
+    paths: &[PathBuf],
+    severities: &BTreeMap<String, LintSeverity>,
+) -> Result<LintReport, ToolError> {
     let files = collect_targets(root, paths)?;
     let mut db = GraphDb::new();
     let mut report = LintReport {
         checked: files.len(),
         diagnostics: Vec::new(),
+        had_error: false,
     };
 
     for path in files {
@@ -49,9 +66,14 @@ pub fn lint_paths(root: &Path, paths: &[PathBuf]) -> Result<LintReport, ToolErro
                 reason: "missing semantic stage after CST insertion",
             })?;
 
+        // Parse + semantic errors are always hard errors (fail the run).
+        let before = report.diagnostics.len();
         append_diagnostics(&path, &source, cst.errors(), &mut report.diagnostics);
         append_diagnostics(&path, &source, semantic.errors(), &mut report.diagnostics);
-        append_ast_lints(&path, &source, semantic, &mut report.diagnostics);
+        if report.diagnostics.len() != before {
+            report.had_error = true;
+        }
+        append_ast_lints(&path, &source, semantic, severities, &mut report);
 
         if cst.panicked() {
             report.diagnostics.push(ToolDiagnostic {
@@ -61,6 +83,7 @@ pub fn lint_paths(root: &Path, paths: &[PathBuf]) -> Result<LintReport, ToolErro
                 message: "parser panic while parsing file".to_string(),
                 label: None,
             });
+            report.had_error = true;
         }
     }
 
@@ -534,7 +557,8 @@ fn append_ast_lints(
     path: &Path,
     source: &Arc<str>,
     semantic: &SemanticGraph,
-    out: &mut Vec<ToolDiagnostic>,
+    severities: &BTreeMap<String, LintSeverity>,
+    report: &mut LintReport,
 ) {
     // Common `console.*` methods flagged by `no-console`.
     const CONSOLE_METHODS: [&str; 14] = [
@@ -544,42 +568,46 @@ fn append_ast_lints(
 
     for (_, node) in semantic.nodes().iter_enumerated() {
         match node.kind() {
-            AstKind::DebuggerStatement(stmt) => push_lint(
+            AstKind::DebuggerStatement(stmt) => emit_lint(
                 path,
                 source,
                 stmt.span,
                 "no-debugger",
                 "`debugger` statements are not allowed",
-                out,
+                severities,
+                report,
             ),
-            AstKind::VariableDeclaration(decl) if decl.kind.is_var() => push_lint(
+            AstKind::VariableDeclaration(decl) if decl.kind.is_var() => emit_lint(
                 path,
                 source,
                 decl.span,
                 "no-var",
                 "`var` is not allowed; use `let` or `const`",
-                out,
+                severities,
+                report,
             ),
-            AstKind::BlockStatement(block) if block.body.is_empty() => push_lint(
+            AstKind::BlockStatement(block) if block.body.is_empty() => emit_lint(
                 path,
                 source,
                 block.span,
                 "no-empty",
                 "empty block statement",
-                out,
+                severities,
+                report,
             ),
             AstKind::CallExpression(call)
                 if CONSOLE_METHODS
                     .iter()
                     .any(|method| call.callee.is_specific_member_access("console", method)) =>
             {
-                push_lint(
+                emit_lint(
                     path,
                     source,
                     call.span,
                     "no-console",
                     "unexpected `console` statement",
-                    out,
+                    severities,
+                    report,
                 );
             }
             _ => {}
@@ -587,22 +615,45 @@ fn append_ast_lints(
     }
 }
 
-/// Emit one lint diagnostic, carrying the rule id in `label`.
-fn push_lint(
+/// Emit a rule diagnostic at its resolved severity: `off` skips, `warn` reports
+/// (but the run still passes), `error` reports and marks the run failed. The rule
+/// id rides in `label`. Severity comes from `meow.config.json` `lint.rules`, else
+/// the recommended default.
+fn emit_lint(
     path: &Path,
     source: &Arc<str>,
     span: Span,
     rule: &str,
     message: &str,
-    out: &mut Vec<ToolDiagnostic>,
+    severities: &BTreeMap<String, LintSeverity>,
+    report: &mut LintReport,
 ) {
-    out.push(ToolDiagnostic {
+    let severity = severities
+        .get(rule)
+        .copied()
+        .unwrap_or_else(|| default_severity(rule));
+    if severity == LintSeverity::Off {
+        return;
+    }
+    report.diagnostics.push(ToolDiagnostic {
         path: path.to_path_buf(),
         source: Arc::clone(source),
         span: (span.start as usize, span.end as usize),
         message: message.to_string(),
         label: Some(rule.to_string()),
     });
+    if severity == LintSeverity::Error {
+        report.had_error = true;
+    }
+}
+
+/// The recommended default severity when `lint.rules` doesn't set a rule.
+fn default_severity(rule: &str) -> LintSeverity {
+    match rule {
+        "no-debugger" => LintSeverity::Error,
+        "no-var" | "no-empty" | "no-console" => LintSeverity::Warn,
+        _ => LintSeverity::Off,
+    }
 }
 
 const TOOL_EXTENSIONS: [&str; 8] = ["js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx"];
@@ -850,8 +901,12 @@ Widget();
     fn lint_paths_supports_js_with_directive_and_jsx() {
         let tmp = tmp_dir("lint-jsx");
         let file = jsx_js_file(&tmp);
-        let report = lint_paths(&tmp, std::slice::from_ref(&file))
-            .expect("lint_paths should parse jsx js fixture");
+        let report = lint_paths(
+            &tmp,
+            std::slice::from_ref(&file),
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("lint_paths should parse jsx js fixture");
 
         assert_no_parser_blocking_diagnostics(&report.diagnostics);
         std::fs::remove_dir_all(&tmp).ok();
