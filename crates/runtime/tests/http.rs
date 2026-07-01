@@ -155,26 +155,32 @@ fn spawn_runtime(source: &str, policy: Policy) -> RuntimeThread {
                         "meow".to_owned(),
                         join_root.join("main.ts").to_string_lossy().into_owned(),
                     ],
+                    main_module: None,
                     cwd: join_root.clone(),
                     env: BTreeMap::new(),
                     deno_node_services: None,
                     caps: Some(caps),
                     user_agent: Some("meow-test/rt005".to_owned()),
+                    sandbox: None,
                 },
             ));
             if let Policy::DenyNetListen(shared) = policy {
                 extensions.push(io_capability_extension(Rc::new(NetListenDeny { shared })));
             }
 
-let mut runtime = Runtime::new(RuntimeOptions {
+            let mut runtime = Runtime::new(RuntimeOptions {
                 module_loader: loader,
                 extensions,
                 max_heap_size: None,
                 startup_snapshot: None,
                 residual_lazy_js_sources: &[],
                 residual_lazy_esm_sources: &[],
+                v8_flags: None,
             })
             .map_err(|err| err.to_string())?;
+            runtime
+                .apply_hermetic_shadows()
+                .map_err(|err| err.to_string())?;
             runtime
                 .run_main_module_from_source(&spec, source)
                 .await
@@ -277,6 +283,7 @@ async fn node_http_create_server_handles_basic_get() {
 
         let server;
         server = http.createServer((req, res) => {
+          req.resume();
           req.on("end", () => {
             if (req.url === "/__shutdown") {
               res.writeHead(200, { "x-shutdown": "yes" });

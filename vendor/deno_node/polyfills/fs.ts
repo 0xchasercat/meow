@@ -137,6 +137,7 @@ type BufferEncoding = any;
 const {
   op_fs_read_file_async,
   op_fs_read_file_sync,
+  op_fs_write_file_sync,
   op_node_fs_close,
   op_node_fs_fchmod,
   op_node_fs_fchmod_sync,
@@ -2847,6 +2848,51 @@ function writeFileSync(
   }
 
   const isRid = typeof pathOrRid === "number";
+  if (!isRid) {
+    const pathString = pathOrRid as string;
+    let append = false;
+    let create = true;
+    let createNew = false;
+    let useFastPath = true;
+
+    switch (flag) {
+      case undefined:
+      case "w":
+        break;
+      case "wx":
+      case "xw":
+        createNew = true;
+        break;
+      case "a":
+        append = true;
+        break;
+      case "ax":
+      case "xa":
+        append = true;
+        createNew = true;
+        break;
+      default:
+        useFastPath = false;
+        create = false;
+    }
+
+    if (useFastPath) {
+      try {
+        op_fs_write_file_sync(
+          pathString,
+          mode,
+          append,
+          create,
+          createNew,
+          data,
+        );
+      } catch (e) {
+        throw denoWriteFileErrorToNodeError(e as Error, { syscall: "write" });
+      }
+      return;
+    }
+  }
+
   let file;
 
   let error: Error | null = null;

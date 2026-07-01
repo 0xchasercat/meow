@@ -25,7 +25,7 @@ mod schema;
 mod shadow;
 
 // === CFG-003 ===
-pub use deps::{add_dependency, remove_dependency};
+pub use deps::{add_dependency, add_dependency_to, remove_dependency, DependencySection};
 pub use load::ConfigError;
 pub use meow_pkg::{PackageName, VersionReq};
 pub use package_json::{PackageJson, PackageJsonWorkspaceConfig, PackageJsonWorkspaces};

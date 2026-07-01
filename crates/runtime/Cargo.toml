@@ -18,6 +18,10 @@ meow-ui = { path = "../ui" }
 # Async host I/O (ADR-9): tokio/mio is the committed portable layer. Consumed by
 # the `io` ops (tokio::fs / tokio::net) + driven on the current-thread runtime.
 tokio = { workspace = true }
+# Real OS file watching backing Deno.watchFs / node fs.watch: the event-driven
+# notify crate replaces the recursive-snapshot polling shim that blocked
+# watchpack (next dev) on large trees.
+notify = "6"
 # Typed op errors that surface as JS exceptions (not panics): deno_core's op2
 # requires the error type to impl `deno_error::JsErrorClass`; deno_core does not
 # re-export it, so it is a direct dep pinned to the exact version deno_core uses.
@@ -48,7 +52,12 @@ deno_semver = { workspace = true }
 sys_traits = { workspace = true }
 deno_os = { workspace = true }
 deno_process = { workspace = true }
-deno_ast = { version = "0.53.2", features = ["transpiling", "type_strip"] }
+oxc_allocator = { workspace = true }
+oxc_parser = { workspace = true }
+oxc_semantic = { workspace = true }
+oxc_span = { workspace = true }
+oxc_codegen = { workspace = true }
+oxc_transformer = { workspace = true }
 # === /RT-007 ===
 # PKG-002's `meow install` HTTPS client (`reqwest`) and runtime TLS both use
 # `rustls`; installing the aws-lc-rs default in runtime avoids provider ambiguity.

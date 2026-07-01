@@ -7,7 +7,7 @@ use super::write_output;
 
 fn ui_for_output(state: &OpState) -> Ui {
     if state.try_borrow::<super::PrintSink>().is_some() {
-        Ui::plain()
+        Ui::captured()
     } else {
         Ui::auto()
     }

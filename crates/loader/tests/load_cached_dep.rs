@@ -15,9 +15,7 @@ use deno_core::{
     RequestedModuleType,
 };
 use meow_graph::GraphDb;
-use meow_loader::{
-    encode_cache_url, MeowModuleLoader, ModuleKind, ModuleLocator, ResolveError, Resolver,
-};
+use meow_loader::{MeowModuleLoader, ModuleKind, ModuleLocator, ResolveError, Resolver};
 use meow_pkg::{
     Cache, CacheError, LockEntry, Lockfile, PackageName, RegistryProvenance, Version, VersionReq,
 };
@@ -30,7 +28,17 @@ fn unique_dir(tag: &str) -> std::path::PathBuf {
     let mut dir = std::env::temp_dir();
     dir.push(format!("meow-loader-test-{tag}-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temp dir");
-    dir
+    strip_unc_prefix(std::fs::canonicalize(dir).expect("canonicalize temp dir"))
+}
+
+/// Strip Windows UNC extended-length prefix (\\?\) for path comparisons.
+fn strip_unc_prefix(path: std::path::PathBuf) -> std::path::PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(stripped) = s.strip_prefix("\\\\?\\") {
+        std::path::PathBuf::from(stripped)
+    } else {
+        path
+    }
 }
 
 fn cache_arc(root: &Path) -> Arc<Cache> {
@@ -96,6 +104,16 @@ fn archive(files: &[(&str, &[u8])]) -> Vec<u8> {
         .expect("finish gzip")
 }
 
+/// Canonical `file://` URL for a cached member: the REAL unpacked-store path
+/// `<cache>/unpacked/<algo>-<hex>/<member>`.
+fn cache_url(cache_root: &Path, hash: &meow_pkg::ContentHash, member: &str) -> Url {
+    let path = cache_root
+        .join("unpacked")
+        .join(hash.to_url_host())
+        .join(member);
+    Url::from_file_path(path).expect("cached member file URL")
+}
+
 fn resolver_with(
     cache_root: &Path,
     lockfile: Lockfile,
@@ -136,24 +154,7 @@ impl TestDenoNodeBridge {
     }
 
     fn referrer_url(&self, referrer: &node::UrlOrPathRef) -> Url {
-        if let Ok(path) = referrer.path() {
-            if let Some(url) = self.unpacked_path_to_cache_url(path) {
-                return url;
-            }
-        }
         referrer.url().expect("test bridge referrer URL").clone()
-    }
-
-    fn unpacked_path_to_cache_url(&self, path: &Path) -> Option<Url> {
-        let rel = path.strip_prefix(self.store.root()).ok()?;
-        let mut components = rel.components();
-        let package_host = components.next()?.as_os_str().to_str()?;
-        let package = meow_pkg::ContentHash::from_url_host(package_host).ok()?;
-        let member = components.as_path().to_string_lossy().replace('\\', "/");
-        if member.is_empty() {
-            return None;
-        }
-        Some(encode_cache_url(&package, &member))
     }
 
     fn module_kind(&self, specifier: &Url) -> Option<ModuleKind> {
@@ -172,15 +173,19 @@ impl node::NpmPackageFolderResolver for TestDenoNodeBridge {
         referrer: &node::UrlOrPathRef,
     ) -> Result<PathBuf, node::PackageFolderResolveError> {
         let referrer_url = self.referrer_url(referrer);
-        let resolved = self
-            .resolver
-            .resolve_require(specifier, &referrer_url)
-            .unwrap_or_else(|err| {
-                panic!(
-                    "test Deno Node bridge failed to resolve package {specifier:?} from {}: {err}",
-                    referrer.display()
-                )
-            });
+        let resolved = match self.resolver.resolve_require(specifier, &referrer_url) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                let kind = node_resolver::errors::PackageFolderResolveErrorKind::PackageNotFound(
+                    node_resolver::errors::PackageNotFoundError {
+                        package_name: specifier.to_string(),
+                        referrer: referrer.display(),
+                        referrer_extra: Some(err.to_string()),
+                    },
+                );
+                return Err(node::PackageFolderResolveError(Box::new(kind)));
+            }
+        };
 
         let package_root = match resolved.locator {
             ModuleLocator::Cached { package, .. } => {
@@ -223,9 +228,6 @@ impl node::NpmPackageFolderResolver for TestDenoNodeBridge {
 
 impl node::InNpmPackageChecker for TestDenoNodeBridge {
     fn in_npm_package(&self, specifier: &Url) -> bool {
-        if specifier.scheme() == meow_loader::CACHE_SCHEME {
-            return true;
-        }
         let Ok(path) = specifier.to_file_path() else {
             return false;
         };
@@ -251,14 +253,11 @@ impl node::NodeRequireLoader for TestDenoNodeBridge {
 
     fn is_maybe_cjs(&self, specifier: &Url) -> Result<bool, node::PackageJsonLoadError> {
         if let Ok(path) = specifier.to_file_path() {
-            if let Some(cache_url) = self.unpacked_path_to_cache_url(&path) {
-                return Ok(matches!(
-                    self.module_kind(&cache_url),
-                    Some(ModuleKind::Cjs)
-                ));
+            if path.starts_with(self.store.root()) {
+                return Ok(matches!(self.module_kind(specifier), Some(ModuleKind::Cjs)));
             }
             match path.extension().and_then(|ext| ext.to_str()) {
-                None | Some("cjs") | Some("cts") => return Ok(true),
+                None | Some("cjs") | Some("cts") | Some("ts") => return Ok(true),
                 Some("json") | Some("mjs") | Some("mts") => return Ok(false),
                 _ => {}
             }
@@ -341,15 +340,17 @@ async fn run_entry(
         None => node_extensions_without_bridge(cwd),
     });
     // === /RT-007 ===
-let mut rt = Runtime::new(RuntimeOptions {
+    let mut rt = Runtime::new(RuntimeOptions {
         module_loader: loader,
         extensions,
-max_heap_size: None,
+        max_heap_size: None,
         startup_snapshot: None,
         residual_lazy_js_sources: &[],
         residual_lazy_esm_sources: &[],
+        v8_flags: None,
     })
     .expect("runtime initializes");
+    rt.apply_hermetic_shadows().expect("hermetic shadows apply");
     let spec = ModuleSpecifier::from_file_path(entry).expect("entry → file URL");
     rt.run_main_module(&spec).await
 }
@@ -411,10 +412,11 @@ async fn cached_dep_runs_end_to_end_with_no_node_modules() {
             exts.push(sink_ext);
             exts
         },
-max_heap_size: None,
+        max_heap_size: None,
         startup_snapshot: None,
         residual_lazy_js_sources: &[],
         residual_lazy_esm_sources: &[],
+        v8_flags: None,
     })
     .expect("runtime initializes");
     let spec = ModuleSpecifier::from_file_path(&entry).expect("entry → file URL");
@@ -458,10 +460,7 @@ fn one_resolver_handles_relative_and_bare() {
     assert!(matches!(rel_loc, ModuleLocator::LocalFile(_)));
 
     let (bare_url, bare_loc) = resolver.locate("dep", &referrer).expect("bare resolves");
-    assert_eq!(
-        bare_url,
-        meow_loader::encode_cache_url(&dep_hash, "index.js")
-    );
+    assert_eq!(bare_url, cache_url(&cache_root, &dep_hash, "index.js"));
     match bare_loc {
         ModuleLocator::Cached { package, member } => {
             assert_eq!(package, dep_hash);
@@ -538,14 +537,14 @@ fn node_builtin_resolves_from_node_and_bare_specifiers() {
         other => panic!("expected Native locator, got {other:?}"),
     }
 
-    let resolved = resolver
-        .resolve("fs/promises", &referrer)
+    let (promises_url, promises_locator) = resolver
+        .locate("fs/promises", &referrer)
         .expect("fs/promises resolves");
-    assert_eq!(resolved.url.as_str(), "node:fs/promises");
-    assert!(
-        resolved.source.contains("writeFile"),
-        "node builtin source served from the runtime registry"
-    );
+    assert_eq!(promises_url.as_str(), "node:fs/promises");
+    match promises_locator {
+        ModuleLocator::Native { name } => assert_eq!(name, "node:fs/promises"),
+        other => panic!("expected Native locator, got {other:?}"),
+    }
 
     std::fs::remove_dir_all(&proj).ok();
 }
@@ -652,7 +651,7 @@ fn cached_package_dependency_dns_entry_prefers_builtin() {
         root_deps(&[("next", "1.0.0")]),
         &proj,
     );
-    let referrer = encode_cache_url(&next_hash, "dist/bin/next");
+    let referrer = cache_url(&cache_root, &next_hash, "dist/bin/next");
 
     let (url, locator) = resolver
         .locate("dns", &referrer)
@@ -691,7 +690,7 @@ fn cached_package_missing_lockfile_entry_falls_back_to_node_builtin() {
         root_deps(&[("next", "1.0.0")]),
         &proj,
     );
-    let referrer = encode_cache_url(&next_hash, "dist/bin/next");
+    let referrer = cache_url(&cache_root, &next_hash, "dist/bin/next");
 
     let (url, locator) = resolver
         .locate("dns", &referrer)
@@ -856,9 +855,15 @@ async fn first_party_js_commonjs_runs_end_to_end() {
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, resolver.clone(), None, &entry, vec![sink_ext])
-        .await
-        .expect("first-party CommonJS runs");
+    run_entry(
+        loader,
+        resolver.clone(),
+        Some(&proj.join("cache")),
+        &entry,
+        vec![sink_ext],
+    )
+    .await
+    .expect("first-party CommonJS runs");
 
     assert_eq!(*out.borrow(), "42\n");
     std::fs::remove_dir_all(&proj).ok();
@@ -923,7 +928,7 @@ async fn extensionless_cached_commonjs_bin_runs_via_native_cjs_runtime() {
             ),
             (
                 "dist/server/require-hook.js",
-                b"process.env.MEOW_TEST_NEXT = 'yes';\nconst os = require('os');\nconst target = require(require.resolve(__dirname + '/require-target'));\nconst packageRoot = __dirname.slice(0, __dirname.indexOf('/dist/server'));\nconst rootTarget = require(require.resolve(packageRoot));\nexports.value = typeof process + ':' + typeof process.env + ':' + process.env.MEOW_TEST_NEXT + ':' + String(typeof os.tmpdir() === 'string') + ':' + String(global === globalThis) + ':' + typeof performance.now + ':' + typeof TextEncoderStream + ':' + typeof atob + ':' + typeof setInterval + ':' + typeof Event + ':' + target.value + ':' + rootTarget.value;\n",
+                b"process.env.MEOW_TEST_NEXT = 'yes';\nconst os = require('os');\nconst path = require('path');\nconst target = require(require.resolve(__dirname + '/require-target'));\nconst packageRoot = path.resolve(__dirname, '../..');\nconst rootTarget = require(require.resolve(packageRoot));\nexports.value = typeof process + ':' + typeof process.env + ':' + process.env.MEOW_TEST_NEXT + ':' + String(typeof os.tmpdir() === 'string') + ':' + String(global === globalThis) + ':' + typeof performance.now + ':' + typeof TextEncoderStream + ':' + typeof atob + ':' + typeof setInterval + ':' + typeof Event + ':' + target.value + ':' + rootTarget.value;\n",
             ),
             (
                 "dist/server/require-target.js",
@@ -947,7 +952,7 @@ async fn extensionless_cached_commonjs_bin_runs_via_native_cjs_runtime() {
     let loader: Rc<dyn ModuleLoader> = Rc::new(MeowModuleLoader::new(
         resolver.clone(),
         Rc::new(RefCell::new(GraphDb::new())),
-));
+    ));
     let (out, sink_ext) = capture();
     let mut rt = Runtime::new(RuntimeOptions {
         module_loader: loader,
@@ -961,13 +966,14 @@ async fn extensionless_cached_commonjs_bin_runs_via_native_cjs_runtime() {
             exts.push(sink_ext);
             exts
         },
-max_heap_size: None,
+        max_heap_size: None,
         startup_snapshot: None,
         residual_lazy_js_sources: &[],
         residual_lazy_esm_sources: &[],
+        v8_flags: None,
     })
     .expect("runtime initializes");
-    let spec = encode_cache_url(&dep_hash, "dist/bin/next");
+    let spec = cache_url(&cache_root, &dep_hash, "dist/bin/next");
     let ext_resolved = resolver
         .resolve(spec.as_str(), &spec)
         .expect("extensionless cache member resolves");
@@ -1100,9 +1106,15 @@ async fn esm_imports_cjs_default_named_and_reassignment() {
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, resolver.clone(), None, &entry, vec![sink_ext])
-        .await
-        .expect("ESM imports CJS");
+    run_entry(
+        loader,
+        resolver.clone(),
+        Some(&proj.join("cache")),
+        &entry,
+        vec![sink_ext],
+    )
+    .await
+    .expect("ESM imports CJS");
 
     assert_eq!(*out.borrow(), "{\"answer\":42,\"foo\":3,\"bar\":4}\n");
     std::fs::remove_dir_all(&proj).ok();
@@ -1134,9 +1146,15 @@ async fn circular_commonjs_sees_partial_exports_object() {
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, resolver.clone(), None, &entry, vec![sink_ext])
-        .await
-        .expect("cycle runs");
+    run_entry(
+        loader,
+        resolver.clone(),
+        Some(&proj.join("cache")),
+        &entry,
+        vec![sink_ext],
+    )
+    .await
+    .expect("cycle runs");
 
     assert_eq!(
         *out.borrow(),
@@ -1166,9 +1184,15 @@ async fn repeated_require_returns_the_same_object() {
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, resolver.clone(), None, &entry, vec![sink_ext])
-        .await
-        .expect("repeat require runs");
+    run_entry(
+        loader,
+        resolver.clone(),
+        Some(&proj.join("cache")),
+        &entry,
+        vec![sink_ext],
+    )
+    .await
+    .expect("repeat require runs");
 
     assert_eq!(*out.borrow(), "[true,1,2]\n");
     std::fs::remove_dir_all(&proj).ok();
@@ -1259,9 +1283,15 @@ async fn dynamic_require_resolves_at_runtime() {
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, resolver.clone(), None, &entry, vec![sink_ext])
-        .await
-        .expect("dynamic require resolves through native CJS");
+    run_entry(
+        loader,
+        resolver.clone(),
+        Some(&proj.join("cache")),
+        &entry,
+        vec![sink_ext],
+    )
+    .await
+    .expect("dynamic require resolves through native CJS");
     assert_eq!(*out.borrow(), "42\n");
     std::fs::remove_dir_all(&proj).ok();
 }
@@ -1287,9 +1317,15 @@ async fn unresolvable_static_require_falls_through_to_catchable_runtime_error() 
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, resolver.clone(), None, &entry, vec![sink_ext])
-        .await
-        .expect("optional require wrapped in try/catch must not abort build");
+    run_entry(
+        loader,
+        resolver.clone(),
+        Some(&proj.join("cache")),
+        &entry,
+        vec![sink_ext],
+    )
+    .await
+    .expect("optional require wrapped in try/catch must not abort build");
 
     assert_eq!(
         *out.borrow(),
@@ -1316,9 +1352,15 @@ async fn erasable_typescript_commonjs_runs() {
         Rc::new(RefCell::new(GraphDb::new())),
     ));
     let (out, sink_ext) = capture();
-    run_entry(loader, resolver.clone(), None, &entry, vec![sink_ext])
-        .await
-        .expect("TS CommonJS runs");
+    run_entry(
+        loader,
+        resolver.clone(),
+        Some(&proj.join("cache")),
+        &entry,
+        vec![sink_ext],
+    )
+    .await
+    .expect("TS CommonJS runs");
 
     assert_eq!(*out.borrow(), "42\n");
     std::fs::remove_dir_all(&proj).ok();

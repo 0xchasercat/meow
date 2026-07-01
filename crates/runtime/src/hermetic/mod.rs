@@ -36,12 +36,12 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use deno_core::OpState;
-
 deno_core::extension!(
     meow_hermetic,
     ops = [
         ops::op_hermetic_now_ms,
         ops::op_hermetic_mono_ms,
+        ops::op_hermetic_status,
         ops::op_hermetic_random_fill,
         ops::op_hermetic_env_get,
         ops::op_hermetic_env_entries,
@@ -95,5 +95,19 @@ pub fn pin_deterministic_intl(cfg: &HermeticConfig) {
         std::env::set_var("TZ", "UTC");
         std::env::set_var("LC_ALL", "en_US.UTF-8");
         std::env::set_var("LANG", "en_US.UTF-8");
+    }
+}
+
+/// Check whether the active hermetic config requires any global shadows.
+/// Returns `false` when both the clock and RNG are real (e.g. under `--trust`
+/// or in node-compat mode), so the caller can skip the `execute_script`
+/// entirely — avoiding ~1-2ms of JS compile+eval overhead on every run where
+/// shadows are unnecessary.
+pub fn shadows_needed(state: &OpState) -> bool {
+    if let Some(st) = state.try_borrow::<Rc<RefCell<HermeticState>>>() {
+        let st = st.borrow();
+        st.is_virtual_clock() || st.is_seeded_rng()
+    } else {
+        false
     }
 }

@@ -14,7 +14,10 @@ use std::rc::Rc;
 
 use deno_core::OpState;
 
-pub use capability::{AllowAll, CapDenied, CapRequest, CapabilityCheck};
+pub use capability::{
+    sandbox_caps, strip_windows_verbatim_prefix, AllowAll, CapDenied, CapRequest, CapabilityCheck,
+    SandboxCaps, SandboxPolicy, SANDBOX_BYPASS_HINT,
+};
 pub use ops::{op_read_file, op_tcp_connect, RuntimeIoError, TcpStreamResource};
 
 // Raw host-I/O ops. **Unmediated internal plumbing — NOT a user-visible API.**

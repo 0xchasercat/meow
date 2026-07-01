@@ -11,7 +11,6 @@
 
 pub mod package;
 mod resolver;
-mod url;
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -28,9 +27,6 @@ use meow_graph::GraphDb;
 use serde::Serialize;
 
 pub use crate::resolver::{ModuleKind, ModuleLocator, ResolveError, ResolvedModule, Resolver};
-pub use crate::url::{
-    decode as decode_cache_url, encode as encode_cache_url, SCHEME as CACHE_SCHEME,
-};
 
 #[derive(Clone)]
 struct CjsResolveState {
@@ -90,23 +86,31 @@ fn op_cjs_resolve_and_load(
         }
         ModuleLocator::Native { .. } => false,
     };
-    let filename = match &resolved.locator {
-        ModuleLocator::Native { .. } => cjs_filename_for(&resolved.url, &resolved.url),
-        _ => state
-            .resolver
-            .projected_path_for(&resolved.locator)
-            .map(Ok)
-            .unwrap_or_else(|| state.resolver.runtime_path_for(&resolved.locator))
-            .map_err(|err| deno_error::JsErrorBox::generic(format!("meow: {err}")))?
-            .to_string_lossy()
-            .into_owned(),
+    let (url, filename) = match &resolved.locator {
+        ModuleLocator::Native { .. } => (
+            resolved.url.to_string(),
+            cjs_filename_for(&resolved.url, &resolved.url),
+        ),
+        _ => {
+            let path = state
+                .resolver
+                .projected_path_for(&resolved.locator)
+                .map(Ok)
+                .unwrap_or_else(|| state.resolver.runtime_path_for(&resolved.locator))
+                .map_err(|err| deno_error::JsErrorBox::generic(format!("meow: {err}")))?;
+            let url = Url::from_file_path(&path)
+                .ok()
+                .map(|url| url.to_string())
+                .unwrap_or_else(|| resolved.url.to_string());
+            (url, path.to_string_lossy().into_owned())
+        }
     };
     let dirname = PathBuf::from(&filename)
         .parent()
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_default();
     Ok(CjsLoadedModule {
-        url: resolved.url.to_string(),
+        url,
         filename,
         dirname,
         source: if is_napi {
@@ -274,13 +278,26 @@ fn cjs_facade_source(
 ) -> ModuleSource {
     let path_js =
         serde_json::to_string(require_path).expect("serializing require path as JS string");
-    let mut code =
-        String::from("import { createRequire as __meowCreateRequire } from \"node:module\";\n");
+    // When this facade is the entry point (require.main is not yet set), load
+    // the CJS module via Module._load(path, null, true) so Node's module system
+    // sets mainModule BEFORE the module code runs. This makes
+    // `module === require.main` true inside the CJS module — required by
+    // launcher scripts (wrangler, jest, etc.) that guard on that check.
+    // For non-entry CJS imports, fall back to regular require().
+    let mut code = String::from(
+        "import { Module, createRequire as __meowCreateRequire } from \"node:module\";\n",
+    );
     code.push_str("const __meowRequire = __meowCreateRequire(");
     code.push_str(&path_js);
-    code.push_str(");\nconst __meowCjsExports = __meowRequire(");
+    code.push_str(");\n");
+    code.push_str("const __meowCjsExports = (!__meowRequire.main)\n");
+    code.push_str("  ? Module._load(");
     code.push_str(&path_js);
-    code.push_str(");\nexport default __meowCjsExports;\n");
+    code.push_str(", null, true)\n");
+    code.push_str("  : __meowRequire(");
+    code.push_str(&path_js);
+    code.push_str(");\n");
+    code.push_str("export default __meowCjsExports;\n");
     for name in named_exports {
         let key = serde_json::to_string(name).expect("serializing export name as JS string");
         code.push_str("export const ");
@@ -331,11 +348,6 @@ fn graph_path_for(url: &Url, module_specifier: &ModuleSpecifier) -> PathBuf {
     if let Ok(path) = url.to_file_path() {
         return path;
     }
-    if let Ok((package, member)) = decode_cache_url(url) {
-        return PathBuf::from("meow-cache")
-            .join(package.to_url_host())
-            .join(member);
-    }
     // === RT-005 ===
     if url.scheme() == "meow" {
         let native_member = url.path().trim_start_matches('/');
@@ -364,13 +376,6 @@ fn graph_path_for(url: &Url, module_specifier: &ModuleSpecifier) -> PathBuf {
 fn cjs_filename_for(url: &Url, module_specifier: &ModuleSpecifier) -> String {
     if let Ok(path) = url.to_file_path() {
         return path.to_string_lossy().into_owned();
-    }
-    if let Ok((package, member)) = decode_cache_url(url) {
-        return PathBuf::from("/meow-cache")
-            .join(package.to_url_host())
-            .join(member)
-            .to_string_lossy()
-            .into_owned();
     }
     graph_path_for(url, module_specifier)
         .to_string_lossy()

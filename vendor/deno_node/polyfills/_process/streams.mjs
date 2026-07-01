@@ -239,15 +239,36 @@ export const initStdin = (warmup = false) => {
 
   switch (stdinType) {
     case "FILE": {
-      // Since `fs.ReadStream` cannot be imported before process initialization,
-      // use `Readable` instead.
-      // https://github.com/nodejs/node/blob/v18.12.1/lib/internal/bootstrap/switches/is_main_thread.js#L200
-      // https://github.com/nodejs/node/blob/v18.12.1/lib/internal/fs/streams.js#L148
-      stdin = new (lazyStream().Readable)({
+      // Use Duplex even for FILE streams so that setRawMode (tty polyfill)
+      // and _handle checks work uniformly.  Node would use fs.ReadStream
+      // here, but frameworks expect a Duplex-like stdin with both readable
+      // and setRawMode in non-TTY environments.
+      stdin = new (lazyStream().Duplex)({
+        readable: true,
+        writable: false,
         highWaterMark: 64 * 1024,
+        allowHalfOpen: false,
+        emitClose: false,
         autoDestroy: false,
+        decodeStrings: false,
         read: _read,
       });
+      stdin._writableState.ended = true;
+      stdin._handle = {
+        close(cb) {
+          io.stdin?.close();
+          if (typeof cb === "function") cb();
+        },
+        ref() {
+          io.stdin?.[io.REF]();
+        },
+        unref() {
+          io.stdin?.[io.UNREF]();
+        },
+        getAsyncId() {
+          return -1;
+        },
+      };
       break;
     }
     case "TTY": {
@@ -311,11 +332,34 @@ export const initStdin = (warmup = false) => {
       break;
     }
     default: {
-      // Provide a dummy contentless input for e.g. non-console
-      // Windows applications.
-      stdin = new (lazyStream().Readable)({ read() {} });
-      // deno-lint-ignore prefer-primordials
-      stdin.push(null);
+      // UNKNOWN fd (e.g. no TTY in test, or non-console Windows app):
+      // match upstream Node's non-TTY/PIPE/TCP/FILE behavior and return
+      // a Duplex so callers that expect process.stdin with both
+      // readable and writable sides (and a setRawMode polyfill) work.
+      stdin = new (lazyStream().Duplex)({
+        readable: true,
+        writable: false,
+        allowHalfOpen: false,
+        emitClose: false,
+        autoDestroy: true,
+        decodeStrings: false,
+        read() {
+          // No underlying fd; push EOF immediately.
+          this.push(null);
+        },
+      });
+      stdin._writableState.ended = true;
+      // Minimal _handle so code checking process.stdin._handle works.
+      stdin._handle = {
+        close(cb) {
+          if (typeof cb === "function") cb();
+        },
+        ref() {},
+        unref() {},
+        getAsyncId() {
+          return -1;
+        },
+      };
     }
   }
 
@@ -363,28 +407,24 @@ export const initStdin = (warmup = false) => {
       getStdinIsTTY = () => value;
     },
   });
-  stdin._isRawMode = false;
-  stdin.setRawMode = (enable) => {
-    if (io.stdin?.isTerminal()) {
-      try {
+  if (typeof stdin.setRawMode !== "function") {
+    stdin._isRawMode = false;
+    stdin.setRawMode = (enable) => {
+      if (io.stdin?.isTerminal()) {
         io.stdin.setRaw(enable);
-      } catch {
-        // Raw mode unavailable in this runtime (e.g. the op_set_raw TTY op is
-        // not wired). Degrade gracefully like a non-supporting terminal instead
-        // of throwing into consumers such as ora's end-of-build spinner.
       }
-    }
-    stdin._isRawMode = enable;
-    return stdin;
-  };
-  ObjectDefineProperty(stdin, "isRaw", {
-    __proto__: null,
-    enumerable: true,
-    configurable: true,
-    get() {
-      return stdin._isRawMode;
-    },
-  });
+      stdin._isRawMode = enable;
+      return stdin;
+    };
+    ObjectDefineProperty(stdin, "isRaw", {
+      __proto__: null,
+      enumerable: true,
+      configurable: true,
+      get() {
+        return stdin._isRawMode;
+      },
+    });
+  }
 
   return stdin;
 };

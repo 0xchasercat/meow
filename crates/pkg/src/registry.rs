@@ -9,7 +9,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use base64::Engine as _;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use sha2::{Digest, Sha512};
 
@@ -28,10 +28,16 @@ pub trait RegistrySource: Send + Sync {
         &'a self,
         url: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, RegistryError>> + Send + 'a>>;
+
+    /// Check if metadata for a package is already in the local cache (no network).
+    /// Default returns false (no caching layer).
+    fn has_metadata_cache(&self, _name: &PackageName) -> bool {
+        false
+    }
 }
 
 /// The subset of an npm package document the resolver consults.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct PackageMetadata {
     /// npm `dist-tags`, e.g. `latest -> 5.0.0`.
     #[serde(rename = "dist-tags", default)]
@@ -43,14 +49,14 @@ pub struct PackageMetadata {
 
 /// Per-entry `peerDependenciesMeta` flags (npm). An `optional` peer is not
 /// auto-installed when absent.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct PeerDependencyMeta {
     #[serde(default)]
     pub optional: bool,
 }
 
 /// The manifest subset for one published version.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VersionMetadata {
     /// Runtime dependencies, keyed by package name.
     #[serde(default)]
@@ -97,7 +103,7 @@ where
 }
 
 /// Tarball URL + integrity metadata from the registry.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DistInfo {
     /// The exact tarball URL to download.
     pub tarball: String,
@@ -110,7 +116,7 @@ pub struct DistInfo {
 }
 
 /// A dependency requirement: either a semver range, registry dist-tag, or npm alias.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DepSpec {
     Range(VersionReq),
     Tag(String),

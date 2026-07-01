@@ -170,7 +170,7 @@ fn walk_tree(root: &Path, path: &Path, out: &mut Vec<SnapshotEntry>) {
             kind: "symlink",
             mode,
             bytes: vec![],
-            target: Some(target.to_string_lossy().replace('\\', "/")),
+            target: Some(snapshot_link_target(root, &target)),
         });
         return;
     }
@@ -199,6 +199,24 @@ fn walk_tree(root: &Path, path: &Path, out: &mut Vec<SnapshotEntry>) {
     for child in children {
         walk_tree(root, &child, out);
     }
+}
+
+fn snapshot_link_target(root: &Path, target: &Path) -> String {
+    #[cfg(windows)]
+    {
+        if target.is_absolute() {
+            if let Ok(relative) = target.strip_prefix(root) {
+                return relative.to_string_lossy().replace('\\', "/");
+            }
+            if let (Ok(root), Ok(target)) = (fs::canonicalize(root), fs::canonicalize(target)) {
+                if let Ok(relative) = target.strip_prefix(root) {
+                    return relative.to_string_lossy().replace('\\', "/");
+                }
+            }
+        }
+    }
+    let _ = root;
+    target.to_string_lossy().replace('\\', "/")
 }
 
 #[cfg(unix)]
@@ -244,7 +262,7 @@ fn resolve_in_projection(
         } else {
             current.join("node_modules").join(&spec_path)
         };
-        if candidate.exists() {
+        if candidate.join("package.json").is_file() {
             return Some(read_package_identity(&candidate));
         }
         let parent = current.parent()?;
@@ -260,6 +278,23 @@ fn read_package_identity(path: &Path) -> (String, String) {
     let manifest: PackageJson = serde_json::from_slice(&json).expect("parse package.json");
     (manifest.name, manifest.version)
 }
+
+#[cfg(windows)]
+fn assert_resolves_to_package(path: &Path, name: &str, version: &str) {
+    assert_eq!(
+        read_package_identity(path),
+        (name.to_owned(), version.to_owned())
+    );
+}
+
+#[cfg(unix)]
+fn assert_link_target(path: &Path, target: &str) {
+    assert_eq!(
+        fs::read_link(path).expect("edge target").to_string_lossy(),
+        target
+    );
+}
+
 fn package_integrity(graph: &ResolutionGraph, name: &str, version: &str) -> ContentHash {
     graph
         .packages()
@@ -269,17 +304,23 @@ fn package_integrity(graph: &ResolutionGraph, name: &str, version: &str) -> Cont
         .to_owned()
 }
 
-fn assert_global_unpacked_link(cache: &Cache, package_dir: &Path, expected: &ContentHash) {
-    let raw = fs::read_link(package_dir).expect("package symlink target");
-    let target = if raw.is_absolute() {
-        raw
-    } else {
-        package_dir.parent().expect("package link parent").join(raw)
-    };
-    let expected = cache.root().join("unpacked").join(expected.to_url_host());
-    assert_eq!(
-        fs::canonicalize(&target).expect("canonicalize package target"),
-        expected
+fn assert_real_projected_package_tree(_cache: &Cache, package_dir: &Path, _expected: &ContentHash) {
+    let metadata = fs::symlink_metadata(package_dir).expect("package metadata");
+    assert!(
+        metadata.is_dir(),
+        "package projection must be a real directory"
+    );
+    assert!(
+        !metadata.file_type().is_symlink(),
+        "package projection must not be a symlink"
+    );
+    assert!(package_dir.join("package.json").is_file());
+    let real = fs::canonicalize(package_dir).expect("canonicalize package directory");
+    let cache_root = fs::canonicalize(_cache.root()).expect("canonicalize cache root");
+    assert!(
+        !real.starts_with(&cache_root),
+        "projected package realpath must not escape into global cache: {}",
+        real.display()
     );
 }
 
@@ -444,7 +485,11 @@ fn materialize_is_idempotent_and_reconciles_missing_edges() {
     assert_eq!(snapshot, snapshot_tree(&root.join("node_modules")));
 
     let missing_edge = root.join("node_modules/.meow/app@1.0.0/node_modules/dep");
-    fs::remove_file(&missing_edge).expect("remove dep edge");
+    if let Err(file_err) = fs::remove_file(&missing_edge) {
+        fs::remove_dir(&missing_edge).unwrap_or_else(|dir_err| {
+            panic!("remove dep edge as file failed: {file_err}; as dir failed: {dir_err}")
+        });
+    }
     let third = materializer.materialize(&opts).expect("third materialize");
     assert!(!third.skipped);
     assert_eq!(snapshot, snapshot_tree(&root.join("node_modules")));
@@ -517,10 +562,10 @@ fn materialized_tree_matches_graph_and_preserves_multi_version_edges() {
     let c_dir = store_package_dir(&projection, "c", "1.0.0");
     let b1_dir = store_package_dir(&projection, "b", "1.0.0");
     let b2_dir = store_package_dir(&projection, "b", "2.0.0");
-    assert_global_unpacked_link(&cache, &a_dir, &package_integrity(&graph, "a", "1.0.0"));
-    assert_global_unpacked_link(&cache, &c_dir, &package_integrity(&graph, "c", "1.0.0"));
-    assert_global_unpacked_link(&cache, &b1_dir, &package_integrity(&graph, "b", "1.0.0"));
-    assert_global_unpacked_link(&cache, &b2_dir, &package_integrity(&graph, "b", "2.0.0"));
+    assert_real_projected_package_tree(&cache, &a_dir, &package_integrity(&graph, "a", "1.0.0"));
+    assert_real_projected_package_tree(&cache, &c_dir, &package_integrity(&graph, "c", "1.0.0"));
+    assert_real_projected_package_tree(&cache, &b1_dir, &package_integrity(&graph, "b", "1.0.0"));
+    assert_real_projected_package_tree(&cache, &b2_dir, &package_integrity(&graph, "b", "2.0.0"));
     assert_eq!(
         resolve_in_projection(&projection, &a_dir, "b"),
         Some(("b".to_owned(), "1.0.0".to_owned()))
@@ -533,33 +578,27 @@ fn materialized_tree_matches_graph_and_preserves_multi_version_edges() {
         !projection.join("b").exists(),
         "b must not be hoisted to top-level"
     );
+    assert!(
+        !projection.join(".meow/node_modules/b").exists(),
+        "ambiguous multi-version packages must not be hidden-hoisted"
+    );
 
     let a_link = projection.join(".meow/a@1.0.0/node_modules/b");
     let c_link = projection.join(".meow/c@1.0.0/node_modules/b");
-    assert_eq!(
-        fs::read_link(&a_link)
-            .expect("a dep target")
-            .to_string_lossy(),
-        "../../b@1.0.0/node_modules/b"
-    );
-    assert_eq!(
-        fs::read_link(&c_link)
-            .expect("c dep target")
-            .to_string_lossy(),
-        "../../b@2.0.0/node_modules/b"
-    );
-    assert_eq!(
-        fs::read_link(projection.join("a"))
-            .expect("root a target")
-            .to_string_lossy(),
-        ".meow/a@1.0.0/node_modules/a"
-    );
-    assert_eq!(
-        fs::read_link(projection.join("c"))
-            .expect("root c target")
-            .to_string_lossy(),
-        ".meow/c@1.0.0/node_modules/c"
-    );
+    #[cfg(unix)]
+    {
+        assert_link_target(&a_link, "../../b@1.0.0/node_modules/b");
+        assert_link_target(&c_link, "../../b@2.0.0/node_modules/b");
+        assert_link_target(&projection.join("a"), ".meow/a@1.0.0/node_modules/a");
+        assert_link_target(&projection.join("c"), ".meow/c@1.0.0/node_modules/c");
+    }
+    #[cfg(windows)]
+    {
+        assert_resolves_to_package(&a_link, "b", "1.0.0");
+        assert_resolves_to_package(&c_link, "b", "2.0.0");
+        assert_resolves_to_package(&projection.join("a"), "a", "1.0.0");
+        assert_resolves_to_package(&projection.join("c"), "c", "1.0.0");
+    }
     assert_eq!(
         resolve_in_projection(&projection, &projection, "a"),
         Some(("a".to_owned(), "1.0.0".to_owned()))
@@ -639,6 +678,151 @@ fn truncated_archive_is_invalid_and_commits_nothing() {
         .expect_err("invalid archive must fail");
     assert!(matches!(err, MaterializeError::InvalidArchive { .. }));
     assert!(!root.join("node_modules").exists());
+
+    fs::remove_dir_all(cache.root()).ok();
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn node_modules_projection_hidden_hoists_unambiguous_packages_for_tooling() {
+    const APP_FILES: &[FileSpec<'_>] = &[FileSpec {
+        path: "index.js",
+        bytes: b"module.exports = require('dep')
+",
+        mode: 0o644,
+    }];
+    const DEP_FILES: &[FileSpec<'_>] = &[FileSpec {
+        path: "index.js",
+        bytes: b"module.exports = require('leaf')
+",
+        mode: 0o644,
+    }];
+    const LEAF_FILES: &[FileSpec<'_>] = &[FileSpec {
+        path: "index.js",
+        bytes: b"module.exports = 'leaf'
+",
+        mode: 0o644,
+    }];
+
+    let cache = Cache::with_root(tmp_dir("hidden-hoist-cache"));
+    let graph = build_graph(
+        &cache,
+        &[("app", "1.0.0")],
+        vec![
+            PackageSpec {
+                name: "app",
+                version: "1.0.0",
+                deps: &[("dep", "1.0.0"), ("leaf", "1.0.0")],
+                files: APP_FILES,
+            },
+            PackageSpec {
+                name: "dep",
+                version: "1.0.0",
+                deps: &[],
+                files: DEP_FILES,
+            },
+            PackageSpec {
+                name: "leaf",
+                version: "1.0.0",
+                deps: &[],
+                files: LEAF_FILES,
+            },
+        ],
+    );
+    let root = tmp_dir("hidden-hoist-root");
+    Materializer::new(&cache, &graph, &root)
+        .materialize(&MaterializeOptions::node_modules())
+        .expect("materialize");
+    let projection = root.join("node_modules");
+    let dep_dir = store_package_dir(&projection, "dep", "1.0.0");
+
+    assert_eq!(
+        resolve_in_projection(&projection, &dep_dir, "leaf"),
+        Some(("leaf".to_owned(), "1.0.0".to_owned()))
+    );
+    assert_eq!(
+        read_package_identity(&projection.join(".meow/node_modules/leaf")),
+        ("leaf".to_owned(), "1.0.0".to_owned())
+    );
+    assert_eq!(
+        read_package_identity(&projection.join("leaf")),
+        ("leaf".to_owned(), "1.0.0".to_owned()),
+        "unambiguous transitive packages are public-hoisted for root-scoped tooling"
+    );
+    #[cfg(windows)]
+    {
+        assert_resolves_to_package(&projection.join(".meow/node_modules/leaf"), "leaf", "1.0.0");
+        assert_resolves_to_package(&projection.join("leaf"), "leaf", "1.0.0");
+    }
+
+    fs::remove_dir_all(cache.root()).ok();
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn node_modules_projection_does_not_public_hoist_ambiguous_transitives() {
+    const ROOT_FILES: &[FileSpec<'_>] = &[FileSpec {
+        path: "index.js",
+        bytes: b"module.exports = require('left') + require('right')\n",
+        mode: 0o644,
+    }];
+    const PACKAGE_FILES: &[FileSpec<'_>] = &[FileSpec {
+        path: "index.js",
+        bytes: b"module.exports = 1\n",
+        mode: 0o644,
+    }];
+
+    let cache = Cache::with_root(tmp_dir("ambiguous-hoist-cache"));
+    let graph = build_graph(
+        &cache,
+        &[("root", "1.0.0")],
+        vec![
+            PackageSpec {
+                name: "root",
+                version: "1.0.0",
+                deps: &[("left", "1.0.0"), ("right", "1.0.0")],
+                files: ROOT_FILES,
+            },
+            PackageSpec {
+                name: "left",
+                version: "1.0.0",
+                deps: &[("shared", "1.0.0")],
+                files: PACKAGE_FILES,
+            },
+            PackageSpec {
+                name: "right",
+                version: "1.0.0",
+                deps: &[("shared", "2.0.0")],
+                files: PACKAGE_FILES,
+            },
+            PackageSpec {
+                name: "shared",
+                version: "1.0.0",
+                deps: &[],
+                files: PACKAGE_FILES,
+            },
+            PackageSpec {
+                name: "shared",
+                version: "2.0.0",
+                deps: &[],
+                files: PACKAGE_FILES,
+            },
+        ],
+    );
+    let root = tmp_dir("ambiguous-hoist-root");
+    Materializer::new(&cache, &graph, &root)
+        .materialize(&MaterializeOptions::node_modules())
+        .expect("materialize");
+    let projection = root.join("node_modules");
+
+    assert!(
+        !projection.join("shared").exists(),
+        "ambiguous multi-version packages must not be public-hoisted"
+    );
+    assert!(
+        !projection.join(".meow/node_modules/shared").exists(),
+        "ambiguous multi-version packages must not be hidden-hoisted either"
+    );
 
     fs::remove_dir_all(cache.root()).ok();
     fs::remove_dir_all(root).ok();
@@ -762,19 +946,17 @@ fn scoped_package_names_use_escaped_store_keys_and_relative_edges() {
     let projection = root.join("node_modules");
 
     let scoped_store = projection.join(".meow/@scope+pkg@1.2.0/node_modules/@scope/pkg");
-    assert_global_unpacked_link(
+    assert_real_projected_package_tree(
         &cache,
         &scoped_store,
         &package_integrity(&graph, "@scope/pkg", "1.2.0"),
     );
     assert!(scoped_store.join("package.json").is_file());
     let edge = projection.join(".meow/consumer@1.0.0/node_modules/@scope/pkg");
-    assert_eq!(
-        fs::read_link(&edge)
-            .expect("scoped dep target")
-            .to_string_lossy(),
-        "../../../@scope+pkg@1.2.0/node_modules/@scope/pkg"
-    );
+    #[cfg(unix)]
+    assert_link_target(&edge, "../../../@scope+pkg@1.2.0/node_modules/@scope/pkg");
+    #[cfg(windows)]
+    assert_resolves_to_package(&edge, "@scope/pkg", "1.2.0");
     let consumer_dir = store_package_dir(&projection, "consumer", "1.0.0");
     assert_eq!(
         resolve_in_projection(&projection, &consumer_dir, "@scope/pkg"),

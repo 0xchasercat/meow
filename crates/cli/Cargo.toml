@@ -44,14 +44,37 @@ meow-obs = { path = "../obs" }
 serde_json = { workspace = true }
 # === /OBS-001 ===
 
+# === ADR-5 === parse tsc diagnostic output for meow-ui rendering
+regex = { workspace = true }
+# === /ADR-5 ===
+
 deno_error = { workspace = true }
+# === WORKER-001 === the cooperative-isolate node:worker_threads OPS now live in
+# `meow_runtime::worker` (so they bake into the V8 snapshot). The CLI is only the
+# host edge: it implements `meow_runtime::worker::WorkerSpawner` and drives the
+# worker isolates. It needs NO direct deno_core dep — V8 types flow through the
+# `meow_runtime` re-exports (I-10 single-edge invariant); deno_core remains a
+# build-dep below for snapshot baking.
 deno_node = { workspace = true }
 deno_permissions = { workspace = true }
 deno_semver = { workspace = true }
 node_resolver = { workspace = true }
 
 [build-dependencies]
+# Snapshot + residual lazy sources are baked at build time by build.rs. These
+# mirror the runtime's deno_* deps so the snapshot's extension/feature layout
+# matches the runtime that consumes it.
 deno_napi = { workspace = true }
+meow-runtime = { path = "../runtime" }
+meow-pkg = { path = "../pkg" }
+meow-loader = { path = "../loader" }
+deno_node = { workspace = true }
+deno_core = { workspace = true }
+deno_webidl = { workspace = true }
+deno_web = { workspace = true }
+deno_crypto = { workspace = true }
+deno_fetch = { workspace = true }
+deno_net = { workspace = true }
 [dev-dependencies]
 assert_cmd = { workspace = true }
 predicates = { workspace = true }

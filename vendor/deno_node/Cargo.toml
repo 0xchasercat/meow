@@ -50,12 +50,23 @@ features = ["ffi-api"]
 [dependencies.bytes]
 version = "1.11.1"
 
-[dependencies.deno_ast]
-version = "=0.53.2"
-features = [
-    "transpiling",
-    "type_strip",
-]
+[dependencies.oxc_allocator]
+version = "0.137"
+
+[dependencies.oxc_codegen]
+version = "0.137"
+
+[dependencies.oxc_parser]
+version = "0.137"
+
+[dependencies.oxc_semantic]
+version = "0.137"
+
+[dependencies.oxc_span]
+version = "0.137"
+
+[dependencies.oxc_transformer]
+version = "0.137"
 
 [dependencies.deno_core]
 version = "0.403.0"
@@ -90,6 +101,9 @@ default-features = false
 
 [dependencies.deno_path_util]
 version = "=0.6.4"
+
+[dependencies.meow-graph]
+path = "../../crates/graph"
 
 [dependencies.deno_permissions]
 version = "0.109.0"

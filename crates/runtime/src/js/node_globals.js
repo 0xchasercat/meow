@@ -6,14 +6,25 @@ import * as nodeTimers from "node:timers";
 import * as nodeStreamWeb from "node:stream/web";
 import * as nodeFsModule from "node:fs";
 import * as nodeNet from "node:net";
-import * as nodeHttp from "node:http";
 import * as nodeHttpIncoming from "node:_http_incoming";
 import * as nodeOs from "node:os";
 import * as nodeConstantsModule from "node:constants";
 const load = core.loadExtScript;
 const bootstrapInfo = typeof core.ops.op_meow_node_bootstrap_info === "function"
   ? core.ops.op_meow_node_bootstrap_info()
-  : { args: [], argv: [], cwd: "", mainModule: undefined, env: {} };
+  : { args: [], argv: [], cwd: "", mainModule: undefined, env: {}, pid: 0, ppid: 0 };
+if (globalThis.Deno && typeof globalThis.Deno === "object") {
+  try {
+    if (globalThis.Deno.pid === undefined && bootstrapInfo.pid !== undefined) {
+      Object.defineProperty(globalThis.Deno, "pid", { value: bootstrapInfo.pid, writable: true, configurable: true });
+    }
+    if (globalThis.Deno.ppid === undefined && bootstrapInfo.ppid !== undefined) {
+      Object.defineProperty(globalThis.Deno, "ppid", { value: bootstrapInfo.ppid, writable: true, configurable: true });
+    }
+  } catch {
+    // Frozen Deno namespace; later process compatibility shims are best-effort.
+  }
+}
 const hostPlatform = typeof core.ops.op_meow_host_platform === "function"
   ? core.ops.op_meow_host_platform()
   : (core.build?.os ?? "");
@@ -57,6 +68,42 @@ function def(name, value, enumerable = false) {
 }
 
 const processValue = processModule?.default ?? processModule;
+let meowCwd = "";
+
+function meowPatchProcessTtyStreams(processValue) {
+  const columns = Number(processValue?.env?.COLUMNS ?? 80) || 80;
+  const rows = Number(processValue?.env?.LINES ?? 24) || 24;
+  for (const stream of [processValue?.stdout, processValue?.stderr]) {
+    if (!stream || typeof stream !== "object") continue;
+    if (typeof stream.isTTY !== "boolean") {
+      Object.defineProperty(stream, "isTTY", {
+        value: false,
+        writable: true,
+        configurable: true,
+      });
+    }
+    if (typeof stream.columns !== "number") {
+      Object.defineProperty(stream, "columns", {
+        value: columns,
+        writable: true,
+        configurable: true,
+      });
+    }
+    if (typeof stream.rows !== "number") {
+      Object.defineProperty(stream, "rows", {
+        value: rows,
+        writable: true,
+        configurable: true,
+      });
+    }
+    if (typeof stream.getColorDepth !== "function") {
+      stream.getColorDepth = () => 24;
+    }
+    if (typeof stream.hasColors !== "function") {
+      stream.hasColors = () => true;
+    }
+  }
+}
 if (bootstrapInfo.env && typeof bootstrapInfo.env === "object") {
   Object.defineProperty(globalThis, "__MEOW_BOOTSTRAP_ENV__", {
     value: { ...bootstrapInfo.env },
@@ -70,6 +117,65 @@ Object.defineProperty(globalThis, "process", {
   writable: true,
   configurable: true,
 });
+
+function meowSetObjectValue(target, name, value) {
+  if (!target || typeof target !== "object" || value === undefined) return;
+  const descriptor = Object.getOwnPropertyDescriptor(target, name);
+  if (!descriptor) {
+    Object.defineProperty(target, name, { value, writable: true, configurable: true });
+    return;
+  }
+  if (descriptor.configurable) {
+    Object.defineProperty(target, name, { value, writable: true, configurable: true });
+    return;
+  }
+  if (descriptor.writable) {
+    target[name] = value;
+  }
+}
+
+function meowSetProcessValue(name, value) {
+  meowSetObjectValue(processValue, name, value);
+  meowSetObjectValue(globalThis.process, name, value);
+}
+
+function meowInstallProcessIds(info) {
+  meowSetProcessValue("pid", globalThis.Deno?.pid ?? info?.pid);
+  meowSetProcessValue("ppid", globalThis.Deno?.ppid ?? info?.ppid);
+}
+
+const meowProcessEnvProxyTag = Symbol.for("meow.process.env.proxy");
+function meowNormalizeEnvValue(value) {
+  return value === null ? undefined : value;
+}
+function meowInstallProcessEnv() {
+  if (!processValue || typeof processValue !== "object") return;
+  const envTarget = processValue.env;
+  if (!envTarget || typeof envTarget !== "object" || envTarget[meowProcessEnvProxyTag]) return;
+  const proxy = new Proxy(envTarget, {
+    get(target, prop, receiver) {
+      if (prop === meowProcessEnvProxyTag) return true;
+      if (typeof prop !== "string") return Reflect.get(target, prop, receiver);
+      return meowNormalizeEnvValue(Reflect.get(target, prop, receiver));
+    },
+    getOwnPropertyDescriptor(target, prop) {
+      const descriptor = Reflect.getOwnPropertyDescriptor(target, prop);
+      if (!descriptor) return descriptor;
+      if ("value" in descriptor) {
+        return { ...descriptor, value: meowNormalizeEnvValue(descriptor.value) };
+      }
+      return descriptor;
+    },
+  });
+  Object.defineProperty(processValue, "env", {
+    value: proxy,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
+}
+meowInstallProcessEnv();
+
 
 // === CLEAN-003 env overlay ===
 // CJS now runs through Deno's node:module (the synthetic cjs.ts bridge was
@@ -121,13 +227,18 @@ if (globalThis.Deno) {
     const denoFs = load("ext:deno_fs/30_fs.js");
 
     denoNs.args = Array.isArray(bootstrapInfo.args) ? [...bootstrapInfo.args] : [];
+    if (bootstrapInfo.pid !== undefined) {
+      Object.defineProperty(denoNs, "pid", { value: bootstrapInfo.pid, writable: true, configurable: true });
+    }
+    if (bootstrapInfo.ppid !== undefined) {
+      Object.defineProperty(denoNs, "ppid", { value: bootstrapInfo.ppid, writable: true, configurable: true });
+    }
     if (denoNs.version === undefined) {
       denoNs.version = {};
     }
     if (bootstrapInfo.mainModule) {
       denoNs.mainModule = bootstrapInfo.mainModule;
     }
-
 
     if (core.build !== undefined) {
       denoNs.build = core.build;
@@ -187,10 +298,10 @@ if (globalThis.Deno) {
     }
 
     if (bootstrapInfo.cwd) {
-      let currentCwd = bootstrapInfo.cwd;
-      denoNs.cwd = () => currentCwd;
+      meowCwd = bootstrapInfo.cwd;
+      denoNs.cwd = () => meowCwd;
       denoNs.chdir = (nextCwd) => {
-        currentCwd = String(nextCwd);
+        meowCwd = String(nextCwd);
       };
     }
 
@@ -313,86 +424,6 @@ if (globalThis.Deno) {
     wrapAsync("readLink", "readLink");
     wrapAsync("readFile", "readFile");
     wrapAsync("readTextFile", "readTextFile");
-    // === mkdir errno repair (meow Node-compat) ===
-    // deno's op error path collapses NotFound/AlreadyExists into a useless
-    // "invalid_argument" TypeError (and the sync op throws `undefined`).
-    // webpack's mkdirp branches on err.code (ENOENT => create the parent then
-    // retry; EEXIST => treat as already created), so reconstruct faithful
-    // errno semantics from the filesystem whenever the mkdir op fails.
-    const __mkdirDirname = (p) => {
-      let s = String(p).replace(/\/+$/, "");
-      const i = s.lastIndexOf("/");
-      if (i < 0) return ".";
-      if (i === 0) return "/";
-      return s.slice(0, i);
-    };
-    const __mkdirRecursive = (opts) =>
-      (opts && typeof opts === "object") ? !!opts.recursive
-        : (typeof opts === "boolean" ? opts : false);
-    const __statOrNull = (p) => { try { return denoNs.statSync(p); } catch (_) { return null; } };
-    const __isDirStat = (st) => st && ((typeof st.isDirectory === "function") ? st.isDirectory() : !!st.isDirectory);
-    const __mkdirErr = (code, path) => {
-      const tbl = { ENOENT: [-2, "no such file or directory"], EEXIST: [-17, "file already exists"], ENOTDIR: [-20, "not a directory"] };
-      const meta = tbl[code] || [-22, "invalid argument"];
-      let err;
-      try {
-        if (code === "ENOENT" && denoNs.errors && denoNs.errors.NotFound) err = new denoNs.errors.NotFound(`${code}: ${meta[1]}, mkdir '${path}'`);
-        else if (code === "EEXIST" && denoNs.errors && denoNs.errors.AlreadyExists) err = new denoNs.errors.AlreadyExists(`${code}: ${meta[1]}, mkdir '${path}'`);
-      } catch (_) { err = undefined; }
-      if (!err) err = new Error(`${code}: ${meta[1]}, mkdir '${path}'`);
-      try {
-        Object.defineProperty(err, "code", { value: code, writable: true, configurable: true, enumerable: true });
-        Object.defineProperty(err, "errno", { value: meta[0], writable: true, configurable: true, enumerable: true });
-        Object.defineProperty(err, "syscall", { value: "mkdir", writable: true, configurable: true, enumerable: true });
-        Object.defineProperty(err, "path", { value: String(path), writable: true, configurable: true, enumerable: true });
-      } catch (_) {}
-      return err;
-    };
-    const __mkdirLooksGarbage = (error) =>
-      error === undefined || error === null ||
-      (typeof error === "object" && error.code === undefined &&
-        (String(error.message ?? "") === "invalid_argument" || error.name === "TypeError"));
-    const __repairMkdir = (path, opts, error) => {
-      const recursive = __mkdirRecursive(opts);
-      const st = __statOrNull(path);
-      if (st) {
-        if (recursive && __isDirStat(st)) return { ok: true };
-        return { ok: false, error: __mkdirErr("EEXIST", path) };
-      }
-      if (!__statOrNull(__mkdirDirname(path))) return { ok: false, error: __mkdirErr("ENOENT", path) };
-      return { ok: false, error };
-    };
-    {
-      const __mSync = denoNs.mkdirSync;
-      if (typeof __mSync === "function") {
-        Object.defineProperty(denoNs, "mkdirSync", {
-          value: (...args) => {
-            try { return __mSync(...args); }
-            catch (error) {
-              if (!__mkdirLooksGarbage(error)) throw error;
-              const r = __repairMkdir(args[0], args[1], error);
-              if (r.ok) return undefined;
-              throw r.error;
-            }
-          }, writable: true, configurable: true,
-        });
-      }
-      const __mAsync = denoNs.mkdir;
-      if (typeof __mAsync === "function") {
-        Object.defineProperty(denoNs, "mkdir", {
-          value: async (...args) => {
-            try { return await __mAsync(...args); }
-            catch (error) {
-              if (!__mkdirLooksGarbage(error)) throw error;
-              const r = __repairMkdir(args[0], args[1], error);
-              if (r.ok) return undefined;
-              throw r.error;
-            }
-          }, writable: true, configurable: true,
-        });
-      }
-    }
-
     if (denoSignals.addSignalListener !== undefined) {
       denoNs.addSignalListener = denoSignals.addSignalListener;
     }
@@ -404,32 +435,51 @@ if (globalThis.Deno) {
   }
 
   if (denoNs.env === undefined) {
-    const envObject = Object.create(null);
-    const entries = typeof core.ops.op_hermetic_env_entries === "function"
-      ? core.ops.op_hermetic_env_entries()
-      : [];
-    if (Array.isArray(entries)) {
-      for (const entry of entries) {
-        if (Array.isArray(entry) && entry.length === 2) {
-          envObject[String(entry[0])] = String(entry[1]);
+    // Deno.env must reflect the LIVE per-invocation host env, not a value baked
+    // at snapshot-build time. Read the hermetic env ops at access time; keep a
+    // write-overlay so runtime set/delete behave like Node's in-process env
+    // (callers that need children to inherit pass env explicitly to spawn/fork).
+    const overlay = Object.create(null); // key -> value, or null = deleted
+    const liveGet = (key) =>
+      typeof core.ops.op_hermetic_env_get === "function"
+        ? core.ops.op_hermetic_env_get(String(key))
+        : undefined;
+    const liveEntries = () => {
+      const out = Object.create(null);
+      const entries = typeof core.ops.op_hermetic_env_entries === "function"
+        ? core.ops.op_hermetic_env_entries()
+        : [];
+      if (Array.isArray(entries)) {
+        for (const entry of entries) {
+          if (Array.isArray(entry) && entry.length === 2) {
+            out[String(entry[0])] = String(entry[1]);
+          }
         }
       }
-    }
+      return out;
+    };
     denoNs.env = {
       get(key) {
-        return envObject[String(key)];
+        const k = String(key);
+        if (k in overlay) return overlay[k] === null ? undefined : overlay[k];
+        return meowNormalizeEnvValue(liveGet(k));
       },
       set(key, value) {
-        envObject[String(key)] = String(value);
+        overlay[String(key)] = String(value);
       },
       has(key) {
-        return Object.prototype.hasOwnProperty.call(envObject, String(key));
+        return this.get(key) !== undefined;
       },
       delete(key) {
-        delete envObject[String(key)];
+        overlay[String(key)] = null;
       },
       toObject() {
-        return { ...envObject };
+        const out = liveEntries();
+        for (const k of Object.keys(overlay)) {
+          if (overlay[k] === null) delete out[k];
+          else out[k] = overlay[k];
+        }
+        return out;
       },
     };
   }
@@ -489,116 +539,87 @@ if (globalThis.Deno) {
   if (
     processValue &&
     typeof processValue === "object" &&
-    typeof denoNs.execPath === "function" &&
-    (!processValue.execPath || processValue.execPath.length === 0)
+    typeof denoNs.execPath === "function"
   ) {
     processValue.execPath = denoNs.execPath();
   }
-  if (processValue && typeof processValue === "object" && denoNs.pid !== undefined) {
-    Object.defineProperty(processValue, "pid", {
-      value: denoNs.pid,
+  function meowRecordProcessExit(code = 0) {
+    const numeric = code === undefined ? 0 : Number(code);
+    const normalized = Number.isFinite(numeric) ? numeric | 0 : 0;
+    if (typeof core.ops.op_meow_record_process_exit === "function") {
+      core.ops.op_meow_record_process_exit(normalized);
+    }
+    return normalized;
+  }
+  if (processValue && typeof processValue === "object") {
+    const originalExit = typeof processValue.exit === "function"
+      ? processValue.exit.bind(processValue)
+      : undefined;
+    Object.defineProperty(processValue, "exit", {
+      value(code) {
+        meowRecordProcessExit(code);
+        if (originalExit) return originalExit(code);
+        throw { __meowProcessExit: true, code: meowRecordProcessExit(code) };
+      },
+      writable: true,
+      configurable: true,
+    });
+    const originalReallyExit = typeof processValue.reallyExit === "function"
+      ? processValue.reallyExit.bind(processValue)
+      : undefined;
+    Object.defineProperty(processValue, "reallyExit", {
+      value(code) {
+        meowRecordProcessExit(code);
+        if (originalReallyExit) return originalReallyExit(code);
+        throw { __meowProcessExit: true, code: meowRecordProcessExit(code) };
+      },
       writable: true,
       configurable: true,
     });
   }
-  if (processValue && typeof processValue === "object" && denoNs.ppid !== undefined) {
-    Object.defineProperty(processValue, "ppid", {
-      value: denoNs.ppid,
-      writable: true,
-      configurable: true,
-    });
-  }
+  meowInstallProcessIds(bootstrapInfo);
   if (typeof denoNs.watchFs !== "function") {
-    denoNs.watchFs = (paths, _options = {}) => {
+    // Real OS file watching via the host notify-backed ops. Push-based: returns
+    // immediately and change events arrive on a channel. Replaces the old
+    // synchronous recursive-snapshot poller that blocked wp.watch() on large
+    // trees (e.g. Next.js watching the project root incl. node_modules).
+    denoNs.watchFs = (paths, options = {}) => {
       const roots = (Array.isArray(paths) ? paths : [paths]).map(String);
-      const queue = [];
-      const waiters = [];
+      const recursive = options.recursive !== false;
+      const rid = core.ops.op_meow_fs_events_open(recursive, roots);
       let closed = false;
-
-      const wake = (item) => {
-        const waiter = waiters.shift();
-        if (waiter) {
-          waiter({ done: false, value: item });
-        } else {
-          queue.push(item);
-        }
-      };
-      const finish = () => {
-        closed = true;
-        while (waiters.length) {
-          waiters.shift()({ done: true, value: undefined });
-        }
-      };
-      const snapshotOne = (path, out) => {
-        let stat;
-        try {
-          stat = denoNs.statSync(path);
-        } catch {
-          return;
-        }
-        const key = String(path);
-        out.set(key, `${Number(stat.mtime?.getTime?.() ?? 0)}:${Number(stat.size ?? 0)}:${stat.isDirectory ? "d" : "f"}`);
-        if (stat.isDirectory !== true || typeof denoNs.readDirSync !== "function") {
-          return;
-        }
-        try {
-          for (const entry of denoNs.readDirSync(path)) {
-            snapshotOne(`${key}/${entry.name}`, out);
-          }
-        } catch {
-          // Directory disappeared or cannot be read; the parent change is enough.
-        }
-      };
-      const takeSnapshot = () => {
-        const out = new Map();
-        for (const root of roots) {
-          snapshotOne(root, out);
-        }
-        return out;
-      };
-
-      let previous = takeSnapshot();
-      const timer = (nodeTimers.setInterval ?? setInterval)(() => {
-        if (closed) {
-          return;
-        }
-        const next = takeSnapshot();
-        for (const [path, sig] of next) {
-          const old = previous.get(path);
-          if (old === undefined) {
-            wake({ kind: "create", paths: [path] });
-          } else if (old !== sig) {
-            wake({ kind: "modify", paths: [path] });
+      const close = () => {
+        if (!closed) {
+          closed = true;
+          try {
+            core.ops.op_meow_fs_events_close(rid);
+          } catch {
+            // Resource already gone.
           }
         }
-        for (const path of previous.keys()) {
-          if (!next.has(path)) {
-            wake({ kind: "remove", paths: [path] });
-          }
-        }
-        previous = next;
-      }, 500);
-
+      };
       return {
-        close() {
-          if (!closed) {
-            (nodeTimers.clearInterval ?? clearInterval)(timer);
-            finish();
-          }
-        },
+        rid,
+        close,
         ref() {},
         unref() {},
         [Symbol.asyncIterator]() {
           return this;
         },
-        next() {
-          if (queue.length) {
-            return Promise.resolve({ done: false, value: queue.shift() });
-          }
+        async next() {
           if (closed) {
-            return Promise.resolve({ done: true, value: undefined });
+            return { done: true, value: undefined };
           }
-          return new Promise((resolve) => waiters.push(resolve));
+          const value = await core.ops.op_meow_fs_events_poll(rid);
+          if (value == null) {
+            closed = true;
+            return { done: true, value: undefined };
+          }
+          return { done: false, value };
+        },
+        async return(value) {
+          close();
+          return { done: true, value };
         },
       };
     };
@@ -652,53 +673,129 @@ if (globalThis.Deno) {
   }
 }
 
-if (typeof globalThis.nodeBootstrap === "function") {
+// Node process bootstrap. The genuine deno_node `nodeBootstrap` installs the real
+// process.argv / execPath / cwd, wires child IPC (process.send over NODE_CHANNEL_FD),
+// and registers streamBaseState. It must run with the REAL per-invocation state.
+//
+// Under a V8 snapshot this module body executes at snapshot-BUILD time, where the
+// bootstrap state is a placeholder (argv=["meow","snapshot-placeholder"], cwd="/").
+// There we only WARM the lazy Node module graph (warmup:true), which keeps
+// __bootstrapNodeProcess installed and leaves `initialized` false. The host then runs
+// the real bootstrap at runtime via __meowRuntimeBootstrap(), after seeding the real
+// state. In eager (no-snapshot) mode this body runs at runtime with real values, so we
+// run the real bootstrap directly here.
+function meowApplyDenoNamespace(info) {
+  const denoNs = globalThis.Deno;
+  if (denoNs) {
+    try {
+      denoNs.args = Array.isArray(info.args) ? [...info.args] : [];
+      if (info.pid !== undefined) {
+        Object.defineProperty(denoNs, "pid", { value: info.pid, writable: true, configurable: true });
+      }
+      if (info.ppid !== undefined) {
+        Object.defineProperty(denoNs, "ppid", { value: info.ppid, writable: true, configurable: true });
+      }
+      if (info.mainModule) {
+        denoNs.mainModule = info.mainModule;
+      }
+    } catch {
+      // Frozen Deno namespace; process shims fall back to placeholder args.
+    }
+  }
+  if (info.cwd) {
+    meowCwd = info.cwd;
+    if (processValue && typeof processValue === "object") {
+      try {
+        // process.cwd captured deno_fs.cwd at module-load (baked stale under a
+        // snapshot); route it through Deno.cwd so it tracks meow's controlled cwd.
+        processValue.cwd = () => globalThis.Deno.cwd();
+      } catch {
+        // process.cwd not reassignable
+      }
+    }
+  }
+  if (info.execPath && processValue && typeof processValue === "object") {
+    processValue.execPath = String(info.execPath);
+  }
+  if (info.env && typeof info.env === "object" && processValue && processValue.env) {
+    for (const key of Object.keys(info.env)) {
+      try {
+        processValue.env[key] = String(info.env[key]);
+      } catch {
+        // read-only env entry
+      }
+    }
+  }
+  meowInstallProcessEnv();
+  meowInstallProcessIds(info);
+}
+
+function meowRunNodeBootstrap(info, warmup) {
+  if (typeof globalThis.nodeBootstrap !== "function") return;
   try {
     globalThis.nodeBootstrap({
-      usesLocalNodeModulesDir: true,
-      argv0: bootstrapInfo.argv?.[0] ?? "meow",
+      usesLocalNodeModulesDir: false,
+      argv0: info.argv?.[0] ?? "meow",
       runningOnMainThread: true,
       nodeDebug: "",
-      warmup: false,
-      moduleSpecifier: bootstrapInfo.mainModule ?? null,
+      warmup,
+      moduleSpecifier: info.mainModule ?? null,
     });
   } catch (error) {
     if (!String(error?.message ?? "").includes("already initialized")) {
       throw error;
     }
   }
+  meowInstallProcessIds(info);
 }
-if (typeof core.ops.op_stream_base_register_state === "function") {
-  try {
-    const { streamBaseState } = load("ext:deno_node/internal_binding/stream_wrap.ts");
-    core.ops.op_stream_base_register_state(streamBaseState);
-  } catch {
-    // If stream-wrap bootstrap is unavailable, keep the runtime alive; net sockets may still fail.
+
+// Invoked by the host (meow-runtime refresh_bootstrap_state) at runtime when booting
+// from a snapshot: re-read the real bootstrap state and run the genuine Node bootstrap.
+function meowApplyProcessBootstrapOverrides(info) {
+  if (!processValue || typeof processValue !== "object") return;
+  if (Array.isArray(info.argv)) {
+    processValue.argv = info.argv.map((arg) => String(arg));
+  }
+  if (info.execPath) {
+    processValue.execPath = String(info.execPath);
+  }
+  if (info.cwd) {
+    let processCwd = info.cwd;
+    processValue.cwd = () => processCwd;
+    processValue.chdir = (nextCwd) => {
+      processCwd = String(nextCwd);
+    };
   }
 }
 
-
-if (
-  processValue &&
-  typeof processValue === "object" &&
-  Array.isArray(processValue.argv) &&
-  typeof bootstrapInfo.argv?.[0] === "string" &&
-  bootstrapInfo.argv[0].length > 0
-) {
-  processValue.argv[0] = bootstrapInfo.argv[0];
+function meowSetupChildIpc() {
+  if (
+    processValue?.env?.NODE_CHANNEL_FD === undefined ||
+    (processValue?.env?.MEOW_IPC_PARENT_TO_CHILD && processValue?.env?.MEOW_IPC_CHILD_TO_PARENT) ||
+    typeof processValue.send === "function"
+  ) {
+    return;
+  }
+  core.loadExtScript("ext:deno_node/child_process.ts");
+  if (typeof internals.__setupChildProcessIpcChannel === "function") {
+    internals.__setupChildProcessIpcChannel();
+  }
 }
 
-if (
-  processValue &&
-  typeof processValue === "object" &&
-  bootstrapInfo.cwd
-) {
-  let processCwd = bootstrapInfo.cwd;
-  processValue.cwd = () => processCwd;
-  processValue.chdir = (nextCwd) => {
-    processCwd = String(nextCwd);
-  };
-}
+globalThis.__meowRuntimeBootstrap = function () {
+  const info = typeof core.ops.op_meow_node_bootstrap_info === "function"
+    ? core.ops.op_meow_node_bootstrap_info()
+    : null;
+  if (!info) return;
+  meowApplyDenoNamespace(info);
+  meowRunNodeBootstrap(info, false);
+  meowApplyProcessBootstrapOverrides(info);
+  meowPatchProcessTtyStreams(processValue);
+  meowSetupChildIpc();
+};
+
+  meowRunNodeBootstrap(bootstrapInfo, bootstrapInfo.env?.MEOW_SNAPSHOT_BUILD === "1");
+  meowApplyProcessBootstrapOverrides(bootstrapInfo);
 
 
 for (const target of [nodeFsModule.default]) {
@@ -753,61 +850,9 @@ for (const target of [nodeFsModule.default]) {
 }
 
 
-for (const target of [nodeFsModule.default]) {
-  if (
-    !target ||
-    typeof target.watch !== "function" ||
-    target.watch.__meowWatchKickPatch === true
-  ) continue;
-  const originalWatch = target.watch.bind(target);
-  target.watch = (path, options, listener) => {
-    let callback = listener;
-    if (typeof options === "function") {
-      callback = options;
-      options = undefined;
-    }
-    const watcher = originalWatch(path, options ?? {}, callback);
-    const name = String(path).split(/[\\/]/).pop() || "";
-    const timer = (nodeTimers.setTimeout ?? setTimeout)(() => {
-      try {
-        if (typeof callback === "function") {
-          callback("change", name);
-        }
-        if (typeof watcher?.emit === "function") {
-          watcher.emit("change", "change", name);
-        }
-      } catch {
-        // Watch priming is best-effort; real watcher errors still surface normally.
-      }
-    }, 0);
-    if (watcher && typeof watcher.close === "function") {
-      const originalClose = watcher.close.bind(watcher);
-      watcher.close = () => {
-        (nodeTimers.clearTimeout ?? clearTimeout)(timer);
-        return originalClose();
-      };
-    }
-    return watcher;
-  };
-  target.watch.__meowWatchKickPatch = true;
-}
+// __meowWatchKickPatch removed: real fs events now flow via Deno.watchFs (op_meow_fs_events_*).
 
-if (
-  processValue?.env?.NODE_CHANNEL_FD !== undefined &&
-  !(
-    processValue?.env?.MEOW_IPC_PARENT_TO_CHILD &&
-    processValue?.env?.MEOW_IPC_CHILD_TO_PARENT
-  )
-) {
-  try {
-    core.loadExtScript("ext:deno_node/child_process.ts");
-    if (typeof internals.__setupChildProcessIpcChannel === "function") {
-      internals.__setupChildProcessIpcChannel();
-    }
-  } catch {
-    // Child IPC is optional outside forked child processes.
-  }
-}
+meowSetupChildIpc();
 
 const netModule = nodeNet.default ?? nodeNet;
 const serverPrototype = netModule.Server?.prototype;
@@ -837,160 +882,7 @@ if (
   serverPrototype.listen = patchedListen;
 }
 
-const serverEmitPrototype = netModule.Server?.prototype;
-if (
-  serverEmitPrototype &&
-  typeof serverEmitPrototype.emit === "function" &&
-  serverEmitPrototype.emit.__meowHttpConsumePatch !== true
-) {
-  const originalEmit = serverEmitPrototype.emit;
-  const patchedEmit = function (event, ...args) {
-    if (event === "connection") {
-      return originalEmit.call(this, event, ...args);
-    }
-    if (event === "request") {
-      const req = args[0];
-      const result = originalEmit.call(this, event, ...args);
-      if (
-        req &&
-        req.headers?.["content-length"] === undefined &&
-        req.headers?.["transfer-encoding"] === undefined &&
-        typeof req.push === "function"
-      ) {
-        (processValue.nextTick ?? queueMicrotask)(() => {
-          if (req.complete !== true) {
-            req.complete = true;
-            req.push(null);
-          }
-          if (req.__meowEmptyEndEmitted !== true && typeof req.emit === "function") {
-            req.__meowEmptyEndEmitted = true;
-            req.emit("end");
-          }
-        });
-      }
-      return result;
-    }
-    return originalEmit.call(this, event, ...args);
-  };
-  patchedEmit.__meowHttpConsumePatch = true;
-  serverEmitPrototype.emit = patchedEmit;
-}
 
-const httpModule = nodeHttp.default ?? nodeHttp;
-const httpServerPrototype = httpModule.Server?.prototype;
-if (
-  httpServerPrototype &&
-  typeof httpServerPrototype.emit === "function" &&
-  httpServerPrototype.emit.__meowEmptyRequestPatch !== true
-) {
-  const originalHttpEmit = httpServerPrototype.emit;
-  const patchedHttpEmit = function (event, ...args) {
-    if (event !== "request") {
-      return originalHttpEmit.call(this, event, ...args);
-    }
-    const req = args[0];
-    const result = originalHttpEmit.call(this, event, ...args);
-    if (
-      req &&
-      req.headers?.["content-length"] === undefined &&
-      req.headers?.["transfer-encoding"] === undefined &&
-      typeof req.push === "function"
-    ) {
-      (processValue.nextTick ?? queueMicrotask)(() => {
-        if (req.complete !== true) {
-          req.complete = true;
-          req.push(null);
-        }
-        if (req.__meowEmptyEndEmitted !== true && typeof req.emit === "function") {
-          req.__meowEmptyEndEmitted = true;
-          req.emit("end");
-        }
-      });
-    }
-    return result;
-  };
-  patchedHttpEmit.__meowEmptyRequestPatch = true;
-  httpServerPrototype.emit = patchedHttpEmit;
-}
-const responsePrototype = httpModule.ServerResponse?.prototype;
-{
-  const IncomingMessage = nodeHttpIncoming.IncomingMessage;
-  const incomingPrototype = IncomingMessage?.prototype;
-  if (
-    incomingPrototype &&
-    typeof incomingPrototype.on === "function" &&
-    incomingPrototype.on.__meowEmptyEndPatch !== true
-  ) {
-    const originalOn = incomingPrototype.on;
-    const patchedOn = function (event, listener) {
-      const isKnownEmpty =
-        this.headers?.["content-length"] === undefined &&
-        this.headers?.["transfer-encoding"] === undefined;
-      if (event === "data" && isKnownEmpty) {
-        this.complete = true;
-        return this;
-      }
-      const result = originalOn.call(this, event, listener);
-      if (event === "end" && typeof listener === "function" && isKnownEmpty) {
-        (nodeTimers.setTimeout ?? setTimeout)(() => {
-          this.__meowEmptyEndEmitted = true;
-          this.complete = true;
-          listener.call(this);
-        }, 0);
-      }
-      return result;
-    };
-    patchedOn.__meowEmptyEndPatch = true;
-    incomingPrototype.on = patchedOn;
-    incomingPrototype.addListener = patchedOn;
-    if (
-      typeof incomingPrototype._read === "function" &&
-      incomingPrototype._read.__meowEmptyReadPatch !== true
-    ) {
-      const originalRead = incomingPrototype._read;
-      const patchedRead = function (size) {
-        if (
-          this.headers?.["content-length"] === undefined &&
-          this.headers?.["transfer-encoding"] === undefined
-        ) {
-          this.complete = true;
-          this.push(null);
-          return;
-        }
-        return originalRead.call(this, size);
-      };
-      patchedRead.__meowEmptyReadPatch = true;
-      incomingPrototype._read = patchedRead;
-    }
-  }
-}
-
-if (
-  responsePrototype &&
-  typeof responsePrototype.end === "function" &&
-  responsePrototype.end.__meowDirectEndPatch !== true
-) {
-  const originalEnd = responsePrototype.end;
-  const patchedEnd = function (chunk, encoding, callback) {
-    if (typeof chunk === "function") {
-      return originalEnd.call(this, null, null, chunk);
-    }
-    if (typeof encoding === "function") {
-      callback = encoding;
-      encoding = null;
-    }
-    if (chunk !== null && chunk !== undefined && chunk !== "") {
-      this.write(chunk, encoding);
-      (nodeTimers.setTimeout ?? setTimeout)(() => {
-        originalEnd.call(this, null, null, callback);
-      }, 0);
-      return this;
-    }
-    return originalEnd.call(this, chunk, encoding, callback);
-  };
-  patchedEnd.__meowDirectEndPatch = true;
-  responsePrototype.end = patchedEnd;
-}
 
 if (
   typeof processValue?.emit === "function" &&
@@ -1076,7 +968,11 @@ if (
         fs.appendFileSync(String(debugLog), `child<-parent ${line}\n`);
       }
       try {
-        processValue.emit("message", JSON.parse(line));
+        const parsed = JSON.parse(line);
+        if (parsed && typeof parsed === "object" && parsed.__meowProcessExit) {
+          continue;
+        }
+        processValue.emit("message", parsed);
       } catch {
         // Ignore malformed mailbox writes from parent code.
       }
@@ -1161,6 +1057,16 @@ try {
   def("ErrorEvent", event.ErrorEvent);
   def("CloseEvent", event.CloseEvent);
   def("ProgressEvent", event.ProgressEvent);
+
+  // Node exposes these as globals (via worker_threads + the WHATWG channel
+  // messaging spec). Libraries like undici reference `MessagePort` at module load
+  // for webidl type assertions, so install the real deno_web implementations.
+  const messagePort = load("ext:deno_web/13_message_port.js");
+  def("MessagePort", messagePort.MessagePort);
+  def("MessageChannel", messagePort.MessageChannel);
+
+  const broadcastChannel = load("ext:deno_web/01_broadcast_channel.js");
+  def("BroadcastChannel", broadcastChannel.BroadcastChannel);
 
   const compression = load("ext:deno_web/14_compression.js");
   def("CompressionStream", compression.CompressionStream);

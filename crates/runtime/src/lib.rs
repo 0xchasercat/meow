@@ -20,7 +20,7 @@
 
 mod error;
 mod ext;
-mod loader;
+mod fs_events;
 pub mod native;
 pub mod typegen;
 // === RT-005 ===
@@ -55,6 +55,13 @@ pub mod hermetic;
 /// [`node::extensions`].
 pub mod node;
 // === /RT-007 ===
+// === WORKER-001 ===
+/// Cooperative-isolate `node:worker_threads` ops + manager, baked into the V8
+/// snapshot. The host runtime-construction edge (resolver / module graph /
+/// worker-isolate driver) lives at the binary edge and plugs in through the
+/// [`worker::WorkerSpawner`] seam. See [`worker::worker_extension`].
+pub mod worker;
+// === /WORKER-001 ===
 
 use deno_core::{JsRuntime, ModuleId, PollEventLoopOptions, RuntimeOptions as DenoRuntimeOptions};
 
@@ -65,16 +72,17 @@ pub use deno_core;
 pub use deno_core::v8;
 pub use deno_core::ModuleCodeString;
 pub use deno_core::ModuleSpecifier;
+pub use deno_core::SharedArrayBufferStore;
 
 pub use error::{JsExceptionReport, RuntimeError};
 pub use ext::http::ops::HttpError;
-pub use ext::{http_extension, print_sink_extension, ui_extension, PrintSink};
 pub use ext::meow_runtime;
-pub use loader::TrivialModuleLoader;
+pub use ext::{http_extension, print_sink_extension, test_extension, ui_extension, PrintSink};
 // === RT-002 ===
 pub use io::{
-    io_capability_extension, AllowAll, CapDenied, CapRequest, CapabilityCheck, RuntimeIoError,
-    TcpStreamResource,
+    io_capability_extension, sandbox_caps, strip_windows_verbatim_prefix, AllowAll, CapDenied,
+    CapRequest, CapabilityCheck, RuntimeIoError, SandboxCaps, SandboxPolicy, TcpStreamResource,
+    SANDBOX_BYPASS_HINT,
 };
 // === RT-002 ===
 
@@ -87,9 +95,8 @@ pub struct Runtime {
 /// Construction inputs. Deliberately minimal at P0 — `extensions` is the
 /// registration seam (A4).
 pub struct RuntimeOptions {
-    /// Resolves + fetches modules. At P0 this is [`TrivialModuleLoader`];
-    /// the real resolver replaces it with the shared resolver. Required (no
-    /// implicit default → no ambient fs authority).
+    /// Resolves + fetches modules. Required explicitly so tests and production
+    /// exercise the same resolver path and no ambient fs authority is implied.
     pub module_loader: std::rc::Rc<dyn deno_core::ModuleLoader>,
     /// Subsystem-contributed ops/extensions. This crate's own `meow_runtime`
     /// extension is always prepended internally; callers never pass it.
@@ -115,6 +122,11 @@ pub struct RuntimeOptions {
     /// Each entry is `(specifier, source_code)`. Only consulted when
     /// `startup_snapshot` is `Some`.
     pub residual_lazy_esm_sources: &'static [(&'static str, &'static str)],
+    /// Raw V8 flags forwarded to `v8::V8::set_flags_from_command_line` before
+    /// the isolate is created (e.g. `--allow-natives-syntax`, `--trace-opt`).
+    /// Comma- or whitespace-separated. Owned so the caller doesn't have to
+    /// leak or static-promote the input.
+    pub v8_flags: Option<String>,
 }
 /// Default V8 heap size: 4 GiB or 75% of available system memory,
 /// like Next.js dev while staying reasonable for small scripts.
@@ -164,6 +176,57 @@ fn system_memory() -> Option<usize> {
     None
 }
 
+#[cfg(unix)]
+fn maximize_fd_limit() {
+    // Process-global: raising the fd limit once suffices. Guard with `Once` so
+    // that spawning many worker isolates (each constructs a `Runtime`) does not
+    // issue a redundant get/setrlimit syscall pair per worker.
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
+            limit.rlim_cur = limit.rlim_max.min(10240);
+            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn maximize_fd_limit() {}
+
+/// The process-wide [`SharedArrayBufferStore`], shared by EVERY runtime in this
+/// process (the main isolate and every `node:worker_threads` worker isolate).
+///
+/// `deno_core`'s structured clone only serializes a `SharedArrayBuffer` (and
+/// only *transfers* an `ArrayBuffer`) when the runtime has a store, and cross-
+/// isolate sharing requires all participating isolates to use the SAME store
+/// (backing stores are handed off by integer id). A process-global singleton
+/// gives every worker the same store with zero plumbing through `RuntimeOptions`
+/// — the ids are globally unique (one counter), so there is no cross-runtime
+/// collision. This is what lets `worker_threads` `workerData` / `postMessage`
+/// carry a `SharedArrayBuffer` whose `Atomics.wait`/`notify` then work across
+/// threads (e.g. miniflare's synchronous fetch).
+fn shared_array_buffer_store() -> SharedArrayBufferStore {
+    static STORE: std::sync::OnceLock<SharedArrayBufferStore> = std::sync::OnceLock::new();
+    STORE.get_or_init(SharedArrayBufferStore::default).clone()
+}
+
+/// Apply raw V8 engine flags before any isolate is created.
+/// Calls `v8::V8::set_flags_from_command_line` which is a process-global
+/// init point — must be invoked before any `JsRuntime` is constructed.
+fn apply_v8_flags(raw: &str) {
+    // Split on both commas and whitespace so users can use either separator:
+    //   --v8-flags=--allow-natives-syntax,--trace-opt
+    //   --v8-flags="--allow-natives-syntax --trace-opt"
+    let joined = raw.replace(',', " ");
+    let mut args: Vec<String> = vec!["meow".to_string()];
+    args.extend(joined.split_whitespace().map(|s| s.to_string()));
+    v8::V8::set_flags_from_command_line(args);
+}
+
 impl Runtime {
     /// Creates the isolate, prepending this crate's `meow_runtime` extension
     /// (ops + `console` bootstrap) to `options.extensions`. No host reads.
@@ -179,27 +242,32 @@ impl Runtime {
     /// plumbing; they only go live behind a mediated, capability-enforced API in
     /// a later spec (meow:fs + SEC/P6).
     pub fn new(options: RuntimeOptions) -> Result<Runtime, RuntimeError> {
+        maximize_fd_limit();
+        if let Some(raw) = options.v8_flags.as_deref() {
+            apply_v8_flags(raw);
+        }
         let mut extensions = Vec::with_capacity(options.extensions.len() + 1);
         extensions.push(ext::meow_runtime::init());
         extensions.extend(options.extensions);
-        let heap_limit = options
-            .max_heap_size
-            .unwrap_or_else(default_heap_size);
+        let heap_limit = options.max_heap_size.unwrap_or_else(default_heap_size);
         let js_runtime = JsRuntime::try_new(DenoRuntimeOptions {
             module_loader: Some(options.module_loader),
             extensions,
             extension_transpiler: Some(std::rc::Rc::new(|specifier, source| {
                 maybe_transpile_source(specifier, source)
             })),
-            create_params: Some(
-                deno_core::v8::CreateParams::default().heap_limits(0, heap_limit),
-            ),
+            create_params: Some(deno_core::v8::CreateParams::default().heap_limits(0, heap_limit)),
             startup_snapshot: options.startup_snapshot,
             residual_lazy_js_sources: options.residual_lazy_js_sources,
             residual_lazy_esm_sources: options.residual_lazy_esm_sources,
+            // Share ONE store across all isolates in the process so
+            // `SharedArrayBuffer`s (and transferred `ArrayBuffer`s) survive
+            // structured clone between the main isolate and worker isolates.
+            shared_array_buffer_store: Some(shared_array_buffer_store()),
             ..Default::default()
         })
         .map_err(|err| RuntimeError::Init(err.to_string()))?;
+
         Ok(Runtime { js_runtime })
     }
     /// Non-module script eval; returns the completion value. For bootstrap
@@ -208,10 +276,20 @@ impl Runtime {
         &mut self,
         name: &'static str,
         src: impl Into<ModuleCodeString>,
-) -> Result<v8::Global<v8::Value>, RuntimeError> {
+    ) -> Result<v8::Global<v8::Value>, RuntimeError> {
         self.js_runtime
             .execute_script(name, src.into())
             .map_err(|err| error::uncaught_from_js(name, &err))
+    }
+
+    /// Read test results stored by the JS test runner via the op seam.
+    /// Returns `None` if no test results were stored (no test file ran).
+    pub fn take_test_results(&mut self) -> Option<String> {
+        let op_state = self.js_runtime.op_state();
+        let state = op_state.borrow();
+        state
+            .try_borrow::<crate::ext::test::TestResults>()
+            .and_then(|results| results.0.borrow_mut().take())
     }
     /// Loads `spec` as the main ESM module via the configured loader, evaluates
     /// it, and drives the event loop to completion — resolving top-level await
@@ -257,6 +335,21 @@ impl Runtime {
             .map_err(|err| RuntimeError::EventLoop(Box::new(err)))
     }
 
+    /// The runtime's shared op-state. Used to install per-worker channel state
+    /// for the cooperative-isolate `node:worker_threads` host (the worker driver
+    /// inserts the worker side's message queues + serialized `workerData`).
+    pub fn op_state(&self) -> std::rc::Rc<std::cell::RefCell<deno_core::OpState>> {
+        self.js_runtime.op_state()
+    }
+
+    /// A thread-safe handle to this runtime's V8 isolate. The cooperative worker
+    /// host calls `terminate_execution()` on a worker's handle to stop it without
+    /// borrowing the worker's single-owner `JsRuntime` (which its own driver task
+    /// holds across `run_event_loop().await`).
+    pub fn isolate_handle(&mut self) -> deno_core::v8::IsolateHandle {
+        self.js_runtime.v8_isolate().thread_safe_handle()
+    }
+
     /// Take and clear a `process.exit(code)` request recorded by RT-007's node
     /// bootstrap, if the run triggered one.
     pub fn take_process_exit_code(&mut self) -> Option<i32> {
@@ -268,10 +361,44 @@ impl Runtime {
     pub fn refresh_node_bootstrap(
         &mut self,
         argv: Vec<String>,
+        main_module: Option<String>,
         cwd: std::path::PathBuf,
         env: std::collections::BTreeMap<String, String>,
-    ) {
-        crate::node::refresh_bootstrap_state(&mut self.js_runtime, argv, cwd, env);
+    ) -> Result<(), RuntimeError> {
+        crate::node::refresh_bootstrap_state(&mut self.js_runtime, argv, main_module, cwd, env)
+    }
+
+    /// Apply hermetic global shadows (`Date` / `Math.random` / `performance` /
+    /// `crypto`) if the active [`hermetic::HermeticConfig`] requires them.
+    ///
+    /// This MUST be called after [`Runtime::new`] (whether from a snapshot or
+    /// fresh) for the hermetic extension to take effect. The shadow logic lives
+    /// in `globalThis.__meowApplyHermeticShadows` (defined by `hermetic.js` at
+    /// module-eval time, so it survives snapshot restore) and is invoked here
+    /// at runtime so it reads the *runtime* config via `op_hermetic_status`,
+    /// not the snapshot-creation config.
+    ///
+    /// Under `--trust` / `--allow-clock` / `--allow-random`, the corresponding
+    /// shadows are skipped and V8's native intrinsics run unhindered -- no FFI
+    /// tax in hot loops. If the hermetic extension is not installed, this is a
+    /// no-op (the global is absent).
+    pub fn apply_hermetic_shadows(&mut self) -> Result<(), RuntimeError> {
+        // Fast path: if both the clock and RNG are real (e.g. --trust or
+        // node-compat mode), no shadows are needed. Skip the execute_script
+        // entirely — saves ~1-2ms of JS compile+eval on every run.
+        let op_state = self.js_runtime.op_state();
+        let needed = {
+            let state = op_state.borrow();
+            crate::hermetic::shadows_needed(&state)
+        };
+        if !needed {
+            return Ok(());
+        }
+        self.execute_script(
+            "hermetic_apply",
+            String::from("if (typeof globalThis.__meowApplyHermeticShadows === 'function') globalThis.__meowApplyHermeticShadows();"),
+        )?;
+        Ok(())
     }
 
     /// The canonical deno_core dance: kick off evaluation, pump the event
@@ -316,7 +443,12 @@ pub fn maybe_transpile_source(
     ),
     deno_error::JsErrorBox,
 > {
-    use deno_ast::{MediaType, ModuleKind, ParseParams, SourceMapOption};
+    use oxc_allocator::Allocator;
+    use oxc_codegen::Codegen;
+    use oxc_parser::{ParseOptions, Parser};
+    use oxc_semantic::SemanticBuilder;
+    use oxc_span::SourceType;
+    use oxc_transformer::{TransformOptions, Transformer};
 
     let specifier_str = specifier.as_str();
     let should_transpile = specifier_str.starts_with("node:")
@@ -327,53 +459,98 @@ pub fn maybe_transpile_source(
         || specifier_str.ends_with(".tsx")
         || specifier_str.ends_with(".jsx");
 
-    if should_transpile {
-        let parsed_specifier =
-            deno_core::ModuleSpecifier::parse(specifier_str).unwrap_or_else(|_| {
-                deno_core::ModuleSpecifier::parse(&format!("file:///{}", specifier_str)).unwrap()
-            });
+    if !should_transpile {
+        return Ok((source, None));
+    }
 
-        let media_type = if specifier_str.ends_with(".tsx") {
-            MediaType::Tsx
-        } else if specifier_str.ends_with(".jsx") {
-            MediaType::Jsx
-        } else {
-            MediaType::TypeScript
-        };
-
-        let parsed = deno_ast::parse_module(ParseParams {
-            specifier: parsed_specifier,
-            text: source.as_str().into(),
-            media_type,
-            capture_tokens: false,
-            scope_analysis: false,
-            maybe_syntax: None,
+    let source_text = source.as_str();
+    let source_path = source_path_for_oxc(specifier_str);
+    let source_type = SourceType::from_path(&source_path)
+        .unwrap_or_else(|_| source_type_from_specifier(specifier_str));
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, source_text, source_type)
+        .with_options(ParseOptions {
+            allow_return_outside_function: true,
+            ..ParseOptions::default()
         })
-        .map_err(deno_error::JsErrorBox::from_err)?;
+        .parse();
+    if parsed.panicked || !parsed.diagnostics.is_empty() {
+        let message = parsed
+            .diagnostics
+            .into_iter()
+            .map(|error| format!("{:?}", error.with_source_code(source_text.to_owned())))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(deno_error::JsErrorBox::generic(format!(
+            "Oxc parse failed for {specifier_str}: {message}"
+        )));
+    }
 
-        let transpiled = parsed
-            .transpile(
-                &deno_ast::TranspileOptions {
-                    imports_not_used_as_values: deno_ast::ImportsNotUsedAsValues::Remove,
-                    ..Default::default()
-                },
-                &deno_ast::TranspileModuleOptions {
-                    module_kind: Some(ModuleKind::Esm),
-                },
-                &deno_ast::EmitOptions {
-                    source_map: SourceMapOption::Separate,
-                    inline_sources: true,
-                    ..Default::default()
-                },
-            )
-            .map_err(deno_error::JsErrorBox::from_err)?
-            .into_source();
+    let mut program = parsed.program;
+    let semantic = SemanticBuilder::new()
+        .with_excess_capacity(2.0)
+        .with_enum_eval(true)
+        .build(&program);
+    if !semantic.diagnostics.is_empty() {
+        let message = semantic
+            .diagnostics
+            .into_iter()
+            .map(|error| format!("{:?}", error.with_source_code(source_text.to_owned())))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(deno_error::JsErrorBox::generic(format!(
+            "Oxc semantic analysis failed for {specifier_str}: {message}"
+        )));
+    }
 
-        Ok((
-            transpiled.text.into(),
-            transpiled.source_map.map(|s| s.into_bytes().into()),
-        ))
+    let transform_options = TransformOptions {
+        typescript: oxc_transformer::TypeScriptOptions {
+            only_remove_type_imports: true,
+            ..oxc_transformer::TypeScriptOptions::default()
+        },
+        ..TransformOptions::default()
+    };
+    let transformed = Transformer::new(&allocator, &source_path, &transform_options)
+        .build_with_scoping(semantic.semantic.into_scoping(), &mut program);
+    if !transformed.diagnostics.is_empty() {
+        let message = transformed
+            .diagnostics
+            .into_iter()
+            .map(|error| format!("{:?}", error.with_source_code(source_text.to_owned())))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(deno_error::JsErrorBox::generic(format!(
+            "Oxc transform failed for {specifier_str}: {message}"
+        )));
+    }
+
+    let code = Codegen::new().build(&program).code;
+    Ok((code.into(), None))
+}
+
+fn source_path_for_oxc(specifier: &str) -> std::path::PathBuf {
+    if let Ok(url) = deno_core::ModuleSpecifier::parse(specifier) {
+        if let Ok(path) = url.to_file_path() {
+            return path;
+        }
+        let path = url.path();
+        if let Some(name) = path.rsplit('/').next().filter(|name| !name.is_empty()) {
+            return std::path::PathBuf::from(name);
+        }
+    }
+    std::path::PathBuf::from(specifier.rsplit('/').next().unwrap_or(specifier))
+}
+
+fn source_type_from_specifier(specifier: &str) -> oxc_span::SourceType {
+    if specifier.ends_with(".tsx") {
+        oxc_span::SourceType::tsx()
+    } else if specifier.ends_with(".jsx") {
+        oxc_span::SourceType::jsx()
+    } else if specifier.ends_with(".mjs") {
+        oxc_span::SourceType::mjs()
+    } else if specifier.ends_with(".cjs") {
+        oxc_span::SourceType::cjs()
     } else {
-        Ok((source, None))
+        oxc_span::SourceType::ts()
     }
 }

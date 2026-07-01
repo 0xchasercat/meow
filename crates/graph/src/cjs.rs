@@ -109,8 +109,16 @@ impl Analyzer {
             return;
         }
         self.mark_commonjs();
-        if let Some(name) = call.arguments.get(1).and_then(argument_string) {
-            self.push_named_export(name);
+        let has_static_descriptor = call
+            .arguments
+            .get(2)
+            .and_then(argument_expression)
+            .map(object_literal_has_export_property)
+            .unwrap_or(false);
+        if has_static_descriptor {
+            if let Some(name) = call.arguments.get(1).and_then(argument_string) {
+                self.push_named_export(name);
+            }
         }
     }
 
@@ -201,6 +209,19 @@ fn argument_string<'a>(arg: &'a Argument<'a>) -> Option<&'a str> {
         _ => None,
     }
 }
+
+fn object_literal_has_export_property(expr: &Expression<'_>) -> bool {
+    let Expression::ObjectExpression(obj) = expr.without_parentheses() else {
+        return false;
+    };
+    obj.properties.iter().any(|prop| {
+        let ObjectPropertyKind::ObjectProperty(prop) = prop else {
+            return false;
+        };
+        matches!(prop.key.static_name().as_deref(), Some("value" | "get"))
+    })
+}
+
 fn is_exports_target(expr: &Expression<'_>) -> bool {
     expr.without_parentheses().is_specific_id("exports")
 }
@@ -240,10 +261,10 @@ mod tests {
     #[test]
     fn skips_default_and_non_identifier_named_exports() {
         let analysis = analyze(
-            "module.exports.default = 1;\nexports['a-b'] = 2;\nexports.good_name = 3;\n",
+            "module.exports.default = 1;\nexports['a-b'] = 2;\nexports.good_name = 3;\nObject.defineProperty(exports, 'lazy', { get() { return require('dep').x } });\n",
             SourceType::cjs(),
         );
-        assert_eq!(analysis.named_exports, vec!["good_name"]);
+        assert_eq!(analysis.named_exports, vec!["good_name", "lazy"]);
     }
 
     #[test]

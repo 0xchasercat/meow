@@ -55,6 +55,8 @@ export interface ServeOptions {
   signal?: AbortSignal;
   /** Called once the listener is bound, with the resolved address. */
   onListen?: (addr: NetAddr) => void;
+  /** Per-request handler (Deno-style: serve({ port, fetch }) ). */
+  fetch?: Handler;
 }
 
 export interface Server {
@@ -103,8 +105,24 @@ function reportHandlerError(error: unknown): void {
  * Start a Web-standard HTTP/1.1 server. `handler` is invoked per request with a
  * `Request` and must return a `Response`. Requires the network capability; with no
  * grant the bind rejects through `server.finished` with a fix-pointing error.
+ *
+ * Accepts either form:
+ *   serve(handler, { port })       — classic
+ *   serve({ port, fetch })         — Deno-style
  */
-export function serve(handler: Handler, options: ServeOptions = {}): Server {
+export function serve(
+  handlerOrOptions: Handler | ServeOptions,
+  maybeOptions?: ServeOptions,
+): Server {
+  let handler: Handler;
+  let options: ServeOptions;
+  if (typeof handlerOrOptions === "function") {
+    handler = handlerOrOptions;
+    options = maybeOptions ?? {};
+  } else {
+    options = handlerOrOptions;
+    handler = options.fetch ?? (() => new Response("No handler", { status: 500 }));
+  }
   const hostname = options.hostname ?? "0.0.0.0";
   const port = options.port ?? 8000;
   const addr: { hostname: string; port: number } = { hostname, port };

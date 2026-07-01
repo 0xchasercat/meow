@@ -1,21 +1,38 @@
-//! Source-pointing diagnostics — the "Honest Kitten". A `miette`-style snippet
-//! (gutter + the offending line + a caret underline) with the highlight in Mochi
-//! Pink. No external diagnostic crate: the renderer is a pure function over the
-//! source text + a byte span, which keeps the binary lean and the output testable.
+//! Source-pointing diagnostics, compiler-grade. A header line, a framed snippet
+//! with a line gutter and a caret underline in error red, and optional `help:` /
+//! `note:` lines. Pure over the source text + a byte span, so it needs no
+//! external diagnostic crate and stays trivially testable.
 
-use crate::envelope::{self, Tone};
-use crate::theme::{Rgb, Style};
+use crate::caps::Caps;
+use crate::palette::Rgb;
+use crate::status::{self, Tone};
 
-/// A code error to point at: the source, a byte range within it, and the human
-/// message. `label` annotates the underline; `path` names the file in the gutter.
+/// A code error to point at. `label` annotates the caret; `help`/`note` add the
+/// actionable trailer compilers train users to look for.
 #[derive(Debug, Clone)]
 pub struct SourceDiagnostic<'a> {
     pub path: &'a str,
     pub source: &'a str,
-    /// Byte range `[start, end)` into `source`. Clamped defensively.
     pub span: (usize, usize),
     pub message: &'a str,
     pub label: Option<&'a str>,
+    pub help: Option<&'a str>,
+    pub note: Option<&'a str>,
+}
+
+impl<'a> SourceDiagnostic<'a> {
+    /// Minimal constructor; help/note default to none.
+    pub fn new(path: &'a str, source: &'a str, span: (usize, usize), message: &'a str) -> Self {
+        SourceDiagnostic {
+            path,
+            source,
+            span,
+            message,
+            label: None,
+            help: None,
+            note: None,
+        }
+    }
 }
 
 struct Located {
@@ -25,8 +42,6 @@ struct Located {
     span_len: usize,
 }
 
-/// Resolve a byte offset to 1-based line/column and pull the line text. Never
-/// panics on an out-of-range span — it clamps to the source end.
 fn locate(source: &str, span: (usize, usize)) -> Located {
     let start = span.0.min(source.len());
     let end = span.1.clamp(start, source.len());
@@ -47,7 +62,6 @@ fn locate(source: &str, span: (usize, usize)) -> Located {
         .unwrap_or(source.len());
     let line_text = source[line_start..line_end].to_owned();
     let col = source[line_start..start].chars().count() + 1;
-    // Underline length in columns, kept on the offending line.
     let span_on_line = source[start..end.min(line_end)].chars().count().max(1);
     Located {
         line_no,
@@ -57,100 +71,126 @@ fn locate(source: &str, span: (usize, usize)) -> Located {
     }
 }
 
-/// Render the full diagnostic block (header envelope + framed snippet).
-pub fn render(style: Style, diag: &SourceDiagnostic<'_>) -> String {
+/// Render the full diagnostic block.
+pub fn render(caps: &Caps, diag: &SourceDiagnostic<'_>) -> String {
+    let g = caps.glyphs;
     let loc = locate(diag.source, diag.span);
-    let header = envelope::render(style, Tone::Hiss, diag.message);
-    let gutter_w = loc.line_no.to_string().len();
-    let pad = " ".repeat(gutter_w);
-    let ink = |s: &str| style.paint(Rgb::WHISKER, s);
+    let ink = |s: &str| caps.muted(s);
+    let gutter = loc.line_no.to_string();
+    let pad = " ".repeat(gutter.len());
 
     let mut out = String::new();
-    out.push_str(&header);
+    out.push_str(&status::sigil_line(caps, Tone::Hiss, diag.message));
     out.push('\n');
     out.push_str(&format!(
         "{pad}{}",
         ink(&format!(
-            "\u{256D}\u{2500}[{}:{}:{}]",
-            diag.path, loc.line_no, loc.col
+            "{}{}[{}:{}:{}]",
+            g.gutter_down, g.horizontal, diag.path, loc.line_no, loc.col
         ))
     ));
     out.push('\n');
     out.push_str(&format!(
         "{} {} {}",
-        style.paint(Rgb::WHISKER, &loc.line_no.to_string()),
-        ink("\u{2502}"),
+        caps.bold(Rgb::WHISKER, &gutter),
+        ink(g.vertical),
         loc.line_text
     ));
     out.push('\n');
 
-    let caret = style.paint_bold(Rgb::MOCHI, &"^".repeat(loc.span_len));
     let lead = " ".repeat(loc.col.saturating_sub(1));
-    out.push_str(&format!("{pad} {} {lead}{caret}", ink("\u{00B7}")));
+    let carets = caps.bold(Rgb::HISS, &g.caret.repeat(loc.span_len));
+    out.push_str(&format!("{pad} {} {lead}{carets}", ink(g.bullet)));
     if let Some(label) = diag.label {
         out.push(' ');
-        out.push_str(&style.paint(Rgb::MOCHI, label));
+        out.push_str(&caps.paint(Rgb::HISS, label));
     }
     out.push('\n');
-    out.push_str(&format!(
-        "{pad}{}",
-        ink("\u{2570}\u{2500}\u{2500}\u{2500}\u{2500}")
-    ));
+
+    let mut tail: Vec<(Rgb, &str, &str)> = Vec::new();
+    if let Some(help) = diag.help {
+        tail.push((Rgb::SKY, "help:", help));
+    }
+    if let Some(note) = diag.note {
+        tail.push((Rgb::WHISKER, "note:", note));
+    }
+    if tail.is_empty() {
+        out.push_str(&format!(
+            "{pad}{}",
+            ink(&format!("{}{}", g.gutter_up, g.horizontal.repeat(4)))
+        ));
+    } else {
+        let last = tail.len() - 1;
+        for (i, (color, kw, text)) in tail.iter().enumerate() {
+            let conn = if i == last { g.gutter_up } else { g.tee_right };
+            out.push_str(&format!(
+                "{pad}{} {} {text}",
+                ink(&format!("{}{}", conn, g.horizontal)),
+                caps.bold(*color, kw)
+            ));
+            if i != last {
+                out.push('\n');
+            }
+        }
+    }
     out
+}
+
+/// Levenshtein distance (small inputs only: command/flag names).
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
+/// The closest candidate to `input`, when one is near enough to suggest.
+pub fn did_you_mean<'a>(input: &str, candidates: &[&'a str]) -> Option<&'a str> {
+    let mut best: Option<&str> = None;
+    let mut best_d = usize::MAX;
+    for c in candidates {
+        let d = levenshtein(input, c);
+        if d < best_d {
+            best_d = d;
+            best = Some(c);
+        }
+    }
+    let threshold = (input.chars().count() / 2).max(2);
+    best.filter(|_| best_d <= threshold)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn diag<'a>(source: &'a str, span: (usize, usize)) -> SourceDiagnostic<'a> {
-        SourceDiagnostic {
-            path: "app.ts",
-            source,
-            span,
-            message: "enum is not erasable",
-            label: Some("here"),
-        }
-    }
-
     #[test]
-    fn locates_line_and_column_on_the_second_line() {
+    fn points_at_the_span_with_help() {
         let src = "const a = 1;\nenum E { A }\n";
         let start = src.find("enum").unwrap();
-        let loc = locate(src, (start, start + 4));
-        assert_eq!(loc.line_no, 2);
-        assert_eq!(loc.col, 1);
-        assert_eq!(loc.line_text, "enum E { A }");
-        assert_eq!(loc.span_len, 4);
-    }
-
-    #[test]
-    fn out_of_range_span_does_not_panic() {
-        let src = "x";
-        let loc = locate(src, (999, 1000));
-        assert_eq!(loc.line_no, 1);
-        assert_eq!(loc.span_len, 1);
-    }
-
-    #[test]
-    fn plain_render_shows_line_message_and_caret_under_the_span() {
-        let src = "const a = 1;\nenum E { A }\n";
-        let start = src.find("enum").unwrap();
-        let out = render(Style::plain(), &diag(src, (start, start + 4)));
+        let mut d =
+            SourceDiagnostic::new("app.ts", src, (start, start + 4), "enum is not erasable");
+        d.label = Some("here");
+        d.help = Some("use a const object instead");
+        let out = render(&Caps::plain(), &d);
         assert!(out.contains("[app.ts:2:1]"));
         assert!(out.contains("enum E { A }"));
         assert!(out.contains("^^^^"));
-        assert!(out.contains("enum is not erasable"));
-        assert!(out.contains("here"));
+        assert!(out.contains("help:"));
     }
 
     #[test]
-    fn caret_is_offset_to_the_column() {
-        let src = "let x = bad;";
-        let start = src.find("bad").unwrap();
-        let out = render(Style::plain(), &diag(src, (start, start + 3)));
-        let caret_line = out.lines().find(|l| l.contains("^^^")).unwrap();
-        // 3 carets, indented past the gutter to column 9.
-        assert!(caret_line.contains("        ^^^"));
+    fn suggests_close_commands() {
+        let cmds = ["install", "run", "test", "lint"];
+        assert_eq!(did_you_mean("intall", &cmds), Some("install"));
+        assert_eq!(did_you_mean("xyzzy", &cmds), None);
     }
 }

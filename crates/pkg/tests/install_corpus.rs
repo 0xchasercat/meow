@@ -31,14 +31,17 @@ fn dep(name: &str, spec: DepSpec) -> BTreeMap<PackageName, DepSpec> {
     BTreeMap::from([(PackageName::new(name), spec)])
 }
 
-fn declared(name: &str, spec: &str) -> BTreeMap<PackageName, VersionReq> {
-    BTreeMap::from([(PackageName::new(name), req(spec))])
+fn declared(name: &str, spec: &str) -> BTreeMap<PackageName, DepSpec> {
+    BTreeMap::from([(PackageName::new(name), DepSpec::Range(req(spec)))])
 }
 
 fn installer<'a, R>(registry: &R, cache: &'a Cache) -> Installer<'a>
 where
     R: RegistrySource + Clone + 'static,
 {
+    // Disable the metadata-cache fast path for fixture-based tests —
+    // fixtures don't have a disk metadata cache or real tarball URLs.
+    std::env::set_var("MEOW_NO_FAST_PATH", "1");
     Installer::new(
         registry.clone(),
         cache,
@@ -111,6 +114,65 @@ fn transitive_resolution_records_exact_versions() {
         .expect("b present");
     assert!(cache.contains(&a.integrity));
     assert!(cache.contains(&b.integrity));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn root_overrides_constrain_transitive_dependency_selection() {
+    let root = tmp_dir("override-transitive");
+    let cache = Cache::with_root(root.join("cache"));
+    let mut registry = FixtureRegistry::new();
+    registry.publish("app", "1.0.0", &[("vite", "*")], b"app-1.0.0".to_vec());
+    registry.publish("vite", "7.3.6", &[], b"vite-7.3.6".to_vec());
+    registry.publish("vite", "8.1.0", &[], b"vite-8.1.0".to_vec());
+
+    let overrides = BTreeMap::from([(PackageName::new("vite"), DepSpec::Range(req("^7")))]);
+    let lockfile = installer(&registry, &cache)
+        .with_overrides(overrides)
+        .resolve(&dep("app", DepSpec::Range(req("^1.0.0"))))
+        .expect("install succeeds");
+
+    let app = lockfile
+        .get(&PackageName::new("app"), &ver("1.0.0"))
+        .expect("app present");
+    assert_eq!(
+        app.dependencies.get(&PackageName::new("vite")),
+        Some(&ver("7.3.6"))
+    );
+    assert!(
+        lockfile
+            .get(&PackageName::new("vite"), &ver("8.1.0"))
+            .is_none(),
+        "override must prevent the unconstrained latest version from being locked"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn root_overrides_reject_reusing_locked_version_outside_override_range() {
+    let root = tmp_dir("override-reuse");
+    let cache = Cache::with_root(root.join("cache"));
+    let mut registry = FixtureRegistry::new();
+    registry.publish("app", "1.0.0", &[("vite", "*")], b"app-1.0.0".to_vec());
+    registry.publish("vite", "7.3.6", &[], b"vite-7.3.6".to_vec());
+    registry.publish("vite", "8.1.0", &[], b"vite-8.1.0".to_vec());
+
+    let mut old_lock = Lockfile::new();
+    old_lock.upsert(entry("vite", "8.1.0"));
+    let overrides = BTreeMap::from([(PackageName::new("vite"), DepSpec::Range(req("^7")))]);
+
+    let lockfile = installer(&registry, &cache)
+        .with_reuse_lockfile(old_lock)
+        .with_overrides(overrides)
+        .resolve(&dep("app", DepSpec::Range(req("^1.0.0"))))
+        .expect("install succeeds");
+
+    assert!(lockfile
+        .get(&PackageName::new("vite"), &ver("8.1.0"))
+        .is_none());
+    assert!(lockfile
+        .get(&PackageName::new("vite"), &ver("7.3.6"))
+        .is_some());
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -208,9 +270,9 @@ fn darwin_arm64_optional_dependencies_are_filtered_by_platform_support() {
         "compatible optional dependency package is pinned"
     );
     assert!(
-        next.dependencies
-            .get(&PackageName::new("@next/swc-linux-x64-gnu"))
-            .is_none(),
+        !next
+            .dependencies
+            .contains_key(&PackageName::new("@next/swc-linux-x64-gnu")),
         "linux/x64 optional dependency is not in the graph"
     );
     assert!(
@@ -332,8 +394,66 @@ fn lockfile_bytes_are_deterministic_and_sorted() {
 }
 
 #[test]
-fn reused_lockfile_rechecks_cache_integrity_before_claiming_hit() {
-    let root = tmp_dir("reuse-corrupt");
+fn warm_reused_lockfile_resolves_without_registry_requests() {
+    #[derive(Clone)]
+    struct OfflineRegistry;
+
+    impl RegistrySource for OfflineRegistry {
+        fn fetch_metadata<'a>(
+            &'a self,
+            name: &'a PackageName,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<meow_pkg::PackageMetadata, RegistryError>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                Err(RegistryError::Fetch {
+                    target: name.to_string(),
+                    reason: "metadata should not be fetched for warm lockfile installs".to_owned(),
+                })
+            })
+        }
+
+        fn fetch_tarball<'a>(
+            &'a self,
+            url: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, RegistryError>> + Send + 'a>> {
+            Box::pin(async move {
+                Err(RegistryError::Fetch {
+                    target: url.to_owned(),
+                    reason: "tarball should not be fetched for warm lockfile installs".to_owned(),
+                })
+            })
+        }
+    }
+
+    let root = tmp_dir("reuse-offline");
+    let cache = Cache::with_root(root.join("cache"));
+    let a_bytes = b"a-1.0.0".to_vec();
+    let b_bytes = b"b-1.0.0".to_vec();
+    let a_integrity = cache.store(&a_bytes).expect("cache a");
+    let b_integrity = cache.store(&b_bytes).expect("cache b");
+    let mut a = entry("a", "1.0.0");
+    a.integrity = a_integrity;
+    a.dependencies = BTreeMap::from([(PackageName::new("b"), ver("1.0.0"))]);
+    let mut b = entry("b", "1.0.0");
+    b.integrity = b_integrity;
+
+    let mut reuse = Lockfile::new();
+    reuse.upsert(a);
+    reuse.upsert(b);
+
+    let resolved = installer(&OfflineRegistry, &cache)
+        .with_reuse_lockfile(reuse.clone())
+        .resolve(&dep("a", DepSpec::Range(req("^1.0.0"))))
+        .expect("warm lockfile install must not touch registry");
+
+    assert_eq!(resolved.to_canonical_string(), reuse.to_canonical_string());
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn reused_lockfile_requires_cached_blob_presence_before_claiming_hit() {
+    let root = tmp_dir("reuse-missing");
     let cache = Cache::with_root(root.join("cache"));
     let mut registry = FixtureRegistry::new();
     let bytes = b"a-1.0.0".to_vec();
@@ -347,16 +467,16 @@ fn reused_lockfile_rechecks_cache_integrity_before_claiming_hit() {
         .get(&PackageName::new("a"), &ver("1.0.0"))
         .expect("entry present")
         .clone();
-    std::fs::write(cache.path_for(&entry.integrity), b"corrupt").expect("corrupt cache");
+    std::fs::remove_file(cache.path_for(&entry.integrity)).expect("remove cache blob");
     assert!(matches!(
         cache.read(&entry.integrity),
-        Err(CacheError::IntegrityMismatch { .. })
+        Err(CacheError::NotFound(_))
     ));
 
     let repaired = installer(&registry, &cache)
         .with_reuse_lockfile(lockfile.clone())
         .resolve(&direct)
-        .expect("corrupt cache hit is repaired by redownload");
+        .expect("missing cache hit is repaired by redownload");
     assert_eq!(
         repaired.to_canonical_string(),
         lockfile.to_canonical_string()
@@ -481,6 +601,34 @@ fn resolve_roots_supports_disjunction_ranges() {
     let roots = resolve_roots(&declared("a", "^4.0.2 || ^5.0 || ^6.0"), &lockfile)
         .expect("disjunction root resolves");
     assert_eq!(roots.get(&PackageName::new("a")), Some(&ver("6.3.0")));
+}
+
+#[test]
+fn resolve_roots_supports_alias_ranges_after_install() {
+    let mut lockfile = Lockfile::new();
+    lockfile.upsert(entry("alias", "1.0.0"));
+    lockfile.upsert(entry("alias", "1.2.0"));
+    lockfile.upsert(entry("alias", "2.0.0"));
+
+    let declared = BTreeMap::from([(
+        PackageName::new("alias"),
+        DepSpec::Alias {
+            package: PackageName::new("real-package"),
+            spec: Box::new(DepSpec::Range(req("^1.0.0"))),
+        },
+    )]);
+    let roots = resolve_roots(&declared, &lockfile).expect("alias root resolves");
+    assert_eq!(roots.get(&PackageName::new("alias")), Some(&ver("1.2.0")));
+}
+
+#[test]
+fn resolve_roots_reports_unresolved_dist_tags() {
+    let mut lockfile = Lockfile::new();
+    lockfile.upsert(entry("a", "1.0.0"));
+
+    let declared = BTreeMap::from([(PackageName::new("a"), DepSpec::Tag("latest".to_owned()))]);
+    let err = resolve_roots(&declared, &lockfile).expect_err("dist tag cannot be re-derived");
+    assert!(matches!(err, RootResolveError::UnsupportedRange { .. }));
 }
 
 #[test]

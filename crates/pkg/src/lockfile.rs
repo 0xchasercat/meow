@@ -105,6 +105,28 @@ pub struct Lockfile {
     entries: BTreeMap<EntryKey, LockEntry>,
 }
 
+impl Serialize for Lockfile {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.entries.len()))?;
+        for entry in self.entries.values() {
+            seq.serialize_element(entry)?;
+        }
+        seq.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Lockfile {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Lockfile, D::Error> {
+        let entries: Vec<LockEntry> = Vec::deserialize(deserializer)?;
+        let mut map = BTreeMap::new();
+        for entry in entries {
+            map.insert(EntryKey::of(&entry), entry);
+        }
+        Ok(Lockfile { entries: map })
+    }
+}
+
 impl Lockfile {
     /// An empty lockfile.
     pub fn new() -> Lockfile {

@@ -7,7 +7,7 @@ edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/meow-rs/meow"
-version = "0.0.0"
+version = "0.1.0"
 
 # Externals are DECLARED centrally so consuming crates inherit one pin each.
 # A pin here costs nothing until a crate lists it under its own [dependencies].
@@ -20,7 +20,10 @@ version = "0.0.0"
 # Pin confirmed by RT-001's V8 build; consumed by RT-* (use `deno_core::v8`, no direct v8 dep).
 deno_core = "0.403"
 # Parse/semantic/transform — Oxc, pinned as sub-crates in the GRAPH-001 fence below (I-1).
-# Bundler — consumed by TOOL-003 below (skeleton only; no full bundle claim yet).
+# Bundler — Rolldown native Rust bundler; Oxc pins below are aligned to Rolldown 1.1.3.
+rolldown = "1.1.3"
+rolldown_common = "1.1.3"
+rolldown_plugin = "1.1.3"
 # Async I/O — consumed by RT-002 (tokio; io_uring on Linux).
 tokio = { version = "1", features = ["rt-multi-thread", "fs", "io-util", "net", "macros", "sync", "time"] }
 # === RT-002 ===
@@ -31,7 +34,7 @@ deno_error = "=0.7.1"
 # === /RT-002 ===
 # === LOAD-003 ===
 # Package archives + manifests. Serde stays shared here because CFG/PKG/LOAD all consume it.
-flate2 = "1"
+flate2 = { version = "1", features = ["zlib-ng"], default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tar = "0.4"
@@ -41,6 +44,7 @@ clap = { version = "4", features = ["derive"] }
 # Errors — typed + causal (CRAFT): thiserror for libraries, anyhow for the binary edge.
 thiserror = "2"
 anyhow = "1"
+libc = "0.2"
 # Dev-only (integration tests of the binary).
 assert_cmd = "2"
 predicates = "3"
@@ -58,15 +62,15 @@ rustls = "0.23"
 # === /PKG-002 ===
 # === /PKG-001 ===
 # === GRAPH-001 ===
-# The ONE parser (I-1, P15): Oxc, pinned together at one generation. The
-# umbrella `oxc` (DIST-001) is left declared-but-unused — sub-crates give per-feature
+# The ONE parser (I-1, P15): Oxc, pinned together at Rolldown's generation. The
+# sub-crates give per-feature
 # control and avoid a duplicate `oxc` key here. Consumed ONLY by crates/graph.
-oxc_allocator = "0.134"
-oxc_ast = "0.134"
-oxc_parser = "0.134"
-oxc_semantic = "0.134"
-oxc_span = "0.134"
-oxc_diagnostics = "0.134"
+oxc_allocator = "0.137"
+oxc_ast = "0.137"
+oxc_parser = "0.137"
+oxc_semantic = "0.137"
+oxc_span = "0.137"
+oxc_diagnostics = "0.137"
 # Safe self-referential storage for the FileId hot path.
 self_cell = "1"
 # Fast path interner map for the FileId hot path.
@@ -75,9 +79,13 @@ rustc-hash = "2"
 # incremental layer is hand-built behind GraphDb (see crates/graph/src/db.rs). A swap to
 # salsa later is contained behind the facade. oxc_transformer remains deferred; TOOL-001
 # pins oxc_codegen below for printing from this same AST generation.
+# === ADR-5 === tsc output parsing for meow-ui diagnostic rendering
+regex = "1"
+# === /ADR-5 ===
 # === /GRAPH-001 ===
 # === TOOL-001 ===
-oxc_codegen = "0.134"
+oxc_codegen = "0.137"
+oxc_transformer = "0.137"
 # === /TOOL-001 ===
 # === RT-003 ===
 # Position-preserving type-stripping (CANON §9, I-3) walks the stage-1 Oxc AST and
@@ -85,7 +93,7 @@ oxc_codegen = "0.134"
 # AST visitor (traversal only). RT-003 does not consume oxc_transformer/oxc_codegen:
 # it blanks spans in-place to preserve byte positions and avoid sourcemaps. TOOL-001
 # owns the oxc_codegen printer pin above.
-oxc_ast_visit = "0.134"
+oxc_ast_visit = "0.137"
 # === /RT-003 ===
 # === RT-004 ===
 # strict-web Stateless-Edge globals (CANON §8.1). Unmodified upstream Deno web

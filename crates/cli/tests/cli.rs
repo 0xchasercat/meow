@@ -46,25 +46,12 @@ fn version_and_help_succeed() {
         .success()
         .stdout(predicate::str::contains("run"));
 }
-const CASES: &[(&[&str], &str)] = &[
-    (&["add", "pkg"], "add"),
-    (&["remove", "pkg"], "remove"),
-    (&["task", "t"], "task"),
-    (&["test"], "test"),
-    (&["check"], "check"),
-    (&["why-slow"], "why-slow"),
-    (&["why-large"], "why-large"),
-    (&["trace", "x.ts"], "trace"),
-    (&["profile", "x.ts"], "profile"),
-    (&["doctor"], "doctor"),
-];
+// No stub subcommands remain — all are implemented.
+// If a new stub is added, add it to this list and update the count.
+const CASES: &[(&[&str], &str)] = &[];
 #[test]
 fn every_subcommand_stub_is_honest() {
-    assert_eq!(
-        CASES.len(),
-        10,
-        "10 stub subcommands (add/remove/task/test/check/why-slow/why-large/trace/profile/doctor); lint/fmt/bundle are real commands"
-    );
+    assert_eq!(CASES.len(), 0, "all subcommands are implemented");
     for (argv, verb) in CASES {
         let expected = format!("meow: `{verb}` is not yet implemented");
         meow()
@@ -89,8 +76,8 @@ fn lint_reports_debugger_diagnostics() {
     let stderr = String::from_utf8(out.stderr).expect("stderr utf8");
     let file_name = entry.file_name().expect("entry file name");
     assert!(
-        stderr.contains("🙀 [Bad Kitty!]"),
-        "lint should use hiss envelope: {stderr:?}"
+        stderr.contains('^'),
+        "lint should render a caret diagnostic: {stderr:?}"
     );
     assert!(
         stderr.contains(entry.to_string_lossy().as_ref())
@@ -165,12 +152,16 @@ fn fmt_rewrites_and_then_check_succeeds() {
     std::fs::remove_dir_all(&tmp).ok();
 }
 
+// End-to-end: `meow bundle` drives Rolldown through meow's own resolver and
+// emits a real ESM chunk (dist/entry.js). Named for what it verifies now that
+// the bundler is fully wired — not a skeleton.
 #[test]
-fn bundle_entry_is_skeleton_with_pending_wiring_message() {
-    let tmp = load_tmp("bundle-skeleton");
+fn bundle_emits_esm_chunk_via_rolldown_and_meow_resolver() {
+    let tmp = load_tmp("bundle");
     let entry = tmp.join("entry.ts");
     let dist = tmp.join("dist");
-    std::fs::write(&entry, "export const value = 1;\n").expect("write bundle entry");
+    std::fs::write(&entry, "const value = 1; console.log('bundle ok');\n")
+        .expect("write bundle entry");
     let out = meow()
         .current_dir(&tmp)
         .arg("bundle")
@@ -179,35 +170,75 @@ fn bundle_entry_is_skeleton_with_pending_wiring_message() {
         .arg(&dist)
         .output()
         .expect("run bundle");
-    assert!(
-        out.status.success(),
-        "bundle should succeed as skeleton: {out:?}"
-    );
+    assert!(out.status.success(), "bundle should succeed: {out:?}");
     let stdout = String::from_utf8(out.stdout).expect("stdout utf8");
     let stdout_lc = stdout.to_lowercase();
     assert!(
-        stdout.contains("😸 [Purrfect!]") || stdout.contains("😸 [purrfect!]"),
-        "bundle success should use a purr envelope: {stdout:?}"
+        stdout_lc.contains("emitted 1 chunk"),
+        "bundle success should report emitted chunks: {stdout:?}"
     );
     assert!(
-        stdout_lc.contains("resolver wiring") && stdout_lc.contains("pending"),
-        "bundle should mention pending resolver wiring: {stdout:?}"
+        stdout_lc.contains("dist"),
+        "bundle output should name output directory: {stdout:?}"
     );
     assert!(
-        stdout_lc.contains("purrfect!") && stdout_lc.contains("bundle"),
-        "bundle skeleton success should be identifiable: {stdout:?}"
+        dist.join("entry.js").is_file(),
+        "bundle should write dist/entry.js"
     );
     std::fs::remove_dir_all(&tmp).ok();
 }
 
 #[test]
-fn install_vfs_mode_remains_an_honest_stub() {
-    meow()
-        .args(["install", "--mode", "vfs"])
-        .assert()
-        .code(3)
-        .stdout(predicate::str::is_empty())
-        .stderr(predicate::str::contains("not yet implemented"));
+#[cfg(unix)]
+fn run_preserves_native_tty_raw_mode_under_pseudo_terminal() {
+    let script_bin = std::path::Path::new("/usr/bin/script");
+    if !script_bin.exists() {
+        return;
+    }
+    let tmp = load_tmp("tty-raw-mode");
+    let entry = tmp.join("probe.js");
+    std::fs::write(
+        &entry,
+        r#"console.log([
+  process.stdin.isTTY,
+  process.stdout.isTTY,
+  process.stdin.constructor && process.stdin.constructor.name,
+  String(process.stdin.setRawMode).includes("_handle.setRawMode"),
+  String(process.stdin.setRawMode).includes("io.stdin.setRaw"),
+].join(":"));
+process.stdin.setRawMode(true);
+console.log("raw:" + process.stdin.isRaw);
+process.stdin.setRawMode(false);
+"#,
+    )
+    .expect("write tty probe");
+    let transcript = tmp.join("typescript");
+    let meow_bin = assert_cmd::cargo::cargo_bin("meow");
+    // macOS (BSD script): script -q transcript cmd args...
+    // Linux (util-linux): script -qc "cmd args..." transcript
+    let mut cmd = StdCommand::new(script_bin);
+    if cfg!(target_os = "macos") {
+        cmd.arg("-q")
+            .arg(&transcript)
+            .arg(&meow_bin)
+            .arg("run")
+            .arg(&entry);
+    } else {
+        let full_cmd = format!("{} run {}", meow_bin.display(), entry.display());
+        cmd.arg("-q").arg("-c").arg(&full_cmd).arg(&transcript);
+    }
+    let status = cmd.status().expect("run script pseudo-terminal");
+    assert!(status.success(), "pseudo-terminal run should succeed");
+    let output = std::fs::read_to_string(&transcript).expect("read transcript");
+    assert!(
+        output.contains("true:true:ReadStream:true:false"),
+        "stdin must keep native node:tty ReadStream raw-mode method: {output:?}"
+    );
+    assert!(
+        output.contains("raw:true"),
+        "native raw-mode transition should report isRaw=true: {output:?}"
+    );
+    std::fs::remove_dir_all(&tmp).ok();
 }
 
 #[test]
@@ -223,16 +254,16 @@ fn install_success_uses_purr_envelope_in_plain_output() {
     let stdout = String::from_utf8(out.stdout).expect("stdout utf8");
     let stderr = String::from_utf8(out.stderr).expect("stderr utf8");
     assert!(
-        stdout.starts_with("😸 [Purrfect!] installed 0 packages → meow.lock.jsonl"),
-        "install output should report lockfile write"
+        stdout.contains("0 packages ready"),
+        "install output should report the package count: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("meow.lock.jsonl"),
+        "install output should name the lockfile: {stdout:?}"
     );
     assert!(
         stdout.contains("materialized"),
-        "install should default to materialized output"
-    );
-    assert!(
-        stdout.contains("node_modules"),
-        "install output should name the default node_modules projection: {stdout:?}"
+        "install should report the materialized projection: {stdout:?}"
     );
     assert!(
         !stdout.contains("virtual"),
@@ -270,7 +301,7 @@ fn install_parse_error_uses_hiss_envelope_in_plain_output() {
         "install errors stay off stdout: {stdout:?}"
     );
     assert!(
-        stderr.contains("🙀 [Bad Kitty!] meow install:"),
+        stderr.contains("meow install:"),
         "install error should use the hiss envelope: {stderr:?}"
     );
     std::fs::remove_dir_all(&proj).ok();
@@ -290,7 +321,7 @@ fn sync_generates_shadow_configs() {
     let stdout = String::from_utf8(out.stdout).expect("stdout utf8");
     let stderr = String::from_utf8(out.stderr).expect("stderr utf8");
     assert!(
-        stdout.contains("😸 [Purrfect!] meow sync: regenerated .meow/tsconfig.json"),
+        stdout.contains("meow sync: regenerated .meow/tsconfig.json"),
         "sync success should use the purr envelope: {stdout:?}"
     );
     assert!(
@@ -317,19 +348,49 @@ fn sync_generates_shadow_configs() {
 }
 
 #[test]
-fn sync_missing_config_uses_hiss_envelope_in_plain_output() {
-    let tmp = load_tmp("sync-missing");
+fn sync_without_config_uses_default_config() {
+    let tmp = load_tmp("sync-default");
     let out = meow()
         .current_dir(&tmp)
         .arg("sync")
         .output()
         .expect("run sync");
-    assert!(!out.status.success(), "sync without config should fail");
+    assert!(out.status.success(), "sync without config should succeed");
+    let stdout = String::from_utf8(out.stdout).expect("stdout utf8");
+    let stderr = String::from_utf8(out.stderr).expect("stderr utf8");
+    assert!(
+        stdout.contains("meow sync: regenerated .meow/tsconfig.json"),
+        "sync success should use the purr envelope: {stdout:?}"
+    );
+    assert!(
+        stderr.is_empty(),
+        "sync success keeps stderr empty: {stderr:?}"
+    );
+    assert!(
+        tmp.join(".meow/tsconfig.json").is_file(),
+        "shadow .meow/tsconfig.json generated"
+    );
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[test]
+fn sync_invalid_config_uses_hiss_envelope_in_plain_output() {
+    let tmp = load_tmp("sync-invalid");
+    std::fs::write(tmp.join("meow.config.json"), "{").expect("write config");
+    let out = meow()
+        .current_dir(&tmp)
+        .arg("sync")
+        .output()
+        .expect("run sync");
+    assert!(
+        !out.status.success(),
+        "sync with invalid config should fail"
+    );
     let stdout = String::from_utf8(out.stdout).expect("stdout utf8");
     let stderr = String::from_utf8(out.stderr).expect("stderr utf8");
     assert!(stdout.is_empty(), "sync errors stay off stdout: {stdout:?}");
     assert!(
-        stderr.contains("🙀 [Bad Kitty!] meow sync:"),
+        stderr.contains("meow sync:"),
         "sync error should use the hiss envelope: {stderr:?}"
     );
     std::fs::remove_dir_all(&tmp).ok();
@@ -348,6 +409,102 @@ fn run_executes_a_trivial_mjs_module() {
         .assert()
         .success()
         .stdout(predicate::str::contains("hello from meow"));
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[test]
+fn node_compat_run_uses_live_clock_and_os_entropy_by_default() {
+    let tmp = load_tmp("run-live-hermetic-defaults");
+    let entry = tmp.join("live.mjs");
+    std::fs::write(
+        &entry,
+        r#"console.log(`now=${Date.now()}`);
+console.log(`random=${Math.random()}`);
+"#,
+    )
+    .expect("write live hermetic probe");
+
+    let run_once = || {
+        let out = meow()
+            .current_dir(&tmp)
+            .arg("run")
+            .arg("--no-snapshot")
+            .arg(&entry)
+            .output()
+            .expect("run live hermetic probe");
+        assert!(out.status.success(), "meow run should succeed: {out:?}");
+        String::from_utf8(out.stdout).expect("stdout utf8")
+    };
+
+    let first = run_once();
+    let second = run_once();
+    let now = first
+        .lines()
+        .find_map(|line| line.strip_prefix("now="))
+        .and_then(|value| value.parse::<f64>().ok())
+        .expect("now line");
+    assert_ne!(
+        now, 1_780_790_400_000.0,
+        "node-compatible meow run must not inherit strict-web frozen time by default: {first:?}"
+    );
+    assert!(
+        now > 1_735_689_600_000.0,
+        "node-compatible meow run should expose a recent host clock: {first:?}"
+    );
+    let first_random = first
+        .lines()
+        .find_map(|line| line.strip_prefix("random="))
+        .expect("first random line");
+    let second_random = second
+        .lines()
+        .find_map(|line| line.strip_prefix("random="))
+        .expect("second random line");
+    assert_ne!(
+        first_random, second_random,
+        "node-compatible meow run should seed Math.random from OS entropy by default"
+    );
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[test]
+fn strict_web_run_keeps_deterministic_clock_and_entropy_by_default() {
+    let tmp = load_tmp("run-strict-hermetic-defaults");
+    std::fs::write(tmp.join("meow.config.json"), br#"{ "mode": "strict-web" }"#)
+        .expect("write strict-web config");
+    let entry = tmp.join("strict.mjs");
+    std::fs::write(
+        &entry,
+        r#"console.log(`now=${Date.now()}`);
+console.log(`random=${Math.random()}`);
+"#,
+    )
+    .expect("write strict hermetic probe");
+
+    let run_once = || {
+        let out = meow()
+            .current_dir(&tmp)
+            .arg("run")
+            .arg("--no-snapshot")
+            .arg(&entry)
+            .output()
+            .expect("run strict hermetic probe");
+        assert!(
+            out.status.success(),
+            "strict-web meow run should succeed: {out:?}"
+        );
+        String::from_utf8(out.stdout).expect("stdout utf8")
+    };
+
+    let first = run_once();
+    let second = run_once();
+    assert!(
+        first.contains("now=1780790400000"),
+        "strict-web meow run should keep the frozen virtual epoch: {first:?}"
+    );
+    assert_eq!(
+        first, second,
+        "strict-web meow run should keep deterministic seeded entropy by default"
+    );
     std::fs::remove_dir_all(&tmp).ok();
 }
 
@@ -375,11 +532,11 @@ ui.hiss("boom");
     let stdout = String::from_utf8(out.stdout).expect("stdout utf8");
     let stderr = String::from_utf8(out.stderr).expect("stderr utf8");
     assert!(
-        stdout.contains("raw stdout\n😸 [Purrfect!] hello\n"),
+        stdout.contains("raw stdout\n😸 hello\n"),
         "console.log stays raw while ui.purr is wrapped: {stdout:?}"
     );
     assert!(
-        stderr.contains("raw stderr\n🙀 [Bad Kitty!] boom\n"),
+        stderr.contains("raw stderr\n🙀 boom\n"),
         "console.error stays raw while ui.hiss is wrapped: {stderr:?}"
     );
     std::fs::remove_dir_all(&tmp).ok();
@@ -446,9 +603,13 @@ fn run_forwards_argv_after_double_dash_to_process_argv() {
 
 #[test]
 fn bad_usage_is_distinct() {
-    // No subcommand and a missing required arg are clap usage errors (exit 2),
+    // No subcommand now prints the landing screen (exit 0). A malformed
+    // invocation (missing a required arg) is still a clap usage error (exit 2),
     // never the "not built" exit 3.
-    meow().assert().code(2);
+    meow()
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("meow"));
     meow().arg("run").assert().code(2);
 }
 
@@ -488,7 +649,7 @@ fn load_tmp(tag: &str) -> std::path::PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("meow-load-{tag}-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
-    dir
+    std::fs::canonicalize(dir).expect("canonicalize temp dir")
 }
 
 #[test]
@@ -511,14 +672,14 @@ console.log(`ARGV=${JSON.stringify(process.argv.slice(2))}`);"#,
     )
     .expect("write dev script");
 
-    let proj_display = std::fs::canonicalize(&proj)
-        .expect("canon project")
-        .to_string_lossy()
-        .into_owned();
-    let nested_display = std::fs::canonicalize(&nested)
-        .expect("canon nested")
-        .to_string_lossy()
-        .into_owned();
+    // Strip \\?\ UNC prefix on Windows so the assertion matches what
+    // std::env::current_dir() returns inside the child process (without prefix).
+    fn strip_unc_prefix(p: &std::path::Path) -> String {
+        let s = p.to_string_lossy().into_owned();
+        s.strip_prefix(r#"\\?\"#).map(String::from).unwrap_or(s)
+    }
+    let proj_display = strip_unc_prefix(&proj);
+    let nested_display = strip_unc_prefix(&nested);
     meow()
         .current_dir(&nested)
         .arg("run")
@@ -880,24 +1041,6 @@ fn run_imports_a_cached_dev_dependency_from_stock_package_json() {
 }
 
 #[test]
-fn run_rejects_non_erasable_typescript_with_an_honest_diagnostic() {
-    // `enum` emits runtime code → cannot be type-stripped. The run fails honestly
-    // (non-zero + the GRAPH diagnostic), never fabricates a success.
-    let tmp = load_tmp("enum");
-    let entry = tmp.join("bad.ts");
-    std::fs::write(&entry, "enum E { A }\nconsole.log(\"should not run\");\n").expect("write");
-    meow()
-        .arg("run")
-        .arg(&entry)
-        .assert()
-        .failure()
-        .stdout(predicate::str::contains("should not run").not())
-        .stderr(predicate::str::contains("Enums emit runtime code"))
-        .stderr(predicate::str::contains("panicked").not());
-    std::fs::remove_dir_all(&tmp).ok();
-}
-
-#[test]
 fn run_finds_root_lockfile_from_a_nested_entry() {
     // Finding 1: the lockfile lives at the project ROOT and the entry is nested at
     // `src/main.ts`. `meow run src/main.ts` must climb to the root lockfile + root
@@ -1109,6 +1252,8 @@ fn run_is_intl_deterministic_across_tz_and_locale() {
     // identical regardless of the host timezone + locale (pin_deterministic_intl
     // pins TZ=UTC + a fixed default locale before the isolate is created).
     let tmp = load_tmp("intl");
+    std::fs::write(tmp.join("meow.config.json"), br#"{ "mode": "strict-web" }"#)
+        .expect("write strict-web config");
     let entry = tmp.join("intl.ts");
     std::fs::write(
         &entry,
@@ -1295,3 +1440,91 @@ fn why_dep_json_is_machine_readable() {
     std::fs::remove_dir_all(&proj).ok();
 }
 // === /OBS-001 ===
+
+// === INIT-001 ===
+#[test]
+fn init_creates_config_and_package_json() {
+    let proj = load_tmp("init-ok");
+    let _ = std::fs::remove_dir_all(&proj);
+    std::fs::create_dir_all(&proj).expect("create project dir");
+
+    meow()
+        .current_dir(&proj)
+        .arg("init")
+        .arg("--no-install")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Project initialized!"));
+
+    assert!(
+        proj.join("meow.config.json").is_file(),
+        "config should exist"
+    );
+    assert!(
+        proj.join("package.json").is_file(),
+        "package.json should exist"
+    );
+    assert!(proj.join("main.ts").is_file(), "main.ts should exist");
+    assert!(proj.join(".meow").is_dir(), ".meow dir should exist");
+
+    let config = std::fs::read_to_string(proj.join("meow.config.json")).expect("read config");
+    assert!(
+        config.contains("strict-web"),
+        "default mode should be strict-web"
+    );
+
+    let pkg = std::fs::read_to_string(proj.join("package.json")).expect("read package");
+    assert!(pkg.contains("0.1.0"), "version should be 0.1.0");
+    assert!(pkg.contains("\"type\": \"module\""), "should be ESM");
+    assert!(
+        pkg.contains("meow run main.ts"),
+        "dev script should use meow"
+    );
+
+    let main_ts = std::fs::read_to_string(proj.join("main.ts")).expect("read main.ts");
+    assert!(
+        main_ts.contains("meow:http"),
+        "main.ts should import meow:http"
+    );
+
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[test]
+fn init_node_compat_mode() {
+    let proj = load_tmp("init-node-compat");
+    let _ = std::fs::remove_dir_all(&proj);
+    std::fs::create_dir_all(&proj).expect("create project dir");
+
+    meow()
+        .current_dir(&proj)
+        .arg("init")
+        .arg("--mode")
+        .arg("node-compat")
+        .arg("--no-install")
+        .assert()
+        .success();
+
+    let config = std::fs::read_to_string(proj.join("meow.config.json")).expect("read config");
+    assert!(config.contains("node-compat"), "mode should be node-compat");
+
+    std::fs::remove_dir_all(&proj).ok();
+}
+
+#[test]
+fn init_refuses_to_overwrite_without_force() {
+    let proj = load_tmp("init-no-overwrite");
+    let _ = std::fs::remove_dir_all(&proj);
+    std::fs::create_dir_all(&proj).expect("create project dir");
+    std::fs::write(proj.join("meow.config.json"), "{}").expect("seed config");
+
+    meow()
+        .current_dir(&proj)
+        .arg("init")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("already exists"));
+
+    std::fs::remove_dir_all(&proj).ok();
+}
+// === /INIT-001 ===

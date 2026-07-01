@@ -12,6 +12,7 @@ const MARKER_NAME: &str = ".unpacked";
 /// Archives still live in [`Cache`]; this store projects a verified blob onto disk
 /// once at `<root>/<algo>-<hex>/` so editor tooling can traverse real files
 /// without a project-local `node_modules` tree.
+#[derive(Clone)]
 pub struct UnpackedStore {
     root: PathBuf,
     cache: Arc<Cache>,
@@ -35,6 +36,55 @@ impl UnpackedStore {
 
     pub fn dir_for(&self, integrity: &ContentHash) -> PathBuf {
         self.root.join(integrity.to_url_host())
+    }
+
+    pub async fn ensure_async(&self, integrity: &ContentHash) -> Result<PathBuf, MaterializeError> {
+        let dir = self.dir_for(integrity);
+        if marker_path(&dir).is_file() {
+            return Ok(dir);
+        }
+
+        fs::create_dir_all(&self.root)
+            .map_err(|source| MaterializeError::io(&self.root, source))?;
+        if dir.exists() {
+            remove_best_effort(&dir);
+        }
+
+        let bytes = self
+            .cache
+            .read(integrity)
+            .map_err(|source| MaterializeError::CacheBlob {
+                hash: integrity.to_sri(),
+                source,
+            })?;
+
+        let tmp = tmp_path(&dir);
+        remove_best_effort(&tmp);
+        let tmp_for_unpack = tmp.clone();
+        let extracted = tokio::task::spawn_blocking(move || {
+            archive::unpack_to(&bytes, &tmp_for_unpack)?;
+            let marker = marker_path(&tmp_for_unpack);
+            fs::write(&marker, []).map_err(|source| MaterializeError::io(&marker, source))?;
+            Ok::<(), MaterializeError>(())
+        })
+        .await
+        .map_err(|err| MaterializeError::blocking_task("unpack package", err))?;
+        if let Err(err) = extracted {
+            remove_best_effort(&tmp);
+            return Err(err);
+        }
+
+        match fs::rename(&tmp, &dir) {
+            Ok(()) => Ok(dir),
+            Err(_source) if marker_path(&dir).is_file() => {
+                remove_best_effort(&tmp);
+                Ok(dir)
+            }
+            Err(source) => {
+                remove_best_effort(&tmp);
+                Err(MaterializeError::io(&dir, source))
+            }
+        }
     }
 
     pub fn ensure(&self, integrity: &ContentHash) -> Result<PathBuf, MaterializeError> {

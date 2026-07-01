@@ -18,20 +18,42 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::OnceLock;
+
+use tokio::sync::Semaphore;
+
+const FS_PERMITS: usize = 256;
+
+fn fs_semaphore() -> &'static Semaphore {
+    static SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
+    SEMAPHORE.get_or_init(|| Semaphore::new(FS_PERMITS))
+}
 
 /// Read an entire file into memory off the V8 thread (tokio's blocking pool).
 /// Returns the raw bytes; the caller maps the `io::Error` to a typed op error.
 pub async fn read_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    let _permit = fs_semaphore()
+        .acquire()
+        .await
+        .expect("filesystem semaphore closed");
     tokio::fs::read(path).await
 }
 
 /// Write an entire file off the V8 thread.
 pub async fn write_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let _permit = fs_semaphore()
+        .acquire()
+        .await
+        .expect("filesystem semaphore closed");
     tokio::fs::write(path, bytes).await
 }
 
 /// Read directory entry names. Sorted for deterministic tests.
 pub async fn read_dir(path: &Path) -> std::io::Result<Vec<String>> {
+    let _permit = fs_semaphore()
+        .acquire()
+        .await
+        .expect("filesystem semaphore closed");
     let mut dir = tokio::fs::read_dir(path).await?;
     let mut entries = Vec::new();
     while let Some(entry) = dir.next_entry().await? {
@@ -43,6 +65,10 @@ pub async fn read_dir(path: &Path) -> std::io::Result<Vec<String>> {
 
 /// Metadata for a path.
 pub async fn stat(path: &Path) -> std::io::Result<std::fs::Metadata> {
+    let _permit = fs_semaphore()
+        .acquire()
+        .await
+        .expect("filesystem semaphore closed");
     tokio::fs::metadata(path).await
 }
 

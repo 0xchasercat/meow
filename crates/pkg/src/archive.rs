@@ -2,11 +2,13 @@ use std::fs;
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use flate2::read::GzDecoder;
 
-use crate::materialize::{MaterializeError, DIR_MODE, EXEC_MODE, FILE_MODE};
+#[cfg(test)]
+use crate::materialize::DIR_MODE;
+use crate::materialize::{MaterializeError, EXEC_MODE, FILE_MODE};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnpackStats {
@@ -71,7 +73,16 @@ pub fn unpack_to(bytes: &[u8], dest: &Path) -> Result<UnpackStats, MaterializeEr
             written += read as u64;
         }
         let mode = normalized_file_mode(&entry)?;
-        normalize_path(&out, mode)?;
+        // Only set permissions for executable files (bin scripts). Skip
+        // normalize_path (utimensat + chmod) for every file — the per-file
+        // cost of 2 syscalls across thousands of files dominates cold installs.
+        if mode == EXEC_MODE {
+            #[cfg(unix)]
+            {
+                fs::set_permissions(&out, fs::Permissions::from_mode(EXEC_MODE))
+                    .map_err(|source| MaterializeError::io(&out, source))?;
+            }
+        }
         stats.files += 1;
         stats.bytes += written;
     }
@@ -80,33 +91,32 @@ pub fn unpack_to(bytes: &[u8], dest: &Path) -> Result<UnpackStats, MaterializeEr
 }
 
 fn normalize_member(path: &Path) -> Result<Option<PathBuf>, MaterializeError> {
-    // npm tarballs wrap their files in a single top-level directory. It is usually
-    // "package/", but some packages use a different name (e.g. @types/node ships under
-    // "node vX.Y/"). Strip exactly one leading directory regardless of its name, the same
-    // way npm/pnpm/yarn do, instead of requiring the literal "package/" prefix (which
-    // silently skipped every entry -> empty unpack -> missing package.json).
-    let mut components = path.components();
-    let mut first = components.next();
-    if matches!(first, Some(Component::CurDir)) {
-        first = components.next();
+    // Tar member names are POSIX paths regardless of the host OS. Do not use
+    // `Path::components()` here: on Windows it can interpret archive member text
+    // with host semantics and silently fail to reproduce npm's package/ stripping.
+    // Normalize as slash-separated archive data, then build a host PathBuf only
+    // after validating every segment.
+    let raw = path.to_string_lossy().replace('\\', "/");
+    if raw.starts_with('/') || raw.contains(':') {
+        return Err(MaterializeError::unsafe_member(path.display().to_string()));
     }
-    match first {
-        Some(Component::Normal(_)) => {}
-        Some(Component::RootDir | Component::Prefix(_) | Component::ParentDir) => {
-            return Err(MaterializeError::unsafe_member(path.display().to_string()));
-        }
-        _ => return Ok(None),
+
+    let mut parts = raw
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".");
+    let Some(first) = parts.next() else {
+        return Ok(None);
+    };
+    if first == ".." {
+        return Err(MaterializeError::unsafe_member(path.display().to_string()));
     }
 
     let mut out = PathBuf::new();
-    for component in components {
-        match component {
-            Component::Normal(part) => out.push(part),
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(MaterializeError::unsafe_member(path.display().to_string()));
-            }
+    for part in parts {
+        if part == ".." {
+            return Err(MaterializeError::unsafe_member(path.display().to_string()));
         }
+        out.push(part);
     }
     if out.as_os_str().is_empty() {
         return Ok(None);
@@ -130,24 +140,7 @@ fn ensure_dir(path: &Path) -> Result<(), MaterializeError> {
     if path.as_os_str().is_empty() {
         return Ok(());
     }
-    fs::create_dir_all(path).map_err(|source| MaterializeError::io(path, source))?;
-    normalize_path(path, DIR_MODE)
-}
-
-fn normalize_path(path: &Path, mode: u32) -> Result<(), MaterializeError> {
-    #[cfg(unix)]
-    {
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))
-            .map_err(|source| MaterializeError::io(path, source))?;
-    }
-    set_fixed_times(path)
-}
-
-fn set_fixed_times(path: &Path) -> Result<(), MaterializeError> {
-    let file = fs::File::open(path).map_err(|source| MaterializeError::io(path, source))?;
-    let fixed = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
-    file.set_times(fs::FileTimes::new().set_accessed(fixed).set_modified(fixed))
-        .map_err(|source| MaterializeError::io(path, source))
+    fs::create_dir_all(path).map_err(|source| MaterializeError::io(path, source))
 }
 
 #[cfg(test)]

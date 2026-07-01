@@ -1,13 +1,16 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{BTreeMap, HashSet, VecDeque},
     fs, io,
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
 
-use meow_graph::{GraphDb, SourceType};
-use oxc_codegen::Codegen;
+use meow_graph::{GraphDb, SemanticGraph, SourceType};
+use meow_loader::Resolver;
+use oxc_ast::AstKind;
+use oxc_codegen::{Codegen, CodegenOptions, CommentOptions};
 use oxc_diagnostics::OxcDiagnostic;
+use oxc_span::Span;
 
 #[derive(Debug)]
 pub struct ToolDiagnostic {
@@ -18,17 +21,34 @@ pub struct ToolDiagnostic {
     pub label: Option<String>,
 }
 
+/// Severity for a lint rule, resolved from `meow.config.json` `lint.rules`
+/// (falling back to the recommended default per rule).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LintSeverity {
+    Off,
+    Warn,
+    Error,
+}
+
 pub struct LintReport {
     pub checked: usize,
     pub diagnostics: Vec<ToolDiagnostic>,
+    /// True if any error-severity diagnostic fired (a rule set to `error`, or a
+    /// parse/semantic error). `meow lint` exits non-zero on this; warnings pass.
+    pub had_error: bool,
 }
 
-pub fn lint_paths(root: &Path, paths: &[PathBuf]) -> Result<LintReport, ToolError> {
+pub fn lint_paths(
+    root: &Path,
+    paths: &[PathBuf],
+    severities: &BTreeMap<String, LintSeverity>,
+) -> Result<LintReport, ToolError> {
     let files = collect_targets(root, paths)?;
     let mut db = GraphDb::new();
     let mut report = LintReport {
         checked: files.len(),
         diagnostics: Vec::new(),
+        had_error: false,
     };
 
     for path in files {
@@ -46,9 +66,14 @@ pub fn lint_paths(root: &Path, paths: &[PathBuf]) -> Result<LintReport, ToolErro
                 reason: "missing semantic stage after CST insertion",
             })?;
 
+        // Parse + semantic errors are always hard errors (fail the run).
+        let before = report.diagnostics.len();
         append_diagnostics(&path, &source, cst.errors(), &mut report.diagnostics);
         append_diagnostics(&path, &source, semantic.errors(), &mut report.diagnostics);
-        append_starter_lints(&path, &source, &mut report.diagnostics);
+        if report.diagnostics.len() != before {
+            report.had_error = true;
+        }
+        append_ast_lints(&path, &source, semantic, severities, &mut report);
 
         if cst.panicked() {
             report.diagnostics.push(ToolDiagnostic {
@@ -58,6 +83,7 @@ pub fn lint_paths(root: &Path, paths: &[PathBuf]) -> Result<LintReport, ToolErro
                 message: "parser panic while parsing file".to_string(),
                 label: None,
             });
+            report.had_error = true;
         }
     }
 
@@ -113,8 +139,24 @@ pub fn format_paths(
             continue;
         }
 
+        // Format via the Oxc code printer (meow's documented formatter). Pass the
+        // source text + enable comment emission so comments are PRESERVED (the
+        // printer drops them otherwise -- it needs the source to slice comment
+        // text). Canonical codegen formatting, not Prettier-grade, but comment-safe.
         let formatted = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            Codegen::new().build(cst.program()).code
+            Codegen::new()
+                .with_source_text(&source)
+                .with_options(CodegenOptions {
+                    comments: CommentOptions {
+                        normal: true,
+                        jsdoc: true,
+                        annotation: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .build(cst.program())
+                .code
         })) {
             Ok(formatted) => formatted,
             Err(err) => {
@@ -179,6 +221,223 @@ pub fn plan_bundle(
     })
 }
 
+#[derive(Debug, Clone)]
+pub struct BundleReport {
+    pub out_dir: PathBuf,
+    pub emitted: Vec<PathBuf>,
+}
+
+struct MeowResolverPlugin {
+    resolver: Resolver,
+}
+
+impl std::fmt::Debug for MeowResolverPlugin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MeowResolverPlugin").finish_non_exhaustive()
+    }
+}
+
+impl MeowResolverPlugin {
+    fn new(resolver: Resolver) -> Self {
+        Self { resolver }
+    }
+
+    fn referrer_url(&self, importer: Option<&str>) -> Result<deno_core::url::Url, ToolError> {
+        let Some(importer) = importer else {
+            return Ok(self.resolver.project_root().clone());
+        };
+
+        if let Ok(url) = deno_core::url::Url::parse(importer) {
+            return Ok(url);
+        }
+
+        let path = Path::new(importer);
+        let abs = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.resolver
+                .project_root()
+                .to_file_path()
+                .unwrap_or_default()
+                .join(path)
+        };
+        deno_core::url::Url::from_file_path(&abs).map_err(|()| {
+            ToolError::Message(format!(
+                "rolldown importer is not a valid path or URL: {importer}"
+            ))
+        })
+    }
+
+    fn module_type(path: &Path) -> rolldown_common::ModuleType {
+        match path.extension().and_then(|ext| ext.to_str()) {
+            Some("jsx") => rolldown_common::ModuleType::Jsx,
+            Some("ts") | Some("mts") | Some("cts") => rolldown_common::ModuleType::Ts,
+            Some("tsx") => rolldown_common::ModuleType::Tsx,
+            Some("json") => rolldown_common::ModuleType::Json,
+            _ => rolldown_common::ModuleType::Js,
+        }
+    }
+}
+
+impl rolldown_plugin::Plugin for MeowResolverPlugin {
+    fn name(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("rolldown-plugin-meow-resolver")
+    }
+
+    fn resolve_id(
+        &self,
+        _ctx: &rolldown_plugin::PluginContext,
+        args: &rolldown_plugin::HookResolveIdArgs<'_>,
+    ) -> impl std::future::Future<Output = rolldown_plugin::HookResolveIdReturn> + Send {
+        let result = (|| {
+            if args.specifier.starts_with("\0") {
+                return Ok(None);
+            }
+            if args.specifier.starts_with("node:")
+                || args.specifier.starts_with("meow:")
+                || args.specifier.starts_with("ext:")
+            {
+                return Ok(None);
+            }
+
+            let referrer = self.referrer_url(args.importer)?;
+            let resolved = self
+                .resolver
+                .resolve(args.specifier, &referrer)
+                .map_err(|err| {
+                    ToolError::Message(format!(
+                        "cannot resolve {} from {}: {err}",
+                        args.specifier, referrer
+                    ))
+                })?;
+            let path = resolved.url.to_file_path().map_err(|()| {
+                ToolError::Message(format!(
+                    "rolldown resolved {} to unsupported URL {}",
+                    args.specifier, resolved.url
+                ))
+            })?;
+
+            Ok(Some(rolldown_plugin::HookResolveIdOutput::from_id(
+                path.to_string_lossy().into_owned(),
+            )))
+        })()
+        .map_err(|err: ToolError| anyhow::anyhow!(err.to_string()));
+
+        async move { result }
+    }
+
+    fn load(
+        &self,
+        _ctx: rolldown_plugin::SharedLoadPluginContext,
+        args: &rolldown_plugin::HookLoadArgs<'_>,
+    ) -> impl std::future::Future<Output = rolldown_plugin::HookLoadReturn> + Send {
+        let result = (|| {
+            if args.id.starts_with("\0") {
+                return Ok(None);
+            }
+
+            let path = PathBuf::from(args.id);
+            if !path.is_absolute() || !path.is_file() || !is_target_file(&path) {
+                return Ok(None);
+            }
+
+            let source = fs::read_to_string(&path).map_err(|source| ToolError::Read {
+                path: path.clone(),
+                source,
+            })?;
+
+            Ok(Some(rolldown_plugin::HookLoadOutput {
+                code: source.into(),
+                map: None,
+                side_effects: None,
+                module_type: Some(Self::module_type(&path)),
+            }))
+        })()
+        .map_err(|err: ToolError| anyhow::anyhow!(err.to_string()));
+
+        async move { result }
+    }
+
+    fn register_hook_usage(&self) -> rolldown_plugin::HookUsage {
+        rolldown_plugin::HookUsage::ResolveId | rolldown_plugin::HookUsage::Load
+    }
+}
+
+pub async fn execute_bundle(
+    resolver: Resolver,
+    root: &Path,
+    entries: &[PathBuf],
+    out_dir: &Path,
+) -> Result<BundleReport, ToolError> {
+    if entries.is_empty() {
+        return Err(ToolError::NoBundleEntries);
+    }
+
+    fs::create_dir_all(out_dir).map_err(|source| ToolError::Write {
+        path: out_dir.to_path_buf(),
+        source,
+    })?;
+
+    let inputs = entries
+        .iter()
+        .map(|entry| {
+            let entry_abs = if entry.is_absolute() {
+                entry.clone()
+            } else {
+                root.join(entry)
+            };
+            let entry_abs = normalize_path(&entry_abs);
+            rolldown::InputItem {
+                name: entry_abs
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(ToOwned::to_owned),
+                import: entry_abs.to_string_lossy().into_owned(),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let options = rolldown::BundlerOptions {
+        input: Some(inputs),
+        cwd: Some(root.to_path_buf()),
+        dir: Some(out_dir.to_string_lossy().into_owned()),
+        platform: Some(rolldown::Platform::Node),
+        format: Some(rolldown::OutputFormat::Esm),
+        entry_filenames: Some(rolldown::ChunkFilenamesOutputOption::String(
+            "[name].js".into(),
+        )),
+        chunk_filenames: Some(rolldown::ChunkFilenamesOutputOption::String(
+            "chunks/[name]-[hash].js".into(),
+        )),
+        clean_dir: Some(true),
+        ..rolldown::BundlerOptions::default()
+    };
+
+    let plugin: std::sync::Arc<dyn rolldown_plugin::Pluginable> =
+        std::sync::Arc::new(MeowResolverPlugin::new(resolver));
+    let mut bundler = rolldown::Bundler::with_plugins(options, vec![plugin])
+        .map_err(|err| ToolError::Message(format!("rolldown initialization failed: {err}")))?;
+    let output = bundler
+        .write()
+        .await
+        .map_err(|err| ToolError::Message(format!("rolldown write failed: {err}")))?;
+    bundler
+        .close()
+        .await
+        .map_err(|err| ToolError::Message(format!("rolldown close failed: {err}")))?;
+
+    let emitted = output
+        .assets
+        .iter()
+        .map(|asset| out_dir.join(asset.filename()))
+        .collect();
+
+    Ok(BundleReport {
+        out_dir: out_dir.to_path_buf(),
+        emitted,
+    })
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
     #[error("failed to read {}: {source}", .path.display())]
@@ -216,6 +475,9 @@ pub enum ToolError {
 
     #[error("inconsistent graph state for {}: {reason}", .path.display())]
     InconsistentGraph { path: PathBuf, reason: &'static str },
+
+    #[error("{0}")]
+    Message(String),
 }
 
 fn read_source(path: &Path) -> Result<Arc<str>, ToolError> {
@@ -260,30 +522,8 @@ fn append_diagnostics(
     for diag in diagnostics {
         let message = diag.message.to_string();
 
-        if let Some(labels) = diag.labels.as_ref() {
-            if labels.is_empty() {
-                out.push(ToolDiagnostic {
-                    path: path.to_path_buf(),
-                    source: Arc::clone(source),
-                    span: (0, 0),
-                    message: message.clone(),
-                    label: None,
-                });
-            } else {
-                for label in labels {
-                    let start = label.offset();
-                    let len = label.len();
-                    let end = start.saturating_add(len);
-                    out.push(ToolDiagnostic {
-                        path: path.to_path_buf(),
-                        source: Arc::clone(source),
-                        span: (start, end),
-                        message: message.clone(),
-                        label: label.label().map(ToString::to_string),
-                    });
-                }
-            }
-        } else {
+        let labels = diag.labels.as_ref();
+        if labels.is_empty() {
             out.push(ToolDiagnostic {
                 path: path.to_path_buf(),
                 source: Arc::clone(source),
@@ -291,85 +531,129 @@ fn append_diagnostics(
                 message,
                 label: None,
             });
+            continue;
+        }
+
+        for label in labels {
+            let start: usize = label.offset().try_into().unwrap();
+            let len: usize = label.len().try_into().unwrap();
+            let end = start.saturating_add(len);
+            out.push(ToolDiagnostic {
+                path: path.to_path_buf(),
+                source: Arc::clone(source),
+                span: (start, end),
+                message: message.clone(),
+                label: label.label().map(ToString::to_string),
+            });
         }
     }
 }
 
-// Starter bridge until oxc_linter is available in this pinned Oxc generation.
-// This intentionally only scans source bytes for a small recommended-set subset.
-fn append_starter_lints(path: &Path, source: &Arc<str>, out: &mut Vec<ToolDiagnostic>) {
-    for (start, end) in scan_pattern(source.as_bytes(), b"debugger") {
-        out.push(ToolDiagnostic {
-            path: path.to_path_buf(),
-            source: Arc::clone(source),
-            span: (start, end),
-            message: "`debugger` statements are not allowed".to_string(),
-            label: Some("avoid debugger statements".to_string()),
-        });
-    }
+/// Real AST/semantic lints over the shared graph (I-1): each rule is a genuine
+/// node match on meow-graph's single parse, not a byte scan. This is the
+/// recommended default set; the rule ids match `meow.config.json` `lint.rules`
+/// so per-rule severities can gate them (see `cmd_lint`).
+fn append_ast_lints(
+    path: &Path,
+    source: &Arc<str>,
+    semantic: &SemanticGraph,
+    severities: &BTreeMap<String, LintSeverity>,
+    report: &mut LintReport,
+) {
+    // Common `console.*` methods flagged by `no-console`.
+    const CONSOLE_METHODS: [&str; 14] = [
+        "log", "warn", "error", "info", "debug", "trace", "dir", "table", "group", "groupEnd",
+        "count", "assert", "time", "timeEnd",
+    ];
 
-    let console_len = b"console.log".len();
-    for (start, end) in scan_pattern(source.as_bytes(), b"console.log") {
-        if start > 0 {
-            let prev = source.as_bytes()[start - 1];
-            if prev == b'.' {
-                continue;
+    for (_, node) in semantic.nodes().iter_enumerated() {
+        match node.kind() {
+            AstKind::DebuggerStatement(stmt) => emit_lint(
+                path,
+                source,
+                stmt.span,
+                "no-debugger",
+                "`debugger` statements are not allowed",
+                severities,
+                report,
+            ),
+            AstKind::VariableDeclaration(decl) if decl.kind.is_var() => emit_lint(
+                path,
+                source,
+                decl.span,
+                "no-var",
+                "`var` is not allowed; use `let` or `const`",
+                severities,
+                report,
+            ),
+            AstKind::BlockStatement(block) if block.body.is_empty() => emit_lint(
+                path,
+                source,
+                block.span,
+                "no-empty",
+                "empty block statement",
+                severities,
+                report,
+            ),
+            AstKind::CallExpression(call)
+                if CONSOLE_METHODS
+                    .iter()
+                    .any(|method| call.callee.is_specific_member_access("console", method)) =>
+            {
+                emit_lint(
+                    path,
+                    source,
+                    call.span,
+                    "no-console",
+                    "unexpected `console` statement",
+                    severities,
+                    report,
+                );
             }
+            _ => {}
         }
-
-        match source.as_bytes().get(start + console_len).copied() {
-            Some(b'(' | b' ' | b'\t' | b'\n' | b'\r' | b';') => {}
-            None => continue,
-            _ => continue,
-        }
-
-        out.push(ToolDiagnostic {
-            path: path.to_path_buf(),
-            source: Arc::clone(source),
-            span: (start, end),
-            message: "`console.log` calls are not recommended".to_string(),
-            label: Some("avoid console logging".to_string()),
-        });
     }
 }
 
-fn scan_pattern(source: &[u8], pattern: &[u8]) -> impl Iterator<Item = (usize, usize)> {
-    let mut out = Vec::new();
-    let mut index = 0usize;
-    while let Some(found) = find_from(source, pattern, index) {
-        if is_isolated_word(source, found, found + pattern.len()) {
-            out.push((found, found + pattern.len()));
-        }
-        index = found + 1;
+/// Emit a rule diagnostic at its resolved severity: `off` skips, `warn` reports
+/// (but the run still passes), `error` reports and marks the run failed. The rule
+/// id rides in `label`. Severity comes from `meow.config.json` `lint.rules`, else
+/// the recommended default.
+fn emit_lint(
+    path: &Path,
+    source: &Arc<str>,
+    span: Span,
+    rule: &str,
+    message: &str,
+    severities: &BTreeMap<String, LintSeverity>,
+    report: &mut LintReport,
+) {
+    let severity = severities
+        .get(rule)
+        .copied()
+        .unwrap_or_else(|| default_severity(rule));
+    if severity == LintSeverity::Off {
+        return;
     }
-
-    out.into_iter()
-}
-
-fn find_from(source: &[u8], needle: &[u8], start: usize) -> Option<usize> {
-    if needle.is_empty() || start >= source.len() {
-        return None;
+    report.diagnostics.push(ToolDiagnostic {
+        path: path.to_path_buf(),
+        source: Arc::clone(source),
+        span: (span.start as usize, span.end as usize),
+        message: message.to_string(),
+        label: Some(rule.to_string()),
+    });
+    if severity == LintSeverity::Error {
+        report.had_error = true;
     }
-
-    source
-        .windows(needle.len())
-        .enumerate()
-        .skip(start)
-        .find_map(|(index, window)| if window == needle { Some(index) } else { None })
 }
 
-fn is_isolated_word(source: &[u8], start: usize, end: usize) -> bool {
-    let before = start == 0 || !is_ident_byte(source[start - 1]);
-    let after = if end >= source.len() {
-        true
-    } else {
-        !is_ident_byte(source[end])
-    };
-    before && after
-}
-
-fn is_ident_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$'
+/// The recommended default severity when `lint.rules` doesn't set a rule.
+fn default_severity(rule: &str) -> LintSeverity {
+    match rule {
+        "no-debugger" => LintSeverity::Error,
+        "no-var" | "no-empty" | "no-console" => LintSeverity::Warn,
+        _ => LintSeverity::Off,
+    }
 }
 
 const TOOL_EXTENSIONS: [&str; 8] = ["js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx"];
@@ -566,7 +850,7 @@ Widget();
         dir
     }
 
-    fn jsx_js_file(tmp: &PathBuf) -> PathBuf {
+    fn jsx_js_file(tmp: &Path) -> PathBuf {
         let file = tmp.join("entry.js");
         std::fs::write(&file, JSX_JS_SOURCE).expect("write js fixture");
         file
@@ -602,8 +886,12 @@ Widget();
     fn format_paths_supports_js_with_directive_and_jsx() {
         let tmp = tmp_dir("fmt-jsx");
         let file = jsx_js_file(&tmp);
-        let report = format_paths(&tmp, &vec![file.clone()], FormatOptions { check: true })
-            .expect("format_paths should parse jsx js fixture");
+        let report = format_paths(
+            &tmp,
+            std::slice::from_ref(&file),
+            FormatOptions { check: true },
+        )
+        .expect("format_paths should parse jsx js fixture");
 
         assert_no_parser_blocking_diagnostics(&report.diagnostics);
         std::fs::remove_dir_all(&tmp).ok();
@@ -613,8 +901,12 @@ Widget();
     fn lint_paths_supports_js_with_directive_and_jsx() {
         let tmp = tmp_dir("lint-jsx");
         let file = jsx_js_file(&tmp);
-        let report =
-            lint_paths(&tmp, &vec![file.clone()]).expect("lint_paths should parse jsx js fixture");
+        let report = lint_paths(
+            &tmp,
+            std::slice::from_ref(&file),
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("lint_paths should parse jsx js fixture");
 
         assert_no_parser_blocking_diagnostics(&report.diagnostics);
         std::fs::remove_dir_all(&tmp).ok();

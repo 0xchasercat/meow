@@ -1,11 +1,15 @@
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, ErrorKind, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+#[cfg(windows)]
+use std::process::{Command, Stdio};
 use std::sync::Arc;
-use serde::{Deserialize, Serialize};
+
+use rayon::prelude::*;
 
 use crate::archive;
 use crate::{tmp_path, Cache, ContentHash, PackageName, ResolutionGraph, UnpackedStore, Version};
@@ -26,7 +30,7 @@ pub enum Projection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkStrategy {
-    Symlink,
+    EdgeLink,
     Copy,
     Auto,
 }
@@ -37,15 +41,21 @@ pub struct MaterializeOptions {
     pub link: LinkStrategy,
     pub clean: bool,
     pub vendor_dir: PathBuf,
+    /// Whether to normalize file/dir metadata (fixed mtimes + chmod) for
+    /// byte-reproducible `node_modules`. Default `false` for node_modules
+    /// (Bun doesn't do this and `tree_hash` never includes mtimes). `true`
+    /// for vendor/`--frozen`/CI reproducible mode.
+    pub normalize_metadata: bool,
 }
 
 impl MaterializeOptions {
     pub fn node_modules() -> Self {
         MaterializeOptions {
             projection: Projection::NodeModules,
-            link: LinkStrategy::Symlink,
+            link: LinkStrategy::EdgeLink,
             clean: false,
             vendor_dir: PathBuf::from("vendor"),
+            normalize_metadata: false,
         }
     }
 
@@ -55,6 +65,7 @@ impl MaterializeOptions {
             link: LinkStrategy::Copy,
             clean: false,
             vendor_dir: PathBuf::from("vendor"),
+            normalize_metadata: true,
         }
     }
 }
@@ -133,8 +144,13 @@ pub enum MaterializeError {
         version: String,
         member: String,
     },
-    #[error("symlinks unsupported at {} on this filesystem; use --vendor for a copy-based projection", .path.display())]
-    SymlinkUnsupported { path: PathBuf },
+    #[error("dependency edge links unsupported at {} on this filesystem; use --vendor for a copy-based projection", .path.display())]
+    EdgeLinkUnsupported { path: PathBuf },
+    #[error("blocking materialization task {operation} failed: {reason}")]
+    BlockingTask {
+        operation: &'static str,
+        reason: String,
+    },
     #[error("dependency edge {dep}@{ver} of {name}@{version} is not in the resolved closure")]
     DanglingEdge {
         name: String,
@@ -165,6 +181,16 @@ impl MaterializeError {
             name: ARCHIVE_LABEL.to_owned(),
             version: ARCHIVE_LABEL.to_owned(),
             member: member.into(),
+        }
+    }
+
+    pub(crate) fn blocking_task(
+        operation: &'static str,
+        source: tokio::task::JoinError,
+    ) -> MaterializeError {
+        MaterializeError::BlockingTask {
+            operation,
+            reason: source.to_string(),
         }
     }
 
@@ -303,6 +329,50 @@ impl<'a> Materializer<'a> {
             });
         }
 
+        if matches!(opts.projection, Projection::NodeModules) {
+            for (name, version) in hoistable_single_version_packages(self.manifest) {
+                let dep_key = (name.clone(), version.clone());
+                let Some(dep_store_path) = store_paths.get(&dep_key) else {
+                    return Err(MaterializeError::DanglingEdge {
+                        name: "<hoist>".to_owned(),
+                        version: "<hoist>".to_owned(),
+                        dep: name.to_string(),
+                        ver: version.to_string(),
+                    });
+                };
+
+                let hidden_edge_path = hidden_hoist_edge_path(&root_rel, &name);
+                let hidden_edge_parent = hidden_edge_path
+                    .parent()
+                    .map(PathBuf::from)
+                    .unwrap_or_default();
+                let hidden_target = relative_path(&hidden_edge_parent, dep_store_path);
+                nodes.push(PlanNode {
+                    path: hidden_edge_path,
+                    entry: PlanEntry::Edge {
+                        target: hidden_target,
+                    },
+                    mode: DIR_MODE,
+                });
+
+                if !self.manifest.root_deps().contains_key(&name) {
+                    let public_edge_path = root_edge_path(&root_rel, &name);
+                    let public_edge_parent = public_edge_path
+                        .parent()
+                        .map(PathBuf::from)
+                        .unwrap_or_default();
+                    let public_target = relative_path(&public_edge_parent, dep_store_path);
+                    nodes.push(PlanNode {
+                        path: public_edge_path,
+                        entry: PlanEntry::Edge {
+                            target: public_target,
+                        },
+                        mode: DIR_MODE,
+                    });
+                }
+            }
+        }
+
         nodes.sort_by_cached_key(|node| path_key(&node.path));
         Ok(MaterializePlan { root, nodes })
     }
@@ -339,10 +409,8 @@ impl<'a> Materializer<'a> {
         let build_result = (|| -> Result<(), MaterializeError> {
             ensure_dir(&tmp_root)?;
             ensure_dir(&tmp_root.join(STORE_DIR))?;
-            let mut built: BTreeMap<(PackageName, Version), PathBuf> = BTreeMap::new();
-
             let link = effective_link(opts);
-            let unpacked_store = if matches!(link, LinkStrategy::Symlink) {
+            let unpacked_store = if matches!(link, LinkStrategy::EdgeLink) {
                 let cache_root = self.cache.root().to_path_buf();
                 Some(UnpackedStore::new(
                     cache_root.join("unpacked"),
@@ -351,6 +419,8 @@ impl<'a> Materializer<'a> {
             } else {
                 None
             };
+
+            let mut seen_integrity = BTreeSet::new();
 
             for node in &plan.nodes {
                 let PlanEntry::Package {
@@ -376,26 +446,16 @@ impl<'a> Materializer<'a> {
                             .map_err(|err| err.with_package(name, version))?;
                         bytes_written += stats.bytes;
                     }
-                    LinkStrategy::Symlink => {
-                        if needs_real_tree_for_native_walkers(&rel) {
-                            let bytes = self.cache.read(integrity).map_err(|source| {
-                                MaterializeError::Cache {
-                                    name: name.to_string(),
-                                    version: version.to_string(),
-                                    source,
-                                }
-                            })?;
-                            let stats = archive::unpack_to(&bytes, &abs)
-                                .map_err(|err| err.with_package(name, version))?;
-                            bytes_written += stats.bytes;
-                        } else {
-                            let store = unpacked_store.as_ref().expect("unpacked store");
-                            let source = store.ensure(integrity)?;
-                            ensure_dir(abs.parent().unwrap_or(&tmp_root))?;
-                            create_symlink(&source, &abs)?;
+                    LinkStrategy::EdgeLink => {
+                        let store = unpacked_store.as_ref().expect("unpacked store");
+                        let source = store.ensure(integrity)?;
+                        ensure_dir(abs.parent().unwrap_or(&tmp_root))?;
+                        if !seen_integrity.insert(integrity.to_sri()) {
+                            continue;
                         }
+                        bytes_written += copy_dir_recursive_with_hardlinks(&source, &abs)?;
                     }
-                    LinkStrategy::Auto => unreachable!("effective link policy resolves auto"),
+                    LinkStrategy::Auto => unreachable!("effective edge policy resolves auto"),
                 }
             }
 
@@ -407,7 +467,11 @@ impl<'a> Materializer<'a> {
                 let abs = tmp_root.join(&rel);
                 let parent_rel = rel.parent().unwrap_or(Path::new(""));
                 let parent_abs = abs.parent().unwrap_or(&tmp_root).to_path_buf();
-                ensure_dir(&parent_abs)?;
+                match link {
+                    LinkStrategy::EdgeLink => ensure_dir_fast(&parent_abs)?,
+                    LinkStrategy::Copy => ensure_dir(&parent_abs)?,
+                    LinkStrategy::Auto => unreachable!("effective edge policy resolves auto"),
+                }
                 let target_rel = normalize_relative_join(parent_rel, target)?;
                 let Some(key) = path_index.get(&target_rel) else {
                     return Err(MaterializeError::DanglingEdge {
@@ -418,42 +482,29 @@ impl<'a> Materializer<'a> {
                     });
                 };
                 match link {
-                    LinkStrategy::Symlink => {
-                        if needs_real_tree_for_native_walkers(&rel) {
-                            bytes_written += copy_edge_tree(
-                                &abs,
-                                key,
-                                &catalog,
-                                &tmp_root,
-                                &mut Vec::new(),
-                                &mut built,
-                            )?;
-                        } else {
-                            create_symlink(target, &abs)?;
+                    LinkStrategy::EdgeLink => {
+                        if !edge_links_need_final_root(link) {
+                            create_edge_link(target, &abs)?;
                         }
                     }
                     LinkStrategy::Copy => {
-                        bytes_written += copy_edge_tree(
-                            &abs,
-                            key,
-                            &catalog,
-                            &tmp_root,
-                            &mut Vec::new(),
-                            &mut built,
-                        )?;
+                        bytes_written +=
+                            copy_edge_tree_deep(&abs, key, &catalog, &tmp_root, &mut Vec::new())?;
                     }
-                    LinkStrategy::Auto => unreachable!("effective link policy resolves auto"),
+                    LinkStrategy::Auto => unreachable!("effective edge policy resolves auto"),
                 }
             }
 
-            write_sidecar(
-                &tmp_root,
-                &Sidecar {
-                    version: SIDECAR_VERSION,
-                    projection: projection_name(opts.projection).to_owned(),
-                    tree_hash: tree_hash.to_sri(),
-                },
-            )?;
+            if !edge_links_need_final_root(link) {
+                write_sidecar(
+                    &tmp_root,
+                    &Sidecar {
+                        version: SIDECAR_VERSION,
+                        projection: projection_name(opts.projection).to_owned(),
+                        tree_hash: tree_hash.to_sri(),
+                    },
+                )?;
+            }
             Ok(())
         })();
 
@@ -475,11 +526,329 @@ impl<'a> Materializer<'a> {
                 }
                 return Err(MaterializeError::io(plan.root(), source));
             }
+            if edge_links_need_final_root(effective_link(opts)) {
+                if let Err(err) =
+                    finalize_edge_links_at_root(&plan, &root_rel, &path_index, opts, &tree_hash)
+                {
+                    rollback_finalized_root(plan.root(), &backup)?;
+                    return Err(err);
+                }
+            }
             remove_path(&backup)?;
         } else {
             ensure_projection_parent(plan.root())?;
             fs::rename(&tmp_root, plan.root())
                 .map_err(|source| MaterializeError::io(plan.root(), source))?;
+            if edge_links_need_final_root(effective_link(opts)) {
+                if let Err(err) =
+                    finalize_edge_links_at_root(&plan, &root_rel, &path_index, opts, &tree_hash)
+                {
+                    cleanup_best_effort(plan.root());
+                    return Err(err);
+                }
+            }
+        }
+
+        Ok(MaterializeReport {
+            root: plan.root.clone(),
+            tree_hash,
+            packages: plan.packages(),
+            edges: plan.edges(),
+            bytes_written,
+            skipped: false,
+        })
+    }
+
+    pub async fn materialize_async(
+        &self,
+        opts: &MaterializeOptions,
+    ) -> Result<MaterializeReport, MaterializeError> {
+        let trace = std::env::var_os("MEOW_INSTALL_TRACE").is_some();
+        let t0 = std::time::Instant::now();
+        let plan = self.plan(opts)?;
+        let tree_hash = plan.tree_hash();
+        if trace {
+            eprintln!("[trace] mat plan+hash: {}μs", t0.elapsed().as_micros());
+        }
+        let t_current = std::time::Instant::now();
+        if tree_is_current(&plan, opts, &tree_hash, self.cache)? {
+            if trace {
+                eprintln!(
+                    "[trace] tree_is_current: {}μs (skip)",
+                    t_current.elapsed().as_micros()
+                );
+            }
+            return Ok(MaterializeReport {
+                root: plan.root.clone(),
+                tree_hash,
+                packages: plan.packages(),
+                edges: plan.edges(),
+                bytes_written: 0,
+                skipped: true,
+            });
+        }
+
+        if trace {
+            eprintln!(
+                "[trace] tree_is_current: {}μs (no skip)",
+                t_current.elapsed().as_micros()
+            );
+        }
+
+        let root_rel = projection_root_relative(opts, self.project_root)?;
+        let tmp_root = tmp_path(plan.root());
+        cleanup_best_effort(&tmp_root);
+        ensure_projection_parent(&tmp_root)?;
+        if opts.clean && plan.root.exists() {
+            remove_path(plan.root())?;
+        }
+
+        let catalog = package_catalog(self.manifest, &root_rel);
+        let path_index = path_index(&catalog);
+        let mut bytes_written = 0;
+
+        let build_result = async {
+            ensure_dir_fast(&tmp_root)?;
+            ensure_dir_fast(&tmp_root.join(STORE_DIR))?;
+            let link = effective_link(opts);
+            let unpacked_store = if matches!(link, LinkStrategy::EdgeLink) {
+                let cache_root = self.cache.root().to_path_buf();
+                Some(UnpackedStore::new(
+                    cache_root.join("unpacked"),
+                    Arc::new(Cache::with_root(cache_root)),
+                ))
+            } else {
+                None
+            };
+
+            let concurrency = std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(4)
+                .saturating_mul(2)
+                .max(4);
+            let limit = Arc::new(tokio::sync::Semaphore::new(concurrency));
+            let package_cache = Arc::new(Cache::with_root(self.cache.root().to_path_buf()));
+
+            if matches!(link, LinkStrategy::EdgeLink) {
+                let t_unpack = std::time::Instant::now();
+                let store = unpacked_store.as_ref().expect("unpacked store").clone();
+                let mut seen = BTreeSet::new();
+                let mut unpack_tasks = Vec::new();
+                for node in &plan.nodes {
+                    let PlanEntry::Package {
+                        integrity,
+                        name,
+                        version,
+                    } = &node.entry
+                    else {
+                        continue;
+                    };
+                    if !seen.insert(integrity.to_sri()) {
+                        continue;
+                    }
+                    let integrity = integrity.clone();
+                    let package_name = name.clone();
+                    let package_version = version.clone();
+                    let permit = limit.clone();
+                    let store = store.clone();
+                    unpack_tasks.push(tokio::spawn(async move {
+                        let _permit = permit
+                            .acquire_owned()
+                            .await
+                            .expect("materialize concurrency semaphore closed");
+                        store
+                            .ensure_async(&integrity)
+                            .await
+                            .map_err(|err| err.with_package(&package_name, &package_version))?;
+                        Ok::<(), MaterializeError>(())
+                    }));
+                }
+                for task in unpack_tasks {
+                    task.await
+                        .map_err(|err| MaterializeError::blocking_task("unpack package", err))??;
+                }
+                if trace { eprintln!("[trace] mat unpack ensure: {}ms", t_unpack.elapsed().as_millis()); }
+            }
+
+            let t_proj = std::time::Instant::now();
+
+            // Collect all package entries with their resolved paths.
+            // On macOS, clonefile is ~10μs per package — the per-package
+            // spawn_blocking hop (~0.4ms) dominates. Batch into ONE
+            // spawn_blocking that does all clonefiles sequentially.
+            let package_entries: Vec<(ContentHash, PackageName, Version, PathBuf)> = plan
+                .nodes
+                .iter()
+                .filter_map(|node| match &node.entry {
+                    PlanEntry::Package { integrity, name, version } => {
+                        let rel = path_inside_root(&node.path, &root_rel).ok()?;
+                        let abs = tmp_root.join(&rel);
+                        Some((integrity.clone(), name.clone(), version.clone(), abs))
+                    }
+                    _ => None,
+                })
+                .collect();
+
+            match link {
+                LinkStrategy::EdgeLink => {
+                    let store = unpacked_store.as_ref().expect("unpacked store").clone();
+                    let entries = package_entries;
+                    let bytes = tokio::task::spawn_blocking(move || -> Result<u64, MaterializeError> {
+                        let results: Vec<u64> = entries
+                            .par_iter()
+                            .map(|(integrity, _name, _version, dest)| -> Result<u64, MaterializeError> {
+                                let source = store.dir_for(integrity);
+                                ensure_dir_fast(dest.parent().unwrap_or(dest))?;
+                                copy_dir_recursive_with_hardlinks(&source, dest)
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        Ok(results.into_iter().sum())
+                    })
+                    .await
+                    .map_err(|err| MaterializeError::blocking_task("project packages", err))??;
+                    bytes_written += bytes;
+                }
+                LinkStrategy::Copy => {
+                    // Copy mode needs to read + decompress tarballs (heavier I/O),
+                    // so keep per-package spawn_blocking for overlap.
+                    let mut package_tasks = Vec::new();
+                    for (integrity, name, version, abs) in package_entries {
+                        let permit = limit.clone();
+                        let cache = package_cache.clone();
+                        let package_name = name.clone();
+                        let package_version = version.clone();
+                        package_tasks.push(tokio::spawn(async move {
+                            let _permit = permit
+                                .acquire_owned()
+                                .await
+                                .expect("materialize concurrency semaphore closed");
+                            let bytes = cache.read(&integrity).map_err(|source| {
+                                MaterializeError::Cache {
+                                    name: package_name.to_string(),
+                                    version: package_version.to_string(),
+                                    source,
+                                }
+                            })?;
+                            let stats = unpack_archive_blocking(bytes, abs)
+                                .await
+                                .map_err(|err| err.with_package(&package_name, &package_version))?;
+                            Ok::<u64, MaterializeError>(stats.bytes)
+                        }));
+                    }
+                    for task in package_tasks {
+                        bytes_written += task
+                            .await
+                            .map_err(|err| MaterializeError::blocking_task("materialize package", err))??;
+                    }
+                }
+                LinkStrategy::Auto => unreachable!("effective edge policy resolves auto"),
+            }
+            if trace { eprintln!("[trace] mat project: {}ms", t_proj.elapsed().as_millis()); }
+
+            let t_edge = std::time::Instant::now();
+
+            for node in &plan.nodes {
+                let PlanEntry::Edge { target } = &node.entry else {
+                    continue;
+                };
+                let rel = path_inside_root(&node.path, &root_rel)?;
+                let abs = tmp_root.join(&rel);
+                let parent_rel = rel.parent().unwrap_or(Path::new(""));
+                let parent_abs = abs.parent().unwrap_or(&tmp_root).to_path_buf();
+                match link {
+                    LinkStrategy::EdgeLink => ensure_dir_fast(&parent_abs)?,
+                    LinkStrategy::Copy => ensure_dir_fast(&parent_abs)?,
+                    LinkStrategy::Auto => unreachable!("effective edge policy resolves auto"),
+                }
+                let target_rel = normalize_relative_join(parent_rel, target)?;
+                let Some(key) = path_index.get(&target_rel) else {
+                    return Err(MaterializeError::DanglingEdge {
+                        name: rel.display().to_string(),
+                        version: rel.display().to_string(),
+                        dep: target.display().to_string(),
+                        ver: target_rel.display().to_string(),
+                    });
+                };
+                match link {
+                    LinkStrategy::EdgeLink => {
+                        if !edge_links_need_final_root(link) {
+                            create_edge_link(target, &abs)?;
+                        }
+                    }
+                    LinkStrategy::Copy => {
+                        let dest = abs.clone();
+                        let key = key.clone();
+                        let catalog = catalog.clone();
+                        let root = tmp_root.clone();
+                        bytes_written += tokio::task::spawn_blocking(move || {
+                            copy_edge_tree_deep(&dest, &key, &catalog, &root, &mut Vec::new())
+                        })
+                        .await
+                        .map_err(|err| {
+                            MaterializeError::blocking_task("copy dependency edge", err)
+                        })??;
+                    }
+                    LinkStrategy::Auto => unreachable!("effective edge policy resolves auto"),
+                }
+            }
+            if trace { eprintln!("[trace] mat edges: {}ms", t_edge.elapsed().as_millis()); }
+
+            if !edge_links_need_final_root(link) {
+                write_sidecar(
+                    &tmp_root,
+                    &Sidecar {
+                        version: SIDECAR_VERSION,
+                        projection: projection_name(opts.projection).to_owned(),
+                        tree_hash: tree_hash.to_sri(),
+                    },
+                )?;
+            }
+            Ok::<(), MaterializeError>(())
+        }
+        .await;
+        if trace {
+            eprintln!("[trace] mat TOTAL: {}ms", t0.elapsed().as_millis());
+        }
+
+        if let Err(err) = build_result {
+            cleanup_best_effort(&tmp_root);
+            return Err(err);
+        }
+
+        if !opts.clean && plan.root.exists() {
+            let backup = tmp_path(&tmp_root);
+            cleanup_best_effort(&backup);
+            fs::rename(plan.root(), &backup)
+                .map_err(|source| MaterializeError::io(plan.root(), source))?;
+            if let Err(source) = fs::rename(&tmp_root, plan.root()) {
+                let restore = fs::rename(&backup, plan.root());
+                cleanup_best_effort(&tmp_root);
+                if restore.is_err() {
+                    cleanup_best_effort(&backup);
+                }
+                return Err(MaterializeError::io(plan.root(), source));
+            }
+            if edge_links_need_final_root(effective_link(opts)) {
+                if let Err(err) =
+                    finalize_edge_links_at_root(&plan, &root_rel, &path_index, opts, &tree_hash)
+                {
+                    rollback_finalized_root(plan.root(), &backup)?;
+                    return Err(err);
+                }
+            }
+            remove_path(&backup)?;
+        } else {
+            ensure_projection_parent(plan.root())?;
+            fs::rename(&tmp_root, plan.root())
+                .map_err(|source| MaterializeError::io(plan.root(), source))?;
+            if edge_links_need_final_root(effective_link(opts)) {
+                if let Err(err) =
+                    finalize_edge_links_at_root(&plan, &root_rel, &path_index, opts, &tree_hash)
+                {
+                    cleanup_best_effort(plan.root());
+                    return Err(err);
+                }
+            }
         }
 
         Ok(MaterializeReport {
@@ -508,6 +877,15 @@ struct Sidecar {
     tree_hash: String,
 }
 
+async fn unpack_archive_blocking(
+    bytes: Vec<u8>,
+    dest: PathBuf,
+) -> Result<archive::UnpackStats, MaterializeError> {
+    tokio::task::spawn_blocking(move || archive::unpack_to(&bytes, &dest))
+        .await
+        .map_err(|err| MaterializeError::blocking_task("unpack package", err))?
+}
+
 fn package_catalog(
     manifest: &ResolutionGraph,
     root_rel: &Path,
@@ -529,17 +907,6 @@ fn package_catalog(
         );
     }
     records
-}
-
-fn needs_real_tree_for_native_walkers(rel: &Path) -> bool {
-    let mut parts = rel.components();
-    let first = parts.next().map(|part| part.as_os_str().to_string_lossy());
-    let second = parts.next().map(|part| part.as_os_str().to_string_lossy());
-    match (first.as_deref(), second.as_deref(), parts.next()) {
-        (Some(scope), Some(_name), None) if scope.starts_with('@') => true,
-        (Some(_name), None, None) => true,
-        _ => false,
-    }
 }
 
 fn path_index(
@@ -568,38 +935,86 @@ fn tree_is_current(
     {
         return Ok(false);
     }
-    // Sidecar matches — the tree was materialized in a previous run with the
-    // same plan. A quick root-dir check is sufficient; the full per-node
-    // verification is expensive and unnecessary when the content hash already
-    // guarantees structural identity.
     if !plan.root.is_dir() {
         return Ok(false);
+    }
+
+    // Lightweight verification: stat each node in the plan.
+    // On a warm filesystem these are ~1μs each from the dentry cache.
+    let root_rel = plan.root.file_name().map(PathBuf::from).unwrap_or_default();
+    for node in &plan.nodes {
+        let rel = path_inside_root(&node.path, &root_rel)?;
+        let abs = plan.root.join(rel);
+        match node.entry {
+            PlanEntry::Package { .. } => {
+                if !abs.exists() {
+                    return Ok(false);
+                }
+            }
+            PlanEntry::Edge { .. } => {
+                if fs::symlink_metadata(&abs).is_err() {
+                    return Ok(false);
+                }
+            }
+        }
     }
     Ok(true)
 }
 
-fn copy_edge_tree(
+fn edge_links_need_final_root(link: LinkStrategy) -> bool {
+    cfg!(windows) && matches!(link, LinkStrategy::EdgeLink)
+}
+
+fn finalize_edge_links_at_root(
+    plan: &MaterializePlan,
+    root_rel: &Path,
+    path_index: &BTreeMap<PathBuf, (PackageName, Version)>,
+    opts: &MaterializeOptions,
+    tree_hash: &ContentHash,
+) -> Result<(), MaterializeError> {
+    for node in &plan.nodes {
+        let PlanEntry::Edge { target } = &node.entry else {
+            continue;
+        };
+        let rel = path_inside_root(&node.path, root_rel)?;
+        let abs = plan.root.join(&rel);
+        let parent_rel = rel.parent().unwrap_or(Path::new(""));
+        let parent_abs = abs.parent().unwrap_or(plan.root()).to_path_buf();
+        ensure_dir_fast(&parent_abs)?;
+        let target_rel = normalize_relative_join(parent_rel, target)?;
+        if !path_index.contains_key(&target_rel) {
+            return Err(MaterializeError::DanglingEdge {
+                name: rel.display().to_string(),
+                version: rel.display().to_string(),
+                dep: target.display().to_string(),
+                ver: target_rel.display().to_string(),
+            });
+        }
+        create_edge_link(target, &abs)?;
+    }
+    write_sidecar(
+        plan.root(),
+        &Sidecar {
+            version: SIDECAR_VERSION,
+            projection: projection_name(opts.projection).to_owned(),
+            tree_hash: tree_hash.to_sri(),
+        },
+    )
+}
+
+fn rollback_finalized_root(root: &Path, backup: &Path) -> Result<(), MaterializeError> {
+    remove_path(root)?;
+    fs::rename(backup, root).map_err(|source| MaterializeError::io(root, source))
+}
+
+fn copy_edge_tree_deep(
     dest: &Path,
     key: &(PackageName, Version),
     catalog: &BTreeMap<(PackageName, Version), PackageRecord>,
     root: &Path,
     stack: &mut Vec<(PackageName, Version)>,
-    built: &mut BTreeMap<(PackageName, Version), PathBuf>,
 ) -> Result<u64, MaterializeError> {
-    // Dedup the dependency DAG: materialize each (name, version) subtree as a real tree
-    // exactly once. Repeat occurrences become a relative symlink to the first copy.
-    // Without this, a shared/diamond dependency is re-copied once per path through the
-    // graph -> exponential work that never terminates on real npm trees (the install hang).
-    if let Some(canonical) = built.get(key) {
-        if canonical.as_path() == dest {
-            return Ok(0);
-        }
-        if let Some(parent) = dest.parent() {
-            ensure_dir(parent)?;
-        }
-        let from_dir = dest.parent().unwrap_or(root);
-        let rel_target = relative_path(from_dir, canonical);
-        create_symlink(&rel_target, dest)?;
+    if stack.contains(key) {
         return Ok(0);
     }
     let Some(record) = catalog.get(key) else {
@@ -612,16 +1027,12 @@ fn copy_edge_tree(
     };
     let source = root.join(&record.store_path);
     let bytes = copy_dir_recursive(&source, dest)?;
-    built.insert(key.clone(), dest.to_path_buf());
     stack.push((record.name.clone(), record.version.clone()));
     let mut total = bytes;
     for (dep, version) in &record.dependencies {
         let dep_key = (dep.clone(), version.clone());
-        if stack.contains(&dep_key) {
-            continue;
-        }
         let child = dest.join("node_modules").join(package_rel_path(dep));
-        total += copy_edge_tree(&child, &dep_key, catalog, root, stack, built)?;
+        total += copy_edge_tree_deep(&child, &dep_key, catalog, root, stack)?;
     }
     let _ = stack.pop();
     Ok(total)
@@ -655,9 +1066,124 @@ fn copy_dir_recursive(source: &Path, dest: &Path) -> Result<u64, MaterializeErro
     Ok(total)
 }
 
+#[cfg(target_os = "macos")]
+fn fast_clone_dir(source: &Path, dest: &Path) -> Result<bool, MaterializeError> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let src_c = CString::new(source.as_os_str().as_bytes()).map_err(|_| {
+        MaterializeError::invalid_archive("invalid source path for clonefile".to_string())
+    })?;
+    let dest_c = CString::new(dest.as_os_str().as_bytes()).map_err(|_| {
+        MaterializeError::invalid_archive("invalid dest path for clonefile".to_string())
+    })?;
+
+    let ret = unsafe { libc::clonefile(src_c.as_ptr(), dest_c.as_ptr(), 0) };
+    if ret == 0 {
+        Ok(true)
+    } else {
+        let err = std::io::Error::last_os_error();
+        let errno = err.raw_os_error().unwrap_or(0);
+        if errno == libc::EXDEV || errno == libc::ENOTSUP {
+            Ok(false)
+        } else {
+            Err(MaterializeError::io(dest, err))
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn fast_clone_dir(_source: &Path, _dest: &Path) -> Result<bool, MaterializeError> {
+    Ok(false)
+}
+
+/// Linux `FICLONE` ioctl for file-level Copy-on-Write (reflink).
+/// Returns `Ok(true)` on success, `Ok(false)` if CoW is unsupported,
+/// and `Err` for actual I/O errors.
+#[cfg(target_os = "linux")]
+fn fast_clone_file(source: &Path, dest: &Path) -> Result<bool, std::io::Error> {
+    use std::os::unix::io::AsRawFd;
+    const FICLONE: libc::c_ulong = 0x40049409;
+    let src_file = std::fs::File::open(source)?;
+    let dest_file = std::fs::File::create(dest)?;
+    let res = unsafe { libc::ioctl(dest_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) };
+    if res == 0 {
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn fast_clone_file(_source: &Path, _dest: &Path) -> Result<bool, std::io::Error> {
+    Ok(false)
+}
+
+fn copy_dir_recursive_with_hardlinks(source: &Path, dest: &Path) -> Result<u64, MaterializeError> {
+    // 1. Try the platform-specific directory clone (macOS APFS clonefile).
+    if std::env::var_os("MEOW_PM_NO_CLONEFILE").is_none() && fast_clone_dir(source, dest)? {
+        return Ok(0);
+    }
+
+    // 2. Recursively walk source: collect all (file_path, dest_path) pairs and dirs.
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut files: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut walk_stack = vec![source.to_path_buf()];
+    while let Some(dir) = walk_stack.pop() {
+        let entries = fs::read_dir(&dir).map_err(|e| MaterializeError::io(&dir, e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| MaterializeError::io(&dir, e))?;
+            let entry_path = entry.path();
+            let rel = entry_path
+                .strip_prefix(source)
+                .expect("walked path must be under source");
+            let dest_path = dest.join(rel);
+            if entry
+                .file_type()
+                .map_err(|e| MaterializeError::io(&entry_path, e))?
+                .is_dir()
+            {
+                dirs.push(dest_path.clone());
+                walk_stack.push(entry_path);
+            } else {
+                files.push((entry_path, dest_path));
+            }
+        }
+    }
+
+    // 3. Sort directories so parents come before children, then create them sequentially.
+    dirs.sort_by_key(|d| d.components().count());
+    for d in &dirs {
+        ensure_dir(d)?;
+    }
+    ensure_dir(dest)?; // just in case the root wasn't covered by the walk
+
+    // 4. Parallel: link / clone / copy every file.
+    //    priority: fast_clone_file → hard_link → copy_file
+    let bytes: Vec<u64> = files
+        .par_iter()
+        .map(|(src, dst)| -> Result<u64, MaterializeError> {
+            // FICLONE (Linux reflink CoW)
+            if fast_clone_file(src, dst).unwrap_or(false) {
+                // bytes don't really matter for CoW — report size from metadata
+                return Ok(std::fs::metadata(src).map(|m| m.len()).unwrap_or(0));
+            }
+            // Hard link (cross-device may fail)
+            if std::fs::hard_link(src, dst).is_ok() {
+                // hard links share inodes, 0 "new" bytes by convention
+                return Ok(0);
+            }
+            // Fallback: full copy
+            copy_file(src, dst)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(bytes.iter().sum())
+}
+
 fn copy_file(source: &Path, dest: &Path) -> Result<u64, MaterializeError> {
     if let Some(parent) = dest.parent() {
-        ensure_dir(parent)?;
+        ensure_dir_fast(parent)?;
     }
     let mut src =
         fs::File::open(source).map_err(|source_err| MaterializeError::io(source, source_err))?;
@@ -676,8 +1202,16 @@ fn copy_file(source: &Path, dest: &Path) -> Result<u64, MaterializeError> {
             .map_err(|source_err| MaterializeError::io(dest, source_err))?;
         total += read as u64;
     }
+    // Preserve executable bit (Bun does this too); skip full normalize_path
+    // (utimensat + chmod) unless reproducible mode is requested.
     let mode = file_mode_from_metadata(source)?;
-    normalize_path(dest, mode)?;
+    if mode == EXEC_MODE {
+        #[cfg(unix)]
+        {
+            fs::set_permissions(dest, fs::Permissions::from_mode(EXEC_MODE))
+                .map_err(|source| MaterializeError::io(dest, source))?;
+        }
+    }
     Ok(total)
 }
 
@@ -777,6 +1311,32 @@ fn root_edge_path(root_rel: &Path, name: &PackageName) -> PathBuf {
     path
 }
 
+fn hidden_hoist_edge_path(root_rel: &Path, name: &PackageName) -> PathBuf {
+    let mut path = root_rel.join(STORE_DIR).join("node_modules");
+    path.push(package_rel_path(name));
+    path
+}
+
+fn hoistable_single_version_packages(manifest: &ResolutionGraph) -> Vec<(PackageName, Version)> {
+    let mut versions_by_name = BTreeMap::<PackageName, BTreeSet<Version>>::new();
+    for package in manifest.packages() {
+        versions_by_name
+            .entry(package.name.clone())
+            .or_default()
+            .insert(package.version.clone());
+    }
+    versions_by_name
+        .into_iter()
+        .filter_map(|(name, mut versions)| {
+            if versions.len() == 1 {
+                versions.pop_first().map(|version| (name, version))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 fn store_key(name: &PackageName, version: &Version) -> String {
     format!("{}@{}", name.as_str().replace('/', "+"), version)
 }
@@ -860,26 +1420,69 @@ fn ensure_projection_parent(path: &Path) -> Result<(), MaterializeError> {
     Ok(())
 }
 
-fn ensure_dir(path: &Path) -> Result<(), MaterializeError> {
+fn ensure_dir_fast(path: &Path) -> Result<(), MaterializeError> {
     if path.as_os_str().is_empty() {
         return Ok(());
     }
-    fs::create_dir_all(path).map_err(|source| MaterializeError::io(path, source))?;
-    normalize_path(path, DIR_MODE)
+    fs::create_dir_all(path).map_err(|source| MaterializeError::io(path, source))
 }
 
-fn create_symlink(target: &Path, path: &Path) -> Result<(), MaterializeError> {
+fn ensure_dir(path: &Path) -> Result<(), MaterializeError> {
+    ensure_dir_fast(path)
+}
+
+#[cfg(windows)]
+fn create_windows_junction(target: &Path, path: &Path) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let link_name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "junction path has no file name",
+        )
+    })?;
+    let absolute_target = parent.join(target).canonicalize()?;
+    let status = Command::new("cmd")
+        .current_dir(parent)
+        .arg("/C")
+        .arg("mklink")
+        .arg("/J")
+        .arg(link_name)
+        .arg(&absolute_target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other("mklink /J failed"))
+    }
+}
+
+fn create_edge_link(target: &Path, path: &Path) -> Result<(), MaterializeError> {
     #[cfg(unix)]
     {
-        symlink(target, path).map_err(|_| MaterializeError::SymlinkUnsupported {
+        symlink(target, path).map_err(|_| MaterializeError::EdgeLinkUnsupported {
             path: path.to_path_buf(),
         })
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // Dependency edges are directories. On Windows, use an NTFS junction
+        // instead of a symlink: directory symlinks require developer-mode/admin
+        // privileges in CI, while junctions are the native unprivileged edge
+        // primitive package managers use for node_modules graphs. Rust's
+        // std::os::windows::fs::junction_point is still unstable, so use the
+        // stable OS command.
+        create_windows_junction(target, path).map_err(|_| MaterializeError::EdgeLinkUnsupported {
+            path: path.to_path_buf(),
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = target;
         let _ = path;
-        Err(MaterializeError::SymlinkUnsupported {
+        Err(MaterializeError::EdgeLinkUnsupported {
             path: path.to_path_buf(),
         })
     }
@@ -931,14 +1534,55 @@ fn normalize_path(path: &Path, mode: u32) -> Result<(), MaterializeError> {
         fs::set_permissions(path, fs::Permissions::from_mode(mode))
             .map_err(|source| MaterializeError::io(path, source))?;
     }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+    }
     set_fixed_times(path)
 }
 
 fn set_fixed_times(path: &Path) -> Result<(), MaterializeError> {
-    let file = fs::File::open(path).map_err(|source| MaterializeError::io(path, source))?;
-    let fixed = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
-    file.set_times(fs::FileTimes::new().set_accessed(fixed).set_modified(fixed))
-        .map_err(|source| MaterializeError::io(path, source))
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let ts = libc::timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        };
+        let path_c = match std::ffi::CString::new(path.as_os_str().as_bytes()) {
+            Ok(c) => c,
+            Err(_) => {
+                return Err(MaterializeError::invalid_archive(
+                    "invalid path for set_fixed_times".to_string(),
+                ))
+            }
+        };
+        let ret = unsafe {
+            libc::utimensat(
+                libc::AT_FDCWD,
+                path_c.as_ptr(),
+                &[ts, ts] as *const libc::timespec,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if ret != 0 {
+            return Err(MaterializeError::io(path, std::io::Error::last_os_error()));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let fixed = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        // Open with write access so set_times works on all Windows versions.
+        // A read-only handle can fail with access-denied on some configurations.
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .or_else(|_| fs::File::open(path))
+            .map_err(|source| MaterializeError::io(path, source))?;
+        file.set_times(fs::FileTimes::new().set_accessed(fixed).set_modified(fixed))
+            .map_err(|source| MaterializeError::io(path, source))?;
+    }
+    Ok(())
 }
 
 fn path_key(path: &Path) -> String {
@@ -988,7 +1632,7 @@ fn parts_to_path(parts: &[String]) -> PathBuf {
 
 fn effective_link(opts: &MaterializeOptions) -> LinkStrategy {
     match opts.projection {
-        Projection::NodeModules => LinkStrategy::Symlink,
+        Projection::NodeModules => LinkStrategy::EdgeLink,
         Projection::Vendor => LinkStrategy::Copy,
     }
 }
@@ -1078,16 +1722,16 @@ mod tests {
     #[test]
     fn projection_link_policy_is_strict() {
         let mut node_modules = MaterializeOptions::node_modules();
-        assert_eq!(effective_link(&node_modules), LinkStrategy::Symlink);
+        assert_eq!(effective_link(&node_modules), LinkStrategy::EdgeLink);
 
         node_modules.link = LinkStrategy::Copy;
-        assert_eq!(effective_link(&node_modules), LinkStrategy::Symlink);
+        assert_eq!(effective_link(&node_modules), LinkStrategy::EdgeLink);
 
         node_modules.link = LinkStrategy::Auto;
-        assert_eq!(effective_link(&node_modules), LinkStrategy::Symlink);
+        assert_eq!(effective_link(&node_modules), LinkStrategy::EdgeLink);
 
         let mut vendor = MaterializeOptions::vendor();
-        vendor.link = LinkStrategy::Symlink;
+        vendor.link = LinkStrategy::EdgeLink;
         assert_eq!(effective_link(&vendor), LinkStrategy::Copy);
     }
 

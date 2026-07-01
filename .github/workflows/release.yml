@@ -1,0 +1,132 @@
+name: Release
+
+# Build and publish the `meow` single-binary for every supported target.
+#
+# Trigger by pushing a version tag (e.g. `git tag v0.1.0 && git push --tags`),
+# or manually via the Actions tab (workflow_dispatch) with a tag name.
+#
+# The matrix mirrors the `build` job in ci.yml so a release can never ship a
+# target that CI does not already exercise. Assets are named
+# `meow-<target>.<ext>` so the install script can construct URLs deterministically.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (e.g. v0.1.0). Must already exist as a git tag."
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            ext: tar.gz
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            ext: tar.gz
+          - runner: macos-latest
+            target: x86_64-apple-darwin
+            ext: tar.gz
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            ext: tar.gz
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: zip
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential make cmake clang libclang-dev
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }} -p meow-cli
+
+      - name: Package (unix)
+        if: matrix.ext == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dist="meow-${{ matrix.target }}"
+          mkdir -p "$dist"
+          cp "target/${{ matrix.target }}/release/meow" "$dist/"
+          cp README.md "$dist/" 2>/dev/null || true
+          cp LICENSE* "$dist/" 2>/dev/null || true
+          tar -czf "$dist.tar.gz" "$dist"
+          shasum -a 256 "$dist.tar.gz" > "$dist.tar.gz.sha256"
+
+      - name: Package (windows)
+        if: matrix.ext == 'zip'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dist = "meow-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/meow.exe" "$dist/"
+          Copy-Item README.md "$dist/" -ErrorAction SilentlyContinue
+          Compress-Archive -Path $dist -DestinationPath "$dist.zip" -Force
+          $h = (Get-FileHash "$dist.zip" -Algorithm SHA256).Hash.ToLower()
+          "$h  $dist.zip" | Out-File -Encoding ascii "$dist.zip.sha256"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: meow-${{ matrix.target }}
+          path: |
+            meow-${{ matrix.target }}.tar.gz
+            meow-${{ matrix.target }}.tar.gz.sha256
+            meow-${{ matrix.target }}.zip
+            meow-${{ matrix.target }}.zip.sha256
+          if-no-files-found: ignore
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release with assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          draft: false
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/*.zip
+            dist/*.zip.sha256

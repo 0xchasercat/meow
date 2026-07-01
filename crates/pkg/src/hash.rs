@@ -11,28 +11,32 @@ use std::path::PathBuf;
 
 use base64::Engine as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 
 use crate::error::{ParseHashError, ParseVersionError};
 
-/// Hash algorithm. Extensible by design; only `Sha256` ships at P0.
+/// Hash algorithm. Extensible by design; `Sha256` for meow-internal hashing,
+/// `Sha512` for npm registry integrity (SRI).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum HashAlgo {
     Sha256,
+    Sha512,
 }
 
 impl HashAlgo {
-    /// Lowercase identifier used in SRI prefixes and cache paths (`"sha256"`).
+    /// Lowercase identifier used in SRI prefixes and cache paths.
     pub const fn as_str(self) -> &'static str {
         match self {
             HashAlgo::Sha256 => "sha256",
+            HashAlgo::Sha512 => "sha512",
         }
     }
 
-    /// Digest length in bytes (`sha256` → 32).
+    /// Digest length in bytes (`sha256` → 32, `sha512` → 64).
     pub const fn digest_len(self) -> usize {
         match self {
             HashAlgo::Sha256 => 32,
+            HashAlgo::Sha512 => 64,
         }
     }
 
@@ -40,15 +44,14 @@ impl HashAlgo {
     fn parse(s: &str) -> Option<HashAlgo> {
         match s {
             "sha256" => Some(HashAlgo::Sha256),
+            "sha512" => Some(HashAlgo::Sha512),
             _ => None,
         }
     }
 }
 
-/// Fixed digest capacity. `sha256` fills 32 of these; a future wider algorithm
-/// can grow this without touching call sites (only [`HashAlgo::digest_len`]
-/// decides how many bytes are significant).
-const DIGEST_CAP: usize = 32;
+/// Fixed digest capacity. `sha512` fills 64 of these; `sha256` fills 32.
+const DIGEST_CAP: usize = 64;
 
 /// A content hash. Textual form is SRI (`sha256-<base64>`, lockfile/greppable);
 /// cache-path form is `<algo>/<lowerhex>`. NOT a raw `String`.
@@ -65,10 +68,22 @@ impl ContentHash {
         hasher.update(bytes);
         let out = hasher.finalize();
         let mut digest = [0u8; DIGEST_CAP];
-        // `out` is exactly 32 bytes (sha256), which fits DIGEST_CAP.
-        digest[..out.len()].copy_from_slice(&out);
+        digest[..32].copy_from_slice(&out);
         ContentHash {
             algo: HashAlgo::Sha256,
+            digest,
+        }
+    }
+
+    /// Hash `bytes` with sha512. Used for npm registry integrity verification.
+    pub fn of_sha512(bytes: &[u8]) -> ContentHash {
+        let mut hasher = Sha512::new();
+        hasher.update(bytes);
+        let out = hasher.finalize();
+        let mut digest = [0u8; DIGEST_CAP];
+        digest[..64].copy_from_slice(&out);
+        ContentHash {
+            algo: HashAlgo::Sha512,
             digest,
         }
     }
@@ -120,12 +135,12 @@ impl ContentHash {
         p
     }
     // === LOAD-003 ===
-    /// Canonical URL-host form for `meow-cache://`: `"<algo>-<lowerhex>"`.
+    /// Canonical unpacked-store directory key: `"<algo>-<lowerhex>"`.
     pub fn to_url_host(&self) -> String {
         format!("{}-{}", self.algo.as_str(), to_hex(self.digest()))
     }
 
-    /// Parse the canonical URL-host form `"<algo>-<lowerhex>"`.
+    /// Parse the canonical unpacked-store directory key `"<algo>-<lowerhex>"`.
     pub fn from_url_host(s: &str) -> Result<ContentHash, ParseHashError> {
         let (algo_str, hex) = s
             .split_once('-')

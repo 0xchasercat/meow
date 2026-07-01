@@ -101,7 +101,7 @@ pub(crate) fn compute_cst(source: Arc<str>, source_type: SourceType) -> Cst {
         let ret = Parser::new(&owner.allocator, &owner.source, source_type).parse();
         Parsed {
             program: ret.program,
-            errors: ret.errors,
+            errors: ret.diagnostics.to_vec(),
             panicked: ret.panicked,
         }
     });

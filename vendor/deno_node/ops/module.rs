@@ -1,78 +1,103 @@
 // Copyright 2018-2026 the Deno authors. MIT license.
 
-use deno_ast::EmitOptions;
-use deno_ast::ImportsNotUsedAsValues;
-use deno_ast::MediaType;
-use deno_ast::ParseParams;
-use deno_ast::SourceMapOption;
-use deno_ast::TranspileModuleOptions;
-use deno_ast::TranspileOptions;
-use deno_ast::TypeStripOptions;
 use deno_core::op2;
 use deno_core::url::Url;
 use deno_error::JsErrorBox;
-
-deno_error::js_error_wrapper!(
-  deno_ast::ParseDiagnostic,
-  JsParseDiagnostic,
-  "SyntaxError"
-);
-deno_error::js_error_wrapper!(
-  deno_ast::TranspileError,
-  JsTranspileError,
-  "Error"
-);
-deno_error::js_error_wrapper!(
-  deno_ast::TypeStripError,
-  JsTypeStripError,
-  "SyntaxError"
-);
+use oxc_allocator::Allocator;
+use oxc_codegen::Codegen;
+use oxc_parser::{ParseOptions, Parser};
+use oxc_semantic::SemanticBuilder;
+use oxc_span::SourceType;
+use oxc_transformer::{TransformOptions, Transformer};
 
 #[op2]
 #[string]
 pub fn op_node_strip_typescript_types(
-  #[string] code: String,
-  #[string] mode: &str,
-  source_map: bool,
+    #[string] code: String,
+    #[string] mode: &str,
+    source_map: bool,
 ) -> Result<String, JsErrorBox> {
-  let specifier = Url::parse("file:///stripTypeScriptTypes.ts").unwrap();
-  if mode == "strip" {
-    return deno_ast::type_strip(
-      &specifier,
-      code,
-      TypeStripOptions { module: None },
-    )
-    .map_err(|e| JsErrorBox::from_err(JsTypeStripError(e)));
-  }
+    let specifier = Url::parse("file:///stripTypeScriptTypes.ts").unwrap();
+    if mode == "strip" && source_map {
+        return Err(JsErrorBox::generic(
+            "source maps are not supported in strip mode",
+        ));
+    }
+    transform_typescript_with_oxc(&specifier, &code, mode)
+}
 
-  let parsed = deno_ast::parse_module(ParseParams {
-    specifier,
-    text: code.into(),
-    media_type: MediaType::TypeScript,
-    capture_tokens: false,
-    scope_analysis: false,
-    maybe_syntax: None,
-  })
-  .map_err(|e| JsErrorBox::from_err(JsParseDiagnostic(e)))?;
+fn transform_typescript_with_oxc(
+    specifier: &Url,
+    source_text: &str,
+    mode: &str,
+) -> Result<String, JsErrorBox> {
+    let allocator = Allocator::default();
+    let source_path = specifier
+        .to_file_path()
+        .unwrap_or_else(|_| std::path::PathBuf::from("stripTypeScriptTypes.ts"));
+    let source_type = SourceType::from_path(&source_path).unwrap_or_else(|_| SourceType::ts());
+    let parsed = Parser::new(&allocator, source_text, source_type)
+        .with_options(ParseOptions {
+            allow_return_outside_function: true,
+            ..ParseOptions::default()
+        })
+        .parse();
 
-  let source = parsed
-    .transpile(
-      &TranspileOptions {
-        imports_not_used_as_values: ImportsNotUsedAsValues::Remove,
-        ..Default::default()
-      },
-      &TranspileModuleOptions { module_kind: None },
-      &EmitOptions {
-        source_map: if source_map {
-          SourceMapOption::Inline
-        } else {
-          SourceMapOption::None
+    if parsed.panicked || !parsed.diagnostics.is_empty() {
+        let message = parsed
+            .diagnostics
+            .into_iter()
+            .map(|error| format!("{:?}", error.with_source_code(source_text.to_owned())))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(JsErrorBox::generic(format!(
+            "Oxc parse failed for {specifier}: {message}"
+        )));
+    }
+
+    let mut program = parsed.program;
+    let semantic = SemanticBuilder::new()
+        .with_excess_capacity(2.0)
+        .with_enum_eval(true)
+        .build(&program);
+    if !semantic.diagnostics.is_empty() {
+        let message = semantic
+            .diagnostics
+            .into_iter()
+            .map(|error| format!("{:?}", error.with_source_code(source_text.to_owned())))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(JsErrorBox::generic(format!(
+            "Oxc semantic analysis failed for {specifier}: {message}"
+        )));
+    }
+
+    let transform_options = TransformOptions {
+        typescript: oxc_transformer::TypeScriptOptions {
+            only_remove_type_imports: true,
+            ..oxc_transformer::TypeScriptOptions::default()
         },
-        ..Default::default()
-      },
-    )
-    .map_err(|e| JsErrorBox::from_err(JsTranspileError(e)))?
-    .into_source();
+        ..TransformOptions::default()
+    };
+    let transformed = Transformer::new(&allocator, &source_path, &transform_options)
+        .build_with_scoping(semantic.semantic.into_scoping(), &mut program);
+    if !transformed.diagnostics.is_empty() {
+        let message = transformed
+            .diagnostics
+            .into_iter()
+            .map(|error| format!("{:?}", error.with_source_code(source_text.to_owned())))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(JsErrorBox::generic(format!(
+            "Oxc transform failed for {specifier}: {message}"
+        )));
+    }
 
-  Ok(source.text)
+    if mode != "strip" && mode != "transform" {
+        return Err(JsErrorBox::generic(format!(
+            "unsupported TypeScript transform mode: {mode}"
+        )));
+    }
+
+    Ok(Codegen::new().build(&program).code)
 }

@@ -6,6 +6,8 @@
 //! Tests assert observable JS behavior, not plumbing (CRAFT). The host-touching
 //! state itself (clock/rng/env) is unit-tested in `src/hermetic/state.rs`.
 
+mod real_loader;
+
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -14,7 +16,7 @@ use meow_runtime::hermetic::{extensions, HermeticConfig, RngSource};
 use meow_runtime::web::{extensions as web_extensions, NetCaps, WebOptions};
 use meow_runtime::{
     print_sink_extension, AllowAll, ModuleSpecifier, PrintSink, Runtime, RuntimeError,
-    RuntimeOptions, TrivialModuleLoader,
+    RuntimeOptions,
 };
 
 /// Capture sink + the captured buffer (console output; deterministic, no OS).
@@ -30,24 +32,32 @@ fn capture() -> (Rc<RefCell<String>>, deno_core::Extension) {
 /// A runtime with the hermetic shadows installed under `cfg` + a capture sink.
 /// No Web globals (RT-006 does not depend on RT-004); the `crypto`/`performance`
 /// rebinds in `hermetic.js` are guarded and simply skip when absent.
-fn hermetic_runtime(cfg: HermeticConfig) -> (Rc<RefCell<String>>, Runtime) {
+fn hermetic_runtime(cfg: HermeticConfig) -> (Rc<RefCell<String>>, Runtime, std::path::PathBuf) {
+    let root = real_loader::unique_dir("hermetic");
     let (out, sink_ext) = capture();
     let mut exts = extensions(cfg);
     exts.push(sink_ext);
-    let rt = Runtime::new(RuntimeOptions {
-            module_loader: Rc::new(TrivialModuleLoader::new()),
-            extensions: exts,
-            max_heap_size: None,
-            startup_snapshot: None,
-            residual_lazy_js_sources: &[],
-            residual_lazy_esm_sources: &[],
-        })
+    let mut rt = Runtime::new(RuntimeOptions {
+        module_loader: real_loader::loader_for(&root),
+        extensions: exts,
+        max_heap_size: None,
+        startup_snapshot: None,
+        residual_lazy_js_sources: &[],
+        residual_lazy_esm_sources: &[],
+        v8_flags: None,
+    })
     .expect("runtime initializes with hermetic shadows");
-    (out, rt)
+    rt.apply_hermetic_shadows().expect("hermetic shadows apply");
+    (out, rt, root)
 }
 
-async fn run_src(rt: &mut Runtime, url: &str, src: &str) -> Result<(), RuntimeError> {
-    let spec = ModuleSpecifier::parse(url).expect("valid specifier");
+async fn run_src(
+    rt: &mut Runtime,
+    root: &std::path::Path,
+    name: &str,
+    src: &str,
+) -> Result<(), RuntimeError> {
+    let spec = ModuleSpecifier::from_file_path(root.join(name)).expect("valid specifier");
     rt.run_main_module_from_source(&spec, src.to_string()).await
 }
 
@@ -65,13 +75,13 @@ const PROBE: &str = r#"
 // the default (deterministic) config.
 #[tokio::test]
 async fn hermetic_reproducible_default() {
-    let (out1, mut rt1) = hermetic_runtime(HermeticConfig::default());
-    run_src(&mut rt1, "file:///a.js", PROBE)
+    let (out1, mut rt1, root1) = hermetic_runtime(HermeticConfig::default());
+    run_src(&mut rt1, &root1, "a.js", PROBE)
         .await
         .expect("run 1");
 
-    let (out2, mut rt2) = hermetic_runtime(HermeticConfig::default());
-    run_src(&mut rt2, "file:///b.js", PROBE)
+    let (out2, mut rt2, root2) = hermetic_runtime(HermeticConfig::default());
+    run_src(&mut rt2, &root2, "b.js", PROBE)
         .await
         .expect("run 2");
 
@@ -93,8 +103,8 @@ async fn hermetic_reproducible_default() {
 // is NOT the frozen virtual epoch (proves the gate is not a no-op).
 #[tokio::test]
 async fn hermetic_real_clock_grant_flips_source() {
-    let (out, mut rt) = hermetic_runtime(HermeticConfig::default().with_real_clock());
-    run_src(&mut rt, "file:///c.js", "console.log(Date.now());")
+    let (out, mut rt, root) = hermetic_runtime(HermeticConfig::default().with_real_clock());
+    run_src(&mut rt, &root, "c.js", "console.log(Date.now());")
         .await
         .expect("run");
     let printed: f64 = out.borrow().trim().parse().expect("Date.now() is a number");
@@ -116,10 +126,11 @@ async fn hermetic_env_invisible_until_granted() {
     std::env::set_var(name, "secret-value");
 
     // Deny (default): the var is invisible.
-    let (out, mut rt) = hermetic_runtime(HermeticConfig::default());
+    let (out, mut rt, root) = hermetic_runtime(HermeticConfig::default());
     run_src(
         &mut rt,
-        "file:///deny.js",
+        &root,
+        "deny.js",
         &format!("console.log(String(Deno.core.ops.op_hermetic_env_get({name:?})));"),
     )
     .await
@@ -128,10 +139,11 @@ async fn hermetic_env_invisible_until_granted() {
 
     // Granted by name: the real value resolves.
     let cfg = HermeticConfig::default().with_env_allow([name.to_string()]);
-    let (out, mut rt) = hermetic_runtime(cfg);
+    let (out, mut rt, root) = hermetic_runtime(cfg);
     run_src(
         &mut rt,
-        "file:///allow.js",
+        &root,
+        "allow.js",
         &format!("console.log(String(Deno.core.ops.op_hermetic_env_get({name:?})));"),
     )
     .await
@@ -140,10 +152,11 @@ async fn hermetic_env_invisible_until_granted() {
 
     // A different granted name does not leak this one (scoped, not all-or-nothing).
     let cfg = HermeticConfig::default().with_env_allow(["SOMETHING_ELSE".to_string()]);
-    let (out, mut rt) = hermetic_runtime(cfg);
+    let (out, mut rt, root) = hermetic_runtime(cfg);
     run_src(
         &mut rt,
-        "file:///scoped.js",
+        &root,
+        "scoped.js",
         &format!("console.log(String(Deno.core.ops.op_hermetic_env_get({name:?})));"),
     )
     .await
@@ -161,10 +174,11 @@ async fn hermetic_env_invisible_until_granted() {
 // (arg construction, instanceof, statics) is unchanged.
 #[tokio::test]
 async fn hermetic_date_wrapper_fidelity() {
-    let (out, mut rt) = hermetic_runtime(HermeticConfig::default());
+    let (out, mut rt, root) = hermetic_runtime(HermeticConfig::default());
     run_src(
         &mut rt,
-        "file:///d.js",
+        &root,
+        "d.js",
         r#"
         const d = new Date(2020, 0, 2, 3, 4, 5);
         const checks = [
@@ -190,15 +204,19 @@ async fn hermetic_date_wrapper_fidelity() {
 async fn hermetic_seed_drives_math_random() {
     let probe = "console.log(Math.random());";
 
-    let (a, mut rt_a) = hermetic_runtime(HermeticConfig::default());
-    run_src(&mut rt_a, "file:///s1.js", probe).await.expect("a");
+    let (a, mut rt_a, root_a) = hermetic_runtime(HermeticConfig::default());
+    run_src(&mut rt_a, &root_a, "s1.js", probe)
+        .await
+        .expect("a");
 
     let cfg = HermeticConfig {
         rng: RngSource::Seeded { seed: [7u8; 32] },
         ..HermeticConfig::default()
     };
-    let (b, mut rt_b) = hermetic_runtime(cfg);
-    run_src(&mut rt_b, "file:///s2.js", probe).await.expect("b");
+    let (b, mut rt_b, root_b) = hermetic_runtime(cfg);
+    run_src(&mut rt_b, &root_b, "s2.js", probe)
+        .await
+        .expect("b");
 
     assert_ne!(
         a.borrow().trim(),
@@ -210,7 +228,8 @@ async fn hermetic_seed_drives_math_random() {
 /// A runtime with RT-004's Web globals (so `crypto` exists) THEN the hermetic
 /// shadows appended after — exactly the `meow run` order, so `hermetic.js` rebinds
 /// the real `crypto.getRandomValues`.
-fn web_hermetic_runtime(cfg: HermeticConfig) -> (Rc<RefCell<String>>, Runtime) {
+fn web_hermetic_runtime(cfg: HermeticConfig) -> (Rc<RefCell<String>>, Runtime, std::path::PathBuf) {
+    let root = real_loader::unique_dir("web-hermetic");
     let (out, sink_ext) = capture();
     let caps: NetCaps = Arc::new(AllowAll);
     let mut exts = web_extensions(WebOptions {
@@ -219,16 +238,18 @@ fn web_hermetic_runtime(cfg: HermeticConfig) -> (Rc<RefCell<String>>, Runtime) {
     });
     exts.extend(extensions(cfg));
     exts.push(sink_ext);
-    let rt = Runtime::new(RuntimeOptions {
-            module_loader: Rc::new(TrivialModuleLoader::new()),
-            extensions: exts,
-            max_heap_size: None,
-            startup_snapshot: None,
-            residual_lazy_js_sources: &[],
-            residual_lazy_esm_sources: &[],
-        })
-        .expect("runtime initializes with web + hermetic");
-    (out, rt)
+    let mut rt = Runtime::new(RuntimeOptions {
+        module_loader: real_loader::loader_for(&root),
+        extensions: exts,
+        max_heap_size: None,
+        startup_snapshot: None,
+        residual_lazy_js_sources: &[],
+        residual_lazy_esm_sources: &[],
+        v8_flags: None,
+    })
+    .expect("runtime initializes with web + hermetic");
+    rt.apply_hermetic_shadows().expect("hermetic shadows apply");
+    (out, rt, root)
 }
 
 // `crypto.getRandomValues` is routed through the hermetic op: deterministic under
@@ -242,10 +263,10 @@ async fn hermetic_crypto_get_random_values_deterministic_default_real_on_grant()
         console.log(Array.from(a).join(","));
     "#;
 
-    let (o1, mut r1) = web_hermetic_runtime(HermeticConfig::default());
-    run_src(&mut r1, "file:///cg1.js", probe).await.expect("1");
-    let (o2, mut r2) = web_hermetic_runtime(HermeticConfig::default());
-    run_src(&mut r2, "file:///cg2.js", probe).await.expect("2");
+    let (o1, mut r1, root1) = web_hermetic_runtime(HermeticConfig::default());
+    run_src(&mut r1, &root1, "cg1.js", probe).await.expect("1");
+    let (o2, mut r2, root2) = web_hermetic_runtime(HermeticConfig::default());
+    run_src(&mut r2, &root2, "cg2.js", probe).await.expect("2");
     let seeded = o1.borrow().trim().to_string();
     assert_eq!(
         seeded,
@@ -257,8 +278,8 @@ async fn hermetic_crypto_get_random_values_deterministic_default_real_on_grant()
         "getRandomValues must actually fill the buffer (not a no-op)"
     );
 
-    let (o3, mut r3) = web_hermetic_runtime(HermeticConfig::default().with_os_rng());
-    run_src(&mut r3, "file:///cg3.js", probe).await.expect("3");
+    let (o3, mut r3, root3) = web_hermetic_runtime(HermeticConfig::default().with_os_rng());
+    run_src(&mut r3, &root3, "cg3.js", probe).await.expect("3");
     assert_ne!(
         o3.borrow().trim(),
         seeded,

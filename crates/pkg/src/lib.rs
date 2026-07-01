@@ -13,8 +13,8 @@
 //!   and verified tarballs are stored by content hash.
 //! - [`ResolutionGraph`] — the validated resolved tree consumed by runtime,
 //!   materialization, and editor tooling. [`UnpackedStore`] supplies stable real
-//!   package directories; the standard `node_modules` projection is a strict
-//!   symlink tree into that global unpacked store.
+//!   package directories; packages are real directories containing hardlinks/clones,
+//!   and only dependency edges use links (Unix symlinks, Windows NTFS junctions).
 //!
 //! All hashes/specifiers are newtypes ([`ContentHash`], [`PackageName`],
 //! [`Version`], [`VersionReq`]) and every reachable failure is a typed
@@ -41,7 +41,9 @@ use std::path::{Path, PathBuf};
 pub use cache::Cache;
 pub use error::{CacheError, LockError, ParseHashError, ParseVersionError};
 pub use hash::{ContentHash, HashAlgo, PackageName, Version, VersionReq};
-pub use install::{resolve_roots, InstallError, InstallProgress, Installer, RootResolveError};
+pub use install::{
+    resolve_roots, InstallError, InstallProgress, Installer, ProgressPhase, RootResolveError,
+};
 // === PKG-003 ===
 pub use pnp::{PnpError, ResolutionGraph, ResolvedPackage};
 // === /PKG-003 ===

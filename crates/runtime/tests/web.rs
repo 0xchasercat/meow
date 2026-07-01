@@ -7,6 +7,8 @@
 //! Tests assert behavior from JS via `meow run`-style module evaluation, not
 //! plumbing.
 
+mod real_loader;
+
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -14,7 +16,6 @@ use std::sync::Arc;
 use meow_runtime::web::{extensions, NetCaps, WebOptions};
 use meow_runtime::{
     print_sink_extension, ModuleSpecifier, PrintSink, Runtime, RuntimeError, RuntimeOptions,
-    TrivialModuleLoader,
 };
 
 // --- helpers ---------------------------------------------------------------
@@ -30,7 +31,8 @@ fn capture() -> (Rc<RefCell<String>>, deno_core::Extension) {
 }
 
 /// Build a default runtime with the Web globals installed and a capture sink.
-fn web_runtime(caps: NetCaps) -> (Rc<RefCell<String>>, Runtime) {
+fn web_runtime(caps: NetCaps) -> (Rc<RefCell<String>>, Runtime, std::path::PathBuf) {
+    let root = real_loader::unique_dir("web");
     let (out, sink_ext) = capture();
     let mut exts = extensions(WebOptions {
         caps,
@@ -38,23 +40,29 @@ fn web_runtime(caps: NetCaps) -> (Rc<RefCell<String>>, Runtime) {
     });
     exts.push(sink_ext);
     let rt = Runtime::new(RuntimeOptions {
-            module_loader: Rc::new(TrivialModuleLoader::new()),
-            extensions: exts,
-max_heap_size: None,
-            startup_snapshot: None,
-            residual_lazy_js_sources: &[],
-            residual_lazy_esm_sources: &[],
-        })
-        .expect("runtime initializes with web globals");
-    (out, rt)
+        module_loader: real_loader::loader_for(&root),
+        extensions: exts,
+        max_heap_size: None,
+        startup_snapshot: None,
+        residual_lazy_js_sources: &[],
+        residual_lazy_esm_sources: &[],
+        v8_flags: None,
+    })
+    .expect("runtime initializes with web globals");
+    (out, rt, root)
 }
 
 fn allow_all() -> NetCaps {
     Arc::new(meow_runtime::AllowAll)
 }
 
-async fn run_src(rt: &mut Runtime, url: &str, src: &str) -> Result<(), RuntimeError> {
-    let spec = ModuleSpecifier::parse(url).expect("valid specifier");
+async fn run_src(
+    rt: &mut Runtime,
+    root: &std::path::Path,
+    name: &str,
+    src: &str,
+) -> Result<(), RuntimeError> {
+    let spec = ModuleSpecifier::from_file_path(root.join(name)).expect("valid specifier");
     rt.run_main_module_from_source(&spec, src.to_string()).await
 }
 
@@ -62,10 +70,11 @@ async fn run_src(rt: &mut Runtime, url: &str, src: &str) -> Result<(), RuntimeEr
 
 #[tokio::test]
 async fn web_url() {
-    let (out, mut rt) = web_runtime(allow_all());
+    let (out, mut rt, root) = web_runtime(allow_all());
     run_src(
         &mut rt,
-        "file:///url.js",
+        &root,
+        "url.js",
         r#"
         const u = new URL("https://h.example/p?a=1&a=2#x");
         console.log(u.pathname + "|" + JSON.stringify(u.searchParams.getAll("a")));
@@ -80,10 +89,11 @@ async fn web_url() {
 
 #[tokio::test]
 async fn web_text_codec() {
-    let (out, mut rt) = web_runtime(allow_all());
+    let (out, mut rt, root) = web_runtime(allow_all());
     run_src(
         &mut rt,
-        "file:///text.js",
+        &root,
+        "text.js",
         r#"console.log(new TextDecoder().decode(new TextEncoder().encode("héllo")));"#,
     )
     .await
@@ -93,10 +103,11 @@ async fn web_text_codec() {
 
 #[tokio::test]
 async fn web_crypto_subtle() {
-    let (out, mut rt) = web_runtime(allow_all());
+    let (out, mut rt, root) = web_runtime(allow_all());
     run_src(
         &mut rt,
-        "file:///crypto.js",
+        &root,
+        "crypto.js",
         r#"
         const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode("abc"));
         const hex = Array.from(new Uint8Array(d)).map(b => b.toString(16).padStart(2, "0")).join("");
@@ -114,10 +125,11 @@ async fn web_crypto_subtle() {
 // `Blob` is a deno_web (light) global, available even when `web-fetch` is off.
 #[tokio::test]
 async fn web_blob() {
-    let (out, mut rt) = web_runtime(allow_all());
+    let (out, mut rt, root) = web_runtime(allow_all());
     run_src(
         &mut rt,
-        "file:///blob.js",
+        &root,
+        "blob.js",
         r#"console.log(await new Blob(["xy"]).text());"#,
     )
     .await
@@ -127,10 +139,11 @@ async fn web_blob() {
 
 #[tokio::test]
 async fn web_set_timeout() {
-    let (out, mut rt) = web_runtime(allow_all());
+    let (out, mut rt, root) = web_runtime(allow_all());
     run_src(
         &mut rt,
-        "file:///timer.js",
+        &root,
+        "timer.js",
         r#"await new Promise((r) => setTimeout(r, 1)); console.log("resolved");"#,
     )
     .await
@@ -140,10 +153,11 @@ async fn web_set_timeout() {
 
 #[tokio::test]
 async fn web_no_dom() {
-    let (out, mut rt) = web_runtime(allow_all());
+    let (out, mut rt, root) = web_runtime(allow_all());
     run_src(
         &mut rt,
-        "file:///dom.js",
+        &root,
+        "dom.js",
         r#"console.log(typeof window, typeof document, typeof localStorage, typeof navigator);"#,
     )
     .await
@@ -159,10 +173,11 @@ async fn web_no_dom() {
 // stays `undefined` while `Blob` (committed) is present (I-11 superset honesty).
 #[tokio::test]
 async fn web_file_is_not_a_global() {
-    let (out, mut rt) = web_runtime(allow_all());
+    let (out, mut rt, root) = web_runtime(allow_all());
     run_src(
         &mut rt,
-        "file:///file.js",
+        &root,
+        "file.js",
         r#"console.log(typeof File, typeof Blob);"#,
     )
     .await
@@ -208,10 +223,11 @@ mod fetch {
     use std::sync::atomic::{AtomicUsize, Ordering};
     #[tokio::test]
     async fn web_response_headers_request() {
-        let (out, mut rt) = web_runtime(allow_all());
+        let (out, mut rt, root) = web_runtime(allow_all());
         run_src(
             &mut rt,
-            "file:///resp.js",
+            &root,
+            "resp.js",
             r#"
             console.log(await new Response("hi").text());
             console.log(new Headers({ a: "b" }).get("a"));
@@ -225,10 +241,11 @@ mod fetch {
 
     #[tokio::test]
     async fn web_formdata() {
-        let (out, mut rt) = web_runtime(allow_all());
+        let (out, mut rt, root) = web_runtime(allow_all());
         run_src(
             &mut rt,
-            "file:///fd.js",
+            &root,
+            "fd.js",
             r#"
             const fd = new FormData();
             fd.append("k", "v");
@@ -293,14 +310,14 @@ mod fetch {
     #[tokio::test]
     async fn web_fetch_allowed() {
         let port = pong_server().await;
-        let (out, mut rt) = web_runtime(allow_all());
+        let (out, mut rt, root) = web_runtime(allow_all());
         let src = format!(
             r#"
             const r = await fetch("http://127.0.0.1:{port}/");
             console.log(r.status + ":" + (await r.text()));
             "#
         );
-        run_src(&mut rt, "file:///fetch_ok.js", &src)
+        run_src(&mut rt, &root, "fetch_ok.js", &src)
             .await
             .expect("fetch module runs");
         assert_eq!(out.borrow().trim(), "200:pong");
@@ -317,7 +334,7 @@ mod fetch {
             targets: Mutex::new(Vec::new()),
         });
         let caps: NetCaps = recorder.clone();
-        let (out, mut rt) = web_runtime(caps);
+        let (out, mut rt, root) = web_runtime(caps);
         // A named host so the connector consults the DNS resolver (where the gate
         // lives); IP literals bypass DNS resolution.
         let src = format!(
@@ -331,7 +348,7 @@ mod fetch {
             console.log(result);
             "#
         );
-        run_src(&mut rt, "file:///fetch_deny.js", &src)
+        run_src(&mut rt, &root, "fetch_deny.js", &src)
             .await
             .expect("fetch module runs without panicking");
 
@@ -378,7 +395,7 @@ mod fetch {
     #[tokio::test]
     async fn web_fetch_abort() {
         let port = hang_server().await;
-        let (out, mut rt) = web_runtime(allow_all());
+        let (out, mut rt, root) = web_runtime(allow_all());
         let src = format!(
             r#"
             const ac = new AbortController();
@@ -393,7 +410,7 @@ mod fetch {
             console.log(result);
             "#
         );
-        run_src(&mut rt, "file:///fetch_abort.js", &src)
+        run_src(&mut rt, &root, "fetch_abort.js", &src)
             .await
             .expect("fetch module runs without panicking");
         assert_eq!(
