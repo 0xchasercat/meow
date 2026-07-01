@@ -176,7 +176,11 @@ fn system_memory() -> Option<usize> {
 
 #[cfg(unix)]
 fn maximize_fd_limit() {
-    unsafe {
+    // Process-global: raising the fd limit once suffices. Guard with `Once` so
+    // that spawning many worker isolates (each constructs a `Runtime`) does not
+    // issue a redundant get/setrlimit syscall pair per worker.
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
         let mut limit = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,
@@ -185,7 +189,7 @@ fn maximize_fd_limit() {
             limit.rlim_cur = limit.rlim_max.min(10240);
             let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
         }
-    }
+    });
 }
 
 #[cfg(not(unix))]

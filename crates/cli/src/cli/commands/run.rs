@@ -286,13 +286,14 @@ pub fn cmd_node_eval(args: NodeEvalArgs) -> ExitCode {
         .enable_all()
         .build()
     {
-        // LocalSet so `node:worker_threads` workers can `spawn_local` onto this
-        // thread (see `commands::worker`).
-        Ok(rt) => match rt.block_on(tokio::task::LocalSet::new().run_until(run_native_request(
+        // `node:worker_threads` workers run on their own OS threads
+        // (`commands::worker`), so the main module drives on a plain
+        // current-thread runtime — no `LocalSet` needed.
+        Ok(rt) => match rt.block_on(run_native_request(
             &request,
             flags,
             host_env_map(flags.allow_env, meow_runtime::node::NodeMode::Enabled),
-        ))) {
+        )) {
             Ok(code) => code,
             Err(err) => {
                 hiss(&format!("node: {err}"));
@@ -339,11 +340,10 @@ fn cmd_run_result(target: &str, flags: RunFlagView<'_>) -> Result<ExitCode, RunC
         .enable_all()
         .build()
         .map_err(RunCommandError::AsyncRuntime)?;
-    // Cooperative-isolate workers (`node:worker_threads`) run as `spawn_local`
-    // tasks on this thread, so the main module must be driven inside a `LocalSet`
-    // (see `commands::worker`). No behavior change when no worker is spawned.
-    let local = tokio::task::LocalSet::new();
-    async_rt.block_on(local.run_until(async move {
+    // `node:worker_threads` workers run on their own OS threads
+    // (`commands::worker`), so the main module drives on a plain current-thread
+    // runtime — no `LocalSet` needed.
+    async_rt.block_on(async move {
         if let Some(project_dir) = find_package_root(&cwd) {
             let package_json = meow_config::PackageJson::read(&project_dir)?;
             if package_json.scripts.contains_key(target) {
@@ -359,7 +359,7 @@ fn cmd_run_result(target: &str, flags: RunFlagView<'_>) -> Result<ExitCode, RunC
             host_env_map(flags.allow_env, meow_runtime::node::NodeMode::Enabled),
         )
         .await
-    }))
+    })
 }
 
 async fn execute_package_script(
@@ -805,11 +805,11 @@ pub(super) async fn run_native_request(
     ));
     // === /RT-007 ===
     // === /RT-006 ===
-    // === WORKER-001 === register the cooperative-isolate worker host so JS
-    // `new Worker(...)` spawns worker isolates onto this thread's LocalSet. The
-    // ops live in `meow_runtime::worker` (baked into the snapshot); the binary
-    // edge supplies the spawner that builds + drives each worker isolate. MUST
-    // stay LAST so the extension/op order matches `build.rs` and
+    // === WORKER-001 === register the thread-per-worker host so JS
+    // `new Worker(...)` spawns each worker isolate on its own OS thread. The ops
+    // live in `meow_runtime::worker` (baked into the snapshot); the binary edge
+    // supplies the spawner that builds + drives each worker isolate. MUST stay
+    // LAST so the extension/op order matches `build.rs` and
     // `build_worker_runtime` (snapshot op indices are positional).
     let worker_spawner: std::rc::Rc<dyn meow_runtime::worker::WorkerSpawner> =
         std::rc::Rc::new(super::worker::CliWorkerSpawner {
@@ -881,8 +881,14 @@ pub(super) async fn run_native_request(
 }
 
 // === WORKER-001 ===
-/// Owned inputs captured from a `run_native_request` so a cooperative-isolate
-/// worker (`commands::worker`) can build its own runtime later, on the LocalSet.
+/// Owned, `Send` inputs captured from a `run_native_request` so a thread-per-worker
+/// isolate (`commands::worker`) can build its own runtime on its own OS thread.
+/// The heavy `ctx` shares the project's immutable resolution graph + content
+/// cache by `Arc` (see [`RuntimeContext`]), so a worker does NO re-resolution;
+/// `hermetic` is cloned so every worker isolate has the same frozen clock + seed
+/// (determinism preserved). Note: no `v8_flags` — those are process-global,
+/// applied once on the main thread before any isolate exists, and re-applying
+/// them from worker threads would race `v8::V8::set_flags_from_command_line`.
 #[derive(Clone)]
 pub(super) struct WorkerSpawnConfig {
     ctx: RuntimeContext,
@@ -890,7 +896,6 @@ pub(super) struct WorkerSpawnConfig {
     hermetic: meow_runtime::hermetic::HermeticConfig,
     max_heap_size: Option<usize>,
     no_snapshot: bool,
-    v8_flags: Option<String>,
 }
 
 impl WorkerSpawnConfig {
@@ -901,15 +906,16 @@ impl WorkerSpawnConfig {
             hermetic: run_hermetic_config(flags, ctx.node_mode),
             max_heap_size: flags.max_old_space_size.map(|mib| mib * 1024 * 1024),
             no_snapshot: flags.no_snapshot,
-            v8_flags: flags.v8_flags.map(str::to_owned),
         }
     }
 }
 
-/// Build a worker isolate's runtime. Reuses the project's resolver + Oxc module
-/// graph by `Rc`/`Arc` clone (the worker lives on the same OS thread), and keys
-/// the runtime to the worker module + the worker-side message channels. Mirrors
-/// `run_native_request`'s construction; the caller drives the runtime.
+/// Build a worker isolate's runtime. Called ON the worker's OWN OS thread, so
+/// the `Rc`-based resolver it constructs never crosses threads; it reuses the
+/// project's immutable resolution graph + content cache by `Arc` clone (no
+/// re-resolution, no lockfile re-parse) and keys the runtime to the worker
+/// module + the worker-side message channels. Mirrors `run_native_request`'s
+/// construction; the caller drives the runtime.
 pub(super) fn build_worker_runtime(
     config: &WorkerSpawnConfig,
     spec: &meow_runtime::ModuleSpecifier,
@@ -982,7 +988,10 @@ pub(super) fn build_worker_runtime(
         startup_snapshot,
         residual_lazy_js_sources: residual_lazy_js,
         residual_lazy_esm_sources: residual_lazy_esm,
-        v8_flags: config.v8_flags.clone(),
+        // V8 flags are process-global and were already applied on the main
+        // thread before any isolate existed; re-applying them here would race
+        // `v8::V8::set_flags_from_command_line` across worker threads.
+        v8_flags: None,
     })
     .map_err(|err| err.to_string())?;
     runtime
