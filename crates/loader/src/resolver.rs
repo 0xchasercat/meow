@@ -1660,6 +1660,25 @@ fn cached_dual_build_kind(manifest: &PackageJson, member: &str) -> ModuleKind {
     if manifest.package_type.as_deref() == Some("module") {
         return ModuleKind::Esm;
     }
+    // An exact match against the `module` field is authoritative ESM and wins
+    // over the directory heuristic below. A dual package names its ESM build by
+    // FILE (e.g. `module: "dist/module/public_api.js"`), and that file may sit
+    // UNDER the CommonJS `main` directory (`main: "dist/public_api.js"`, so the
+    // ESM build is `dist/module/...` inside `dist/`). There the `under_cjs`
+    // check would misread the ESM entry as CommonJS and route `import` through
+    // the CJS facade -- regressing e.g. `@ctrl/tinycolor` into
+    // `does not provide an export named 'TinyColor'`. Legacy resolution loads the
+    // `module` field first in `import` context, so this exactly targets the file
+    // we will load.
+    if manifest
+        .module
+        .as_deref()
+        .and_then(normalize_legacy_member)
+        .as_deref()
+        == Some(member)
+    {
+        return ModuleKind::Esm;
+    }
     let Some(esm_dir) = manifest.module.as_deref().and_then(entry_build_dir) else {
         return ModuleKind::Cjs;
     };
@@ -1958,6 +1977,40 @@ mod tests {
         assert_eq!(
             cached_dual_build_kind(&manifest, "cjs/index.cjs"),
             ModuleKind::Cjs
+        );
+    }
+
+    #[test]
+    fn dual_build_module_file_nested_under_main_dir_is_esm() {
+        // Regression (@ctrl/tinycolor): main = dist/public_api.js (CJS), module =
+        // dist/module/public_api.js (ESM). The ESM build sits UNDER the CommonJS
+        // `main` directory (`dist/`), so directory attribution alone misreads the
+        // ESM entry as CommonJS and routes `import` through the CJS facade --
+        // `import { TinyColor } from "@ctrl/tinycolor"` then fails with "does not
+        // provide an export named 'TinyColor'". The exact `module`-field file
+        // match keeps the ESM entry ESM.
+        let manifest = PackageJson {
+            main: Some("dist/public_api.js".to_owned()),
+            module: Some("dist/module/public_api.js".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(
+            cached_dual_build_kind(&manifest, "dist/module/public_api.js"),
+            ModuleKind::Esm
+        );
+        assert_eq!(
+            cached_dual_build_kind(&manifest, "dist/public_api.js"),
+            ModuleKind::Cjs
+        );
+        // A `./`-prefixed module field still matches the resolved member.
+        let manifest_dot = PackageJson {
+            main: Some("./dist/public_api.js".to_owned()),
+            module: Some("./dist/module/public_api.js".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(
+            cached_dual_build_kind(&manifest_dot, "dist/module/public_api.js"),
+            ModuleKind::Esm
         );
     }
 
