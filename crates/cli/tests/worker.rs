@@ -48,22 +48,14 @@ fn run_worker_entry(tag: &str, source: &str, expect: &str) {
         .success()
         .stdout(predicate::str::contains(expect));
     let _ = std::fs::remove_dir_all(&dir);
-    // Best-effort cleanup of any eval temp modules this run staged.
-    cleanup_eval_temp_modules();
-}
-
-/// eval workers stage a temp `.cjs`; drop any this process's runs left behind.
-fn cleanup_eval_temp_modules() {
-    let tmp_dir = std::env::temp_dir();
-    if let Ok(entries) = std::fs::read_dir(&tmp_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with("meow-worker-eval-") && name.ends_with(".cjs") {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-    }
+    // NOTE: eval workers stage a uniquely-named temp `.cjs` (child pid + worker
+    // id) in the OS temp dir, and each meow child removes its own on exit
+    // (`TempEvalModule::drop`). We deliberately do NOT globally sweep
+    // `meow-worker-eval-*.cjs` here: these tests run in parallel, so a global
+    // sweep races sibling tests -- deleting their in-flight eval module mid-load
+    // and surfacing spurious "reading ...cjs" module errors (WORKER-001). The
+    // only residue is a rare abrupt-exit case (the `unref` test, whose parent
+    // exits before the worker's Drop runs): a single tiny temp file the OS reaps.
 }
 
 #[test]
