@@ -114,6 +114,8 @@ fn build_full_extension_set() -> Vec<deno_core::Extension> {
         deno_node_services: None,
         caps: None,
         user_agent: Some("meow/snapshot".to_string()),
+        // === SEC-001 === snapshot build: no enforcement baked in (allow_all).
+        sandbox: None,
     };
     extensions.extend(meow_runtime::node::extensions(node_opts));
 

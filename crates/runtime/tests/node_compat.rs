@@ -269,6 +269,7 @@ fn node_runtime(
         deno_node_services: Some(deno_node_services),
         caps: Some(caps),
         user_agent: Some("meow-test".to_owned()),
+        sandbox: None,
     }));
     extensions.push(meow_loader::cjs_resolve_extension(resolver));
     let hermetic_cfg = if matches!(mode, node::NodeMode::Enabled) {

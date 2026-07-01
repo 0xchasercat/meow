@@ -161,6 +161,7 @@ fn spawn_runtime(source: &str, policy: Policy) -> RuntimeThread {
                     deno_node_services: None,
                     caps: Some(caps),
                     user_agent: Some("meow-test/rt005".to_owned()),
+                    sandbox: None,
                 },
             ));
             if let Policy::DenyNetListen(shared) = policy {

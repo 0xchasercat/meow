@@ -10,7 +10,9 @@ use crate::cli::commands::install::{
     dist_tag_requirement, load_install_package_json, resolve_requested_requirement,
     runtime_meow_requirement, split_package_arg, NpmRegistry,
 };
-use crate::cli::commands::run::{host_env_map, run_native_request, NativeRunRequest, RunFlagView};
+use crate::cli::commands::run::{
+    host_env_map, run_native_request, trust_all_env, NativeRunRequest, RunFlagView,
+};
 use crate::cli::{hiss, ui, XArgs};
 use crate::host;
 
@@ -27,18 +29,17 @@ pub fn cmd_x(args: &XArgs) -> ExitCode {
         }
     };
 
-    // 1. Parse the package spec, handling flags that might be trailing in argv.
-    //    This lets users put --trust at the end like `meow x wrangler deploy --trust`.
-    //    Also checks MEOW_DANGEROUSLY_DISABLE_SECURITY env var for persistent opt-out.
-    let env_trust = std::env::var("MEOW_DANGEROUSLY_DISABLE_SECURITY").is_ok_and(|v| v == "1");
-    let mut trust = args.trust || env_trust;
-    let mut allow_clock = args.allow_clock || env_trust;
-    let mut allow_random = args.allow_random || env_trust;
-    let mut allow_env = if env_trust {
-        Some(String::new())
-    } else {
-        args.allow_env.clone()
-    };
+    // 1. Parse the package spec, handling flags that might be trailing in argv
+    //    (so `meow x wrangler deploy --trust` works). meow x is SANDBOXED by
+    //    default (network denied, writes confined to the workspace/cwd); `--trust`
+    //    or a persistent MEOW_TRUST_ALL=1 drops the sandbox for full host access,
+    //    and `--sandbox` forces it back on even under a global MEOW_TRUST_ALL.
+    let trust_all = trust_all_env();
+    let mut trust = args.trust;
+    let mut force_sandbox = args.sandbox;
+    let mut allow_clock = args.allow_clock;
+    let mut allow_random = args.allow_random;
+    let mut allow_env = args.allow_env.clone();
     let mut package_argv: Vec<String> = Vec::with_capacity(args.argv.len());
     {
         let mut i = 0;
@@ -47,6 +48,11 @@ pub fn cmd_x(args: &XArgs) -> ExitCode {
             match arg.as_str() {
                 "--trust" => {
                     trust = true;
+                    i += 1;
+                    continue;
+                }
+                "--sandbox" => {
+                    force_sandbox = true;
                     i += 1;
                     continue;
                 }
@@ -76,6 +82,13 @@ pub fn cmd_x(args: &XArgs) -> ExitCode {
             i += 1;
         }
     }
+
+    // Final trust decision: `--sandbox` forces isolation even under a global
+    // MEOW_TRUST_ALL; otherwise `--trust` / MEOW_TRUST_ALL grant full host access.
+    // `trusted` drives BOTH the hermetic layer (via RunFlagView.trust) and the
+    // fs/net sandbox (via RunFlagView.sandbox = !trusted).
+    let trusted = !force_sandbox && (trust || trust_all);
+    let sandboxed = !trusted;
 
     let (name, maybe_req) = match split_package_arg(&args.package) {
         Ok(tuple) => tuple,
@@ -229,22 +242,21 @@ pub fn cmd_x(args: &XArgs) -> ExitCode {
         }
     };
 
-    // 7. Print the security envelope
-    if trust {
+    // 7. Print the security envelope: name what the sandbox blocks and the exact
+    //    bypass up front, so a mid-run deno-origin denial is already contextual.
+    if trusted {
         u.warn(&format!(
-            "Executing {} with full host access (--trust).",
-            args.package,
-        ));
-    } else if allow_clock || allow_random || allow_env.is_some() {
-        u.purr(&format!(
-            "Executing ephemeral package {} with partial host access.",
+            "Executing {} with full host access (trusted).",
             args.package,
         ));
     } else {
         u.pounce(&format!(
-            "Executing {} in strict isolation. Set MEOW_DANGEROUSLY_DISABLE_SECURITY=1 or pass --trust to bypass.",
+            "Sandboxing {}: network denied, writes limited to this directory. Pass --trust (or set MEOW_TRUST_ALL=1) for full access.",
             args.package,
         ));
+        if allow_clock || allow_random || allow_env.is_some() {
+            u.purr("Partial host access granted (clock/entropy/env).");
+        }
     }
 
     // 8. Construct and run the request
@@ -270,7 +282,8 @@ pub fn cmd_x(args: &XArgs) -> ExitCode {
         allow_clock,
         allow_random,
         allow_env: &allow_env,
-        trust,
+        trust: trusted,
+        sandbox: sandboxed,
         max_old_space_size: args.max_old_space_size,
         no_snapshot: args.no_snapshot,
         v8_flags: args.v8_flags.as_deref(),

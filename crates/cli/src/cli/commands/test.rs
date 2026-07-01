@@ -157,6 +157,8 @@ async fn run_test_file_inner(root: &Path, file: &Path) -> Result<Vec<serde_json:
             deno_node_services: Some(deno_node_services),
             caps: Some(caps),
             user_agent: Some(format!("meow/{}", env!("CARGO_PKG_VERSION"))),
+            // === SEC-001 === `meow test` runs the user's own project: trusted.
+            sandbox: None,
         },
     ));
 

@@ -15,7 +15,8 @@ use std::sync::Arc;
 
 use deno_core::{op2, Extension, JsRuntime, OpState};
 use deno_permissions::{
-    PermissionsContainer as DenoPermissionsContainer, RuntimePermissionDescriptorParser,
+    PermissionDescriptorParser, Permissions, PermissionsContainer as DenoPermissionsContainer,
+    PermissionsOptions, RuntimePermissionDescriptorParser,
 };
 
 pub use node_bridge::{
@@ -47,6 +48,14 @@ pub struct NodeOptions {
     pub deno_node_services: Option<DenoNodeServices>,
     pub caps: Option<std::sync::Arc<dyn crate::io::CapabilityCheck + Send + Sync>>,
     pub user_agent: Option<String>,
+    // === SEC-001 ===
+    /// Host-access enforcement for this runtime. `None` = trusted (allow_all,
+    /// byte-identical to pre-SEC-001 `meow run`). `Some(policy)` = sandboxed
+    /// (`meow x` by default, `meow run --sandbox`): the Node stack gets a
+    /// restrictive `PermissionsContainer` and meow's seam gets [`SandboxCaps`],
+    /// both derived from the one policy so fs/net enforcement stays consistent.
+    pub sandbox: Option<crate::io::SandboxPolicy>,
+    // === /SEC-001 ===
 }
 
 impl NodeOptions {
@@ -62,6 +71,7 @@ impl NodeOptions {
             deno_node_services: None,
             caps: None,
             user_agent: None,
+            sandbox: None,
         }
     }
 
@@ -77,6 +87,7 @@ impl NodeOptions {
             deno_node_services: None,
             caps: None,
             user_agent: None,
+            sandbox: None,
         }
     }
 }
@@ -91,17 +102,38 @@ pub fn extensions(opts: NodeOptions) -> Vec<Extension> {
         deno_node_services,
         caps,
         user_agent,
+        sandbox,
     } = opts;
 
     // StrictWeb return removed to enable CJS ops in StrictWeb mode
 
-    let caps = caps.unwrap_or_else(|| Arc::new(crate::io::AllowAll));
+    // === SEC-001 === derive both enforcement seams from the one policy.
+    // Trusted (sandbox = None): keep the pre-SEC-001 allow_all everywhere so
+    // `meow run` is byte-identical. Sandboxed: meow's seam gets SandboxCaps and
+    // the Node stack (deno_fs/deno_net/deno_process) gets a restrictive
+    // PermissionsContainer built from the same policy.
+    let caps = match &sandbox {
+        Some(policy) => crate::io::sandbox_caps(policy.clone()),
+        None => caps.unwrap_or_else(|| Arc::new(crate::io::AllowAll)),
+    };
     let user_agent = user_agent.unwrap_or_else(|| format!("meow/{}", env!("CARGO_PKG_VERSION")));
 
-    let parser = Arc::new(RuntimePermissionDescriptorParser::new(
-        node_bridge::real_node_sys(),
-    ));
-    let perms_container = DenoPermissionsContainer::allow_all(parser);
+    // One container governs the whole Node stack; `node_permissions_ext` reuses a
+    // clone of it (no second, divergent container), so put-order can't matter.
+    let parser: Arc<dyn PermissionDescriptorParser> = Arc::new(
+        RuntimePermissionDescriptorParser::new(node_bridge::real_node_sys()),
+    );
+    let perms_container = match &sandbox {
+        None => DenoPermissionsContainer::allow_all(parser.clone()),
+        Some(policy) => {
+            // Fail CLOSED on the (practically impossible) construction error:
+            // deny-all breaks the run visibly rather than silently un-sandboxing.
+            let perms = Permissions::from_options(&*parser, &sandbox_permissions_options(policy))
+                .unwrap_or_else(|_| Permissions::none_without_prompt());
+            DenoPermissionsContainer::new(parser.clone(), perms)
+        }
+    };
+    // === /SEC-001 ===
     crate::web::ensure_crypto_provider();
 
     let blob_store = std::sync::Arc::new(deno_web::BlobStore::default());
@@ -147,10 +179,9 @@ pub fn extensions(opts: NodeOptions) -> Vec<Extension> {
 
     exts.push(deno_napi::deno_napi::init(native_addon_loader));
 
-    let parser = Arc::new(RuntimePermissionDescriptorParser::new(
-        node_bridge::real_node_sys(),
-    ));
-    let node_permissions = DenoPermissionsContainer::allow_all(parser);
+    // Reuse the single container built above (trusted allow_all or the sandbox's
+    // restrictive one) rather than a second, always-allow_all instance.
+    let node_permissions = perms_container.clone();
 
     let node_permissions_ext = Extension {
         name: "meow_deno_node_permissions",
@@ -188,6 +219,37 @@ pub fn extensions(opts: NodeOptions) -> Vec<Extension> {
 
     exts
 }
+
+// === SEC-001 ===
+/// Translate a [`SandboxPolicy`](crate::io::SandboxPolicy) into deno_permissions
+/// flags. Deno semantics: `Some(vec![])` = grant ALL, `Some(paths)` = scope to
+/// those paths, `None` = deny. Reads/env/sys/import are allowed (env is really
+/// governed by the hermetic layer + the baked env map); writes are confined to
+/// the policy roots; network, subprocess (`run`) and native FFI are denied — the
+/// three ways sandboxed code would otherwise escape.
+fn sandbox_permissions_options(policy: &crate::io::SandboxPolicy) -> PermissionsOptions {
+    let write = policy
+        .write_roots
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    PermissionsOptions {
+        allow_read: Some(Vec::new()),
+        allow_write: Some(write),
+        allow_net: if policy.allow_net {
+            Some(Vec::new())
+        } else {
+            None
+        },
+        allow_env: Some(Vec::new()),
+        allow_sys: Some(Vec::new()),
+        allow_run: None,
+        allow_ffi: None,
+        allow_import: Some(Vec::new()),
+        ..Default::default()
+    }
+}
+// === /SEC-001 ===
 
 fn process_exit_state_extension(env: &BTreeMap<String, String>) -> Extension {
     let child_pipe = child_pipe_from_env(env);

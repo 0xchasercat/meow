@@ -9,11 +9,16 @@
 //! default [`AllowAll`] permits everything so P0 is runnable. Real tiered
 //! enforcement (I-8, gate `capability`) lands at P6.
 //
-//! TODO(SEC-001, P6): replace `AllowAll` with real per-capability grant
-//! enforcement. RT-002 only stands up the seam + proves every op routes through
-//! it; it makes no security claim.
+//! SEC-001: [`AllowAll`] is still the default for trusted runs (`meow run`),
+//! preserving the pre-SEC-001 behaviour byte-for-byte. Sandboxed runs (`meow x`
+//! by default, `meow run --sandbox`) install [`SandboxCaps`] instead, which is
+//! real enforcement: reads everywhere, writes confined to policy roots, network
+//! denied. This governs meow's own seam; the Node stack (deno_fs/deno_net/
+//! deno_process) is gated by a matching restrictive `PermissionsContainer` built
+//! from the same [`SandboxPolicy`] in `node.rs`.
 
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 /// A host-I/O request presented to the capability seam before the op acts.
 /// Borrows its subject so the check allocates nothing on the hot path.
@@ -69,4 +74,123 @@ impl CapabilityCheck for AllowAll {
     fn check(&self, _req: &CapRequest<'_>) -> Result<(), CapDenied> {
         Ok(())
     }
+}
+
+/// The single bypass one-liner every sandbox denial teaches, so friction always
+/// arrives with its remedy (kept identical across messages for muscle memory).
+pub const SANDBOX_BYPASS_HINT: &str =
+    "re-run with --trust, or set MEOW_TRUST_ALL=1 to trust everything permanently";
+
+/// Data describing a sandboxed run's host-access grants. Drives BOTH enforcement
+/// seams: meow's [`CapabilityCheck`] (via [`SandboxCaps`], for the fetch gate and
+/// meow-native io ops) and the deno_permissions `PermissionsContainer` the Node
+/// stack consults (built from this in `node.rs`). Holds only owned `Send + Sync`
+/// data so it can cross onto worker OS threads.
+#[derive(Clone, Debug)]
+pub struct SandboxPolicy {
+    /// Absolute roots under which writes (create/write/remove/mkdir) are allowed.
+    /// A write outside every root is denied. Should be canonicalized by the caller.
+    pub write_roots: Vec<PathBuf>,
+    /// Whether the network is permitted. `false` denies all connect/listen.
+    pub allow_net: bool,
+}
+
+/// Real [`CapabilityCheck`] for sandboxed runs: reads are always allowed (exfil
+/// requires the separately-gated network); writes are confined to the policy
+/// roots; network is denied unless granted. Every denial names the subject and
+/// the exact bypass ([`SANDBOX_BYPASS_HINT`]).
+pub struct SandboxCaps {
+    policy: SandboxPolicy,
+}
+
+impl SandboxCaps {
+    pub fn new(policy: SandboxPolicy) -> Self {
+        Self { policy }
+    }
+
+    /// Is a write to `path` inside the sandbox's writable roots? Pure/lexical —
+    /// the seam must not touch the filesystem or read ambient host state (I-6).
+    fn write_allowed(&self, path: &Path) -> bool {
+        let normalized = lexically_normalize(path);
+        if normalized.is_absolute() {
+            self.policy
+                .write_roots
+                .iter()
+                .any(|root| normalized.starts_with(root))
+        } else {
+            // Relative paths resolve against the process cwd, which is always a
+            // write root for a sandboxed run; allow unless the normalized form
+            // climbs above cwd (a leading `..`).
+            !matches!(normalized.components().next(), Some(Component::ParentDir))
+        }
+    }
+}
+
+impl CapabilityCheck for SandboxCaps {
+    fn check(&self, req: &CapRequest<'_>) -> Result<(), CapDenied> {
+        match req {
+            // Reads + metadata always allowed (exfiltration needs the network).
+            CapRequest::ReadFile(_)
+            | CapRequest::ReadDir(_)
+            | CapRequest::Stat(_)
+            | CapRequest::Access(_)
+            | CapRequest::CurrentDir => Ok(()),
+            CapRequest::WriteFile(path) | CapRequest::Mkdir(path) | CapRequest::Remove(path) => {
+                if self.write_allowed(path) {
+                    Ok(())
+                } else {
+                    Err(CapDenied(format!(
+                        "write to {} denied by the meow sandbox ({SANDBOX_BYPASS_HINT})",
+                        path.display()
+                    )))
+                }
+            }
+            CapRequest::NetConnect(target) => {
+                if self.policy.allow_net {
+                    Ok(())
+                } else {
+                    Err(CapDenied(format!(
+                        "network access to {target} denied by the meow sandbox ({SANDBOX_BYPASS_HINT})"
+                    )))
+                }
+            }
+            CapRequest::NetListen(addr) => {
+                if self.policy.allow_net {
+                    Ok(())
+                } else {
+                    Err(CapDenied(format!(
+                        "listening on {addr} denied by the meow sandbox ({SANDBOX_BYPASS_HINT})"
+                    )))
+                }
+            }
+        }
+    }
+}
+
+/// Build the shared [`CapabilityCheck`] enforcing `policy`, as the `Arc` the
+/// fetch gate ([`NetCaps`](crate::web::NetCaps)) and meow-native io ops consult.
+pub fn sandbox_caps(policy: SandboxPolicy) -> Arc<dyn CapabilityCheck + Send + Sync> {
+    Arc::new(SandboxCaps::new(policy))
+}
+
+/// Lexically normalize a path (drop `.`, resolve `..` against prior *normal*
+/// components) WITHOUT touching the filesystem — the capability seam must not
+/// read ambient host state (I-6). A leading `..` on a relative path is kept; a
+/// `..` at a root/prefix is dropped (cannot climb above root).
+fn lexically_normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                Some(Component::RootDir) | Some(Component::Prefix(_)) => {}
+                _ => out.push(".."),
+            },
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }

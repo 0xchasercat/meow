@@ -478,6 +478,11 @@ pub struct RunArgs {
     /// Explicitly grant full host access (clock, entropy, environment).
     #[arg(long)]
     pub trust: bool,
+    /// Sandbox this run: confine writes to the project + deny network (`meow x`
+    /// is sandboxed by default; this opts a `meow run` in). Bypass with --trust
+    /// or a persistent MEOW_TRUST_ALL=1.
+    #[arg(long)]
+    pub sandbox: bool,
     /// Set the V8 heap limit in MiB (overrides the adaptive default).
     /// Equivalent to Node's `--max-old-space-size`.
     #[arg(long, value_name = "MiB")]
@@ -509,6 +514,11 @@ pub struct RunScriptArgs {
     /// Explicitly grant full host access (clock, entropy, environment).
     #[arg(long)]
     pub trust: bool,
+    /// Sandbox this run: confine writes to the project + deny network (`meow x`
+    /// is sandboxed by default; this opts a `meow run` in). Bypass with --trust
+    /// or a persistent MEOW_TRUST_ALL=1.
+    #[arg(long)]
+    pub sandbox: bool,
     /// Set the V8 heap limit in MiB (overrides the adaptive default).
     /// Equivalent to Node's `--max-old-space-size`.
     #[arg(long, value_name = "MiB")]
@@ -542,9 +552,13 @@ pub struct XArgs {
     #[arg(long, value_name = "NAMES", num_args = 0..=1, require_equals = true, default_missing_value = "")]
     pub allow_env: Option<String>,
     // === /RT-006 ===
-    /// Explicitly grant full host access (clock, entropy, environment).
+    /// Explicitly grant full host access (clock, entropy, environment, fs, net).
     #[arg(long)]
     pub trust: bool,
+    /// Force the sandbox on even when MEOW_TRUST_ALL is set (ephemeral packages
+    /// are sandboxed by default; this re-asserts it for one run).
+    #[arg(long)]
+    pub sandbox: bool,
     /// Set the V8 heap limit in MiB.
     #[arg(long, value_name = "MiB")]
     pub max_old_space_size: Option<usize>,

@@ -80,8 +80,8 @@ pub use ext::meow_runtime;
 pub use ext::{http_extension, print_sink_extension, test_extension, ui_extension, PrintSink};
 // === RT-002 ===
 pub use io::{
-    io_capability_extension, AllowAll, CapDenied, CapRequest, CapabilityCheck, RuntimeIoError,
-    TcpStreamResource,
+    io_capability_extension, sandbox_caps, AllowAll, CapDenied, CapRequest, CapabilityCheck,
+    RuntimeIoError, SandboxCaps, SandboxPolicy, TcpStreamResource, SANDBOX_BYPASS_HINT,
 };
 // === RT-002 ===
 

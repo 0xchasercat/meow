@@ -28,17 +28,63 @@ pub(super) struct RunFlagView<'a> {
     pub allow_random: bool,
     pub allow_env: &'a Option<String>,
     pub trust: bool,
+    // === SEC-001 ===
+    /// Enforce the fs/net sandbox for this run. `meow run` defaults to `false`
+    /// (trusted); `meow x` defaults to `true`. Never `true` when `trust` is set.
+    pub sandbox: bool,
+    // === /SEC-001 ===
     pub max_old_space_size: Option<usize>,
     pub no_snapshot: bool,
     pub v8_flags: Option<&'a str>,
 }
+
+// === SEC-001 ===
+/// `MEOW_TRUST_ALL=1` (or the deprecated alias `MEOW_DANGEROUSLY_DISABLE_SECURITY=1`)
+/// trusts every run permanently: no sandbox, full host access. The binary edge is
+/// the only place allowed to read host env (I-6).
+pub(super) fn trust_all_env() -> bool {
+    std::env::var("MEOW_TRUST_ALL").is_ok_and(|v| v == "1")
+        || std::env::var("MEOW_DANGEROUSLY_DISABLE_SECURITY").is_ok_and(|v| v == "1")
+}
+
+/// `MEOW_SANDBOX=1` opts every `meow run` into the sandbox (tighten). An explicit
+/// `--trust`/`MEOW_TRUST_ALL` always wins over it.
+pub(super) fn sandbox_env() -> bool {
+    std::env::var("MEOW_SANDBOX").is_ok_and(|v| v == "1")
+}
+
+/// The sandbox's writable roots: the project dir, the process cwd (scaffolders
+/// like `create-*` write here), and the OS temp dir — canonicalized and
+/// de-duplicated. Network stays denied. Everything else (home dotfiles, `/etc`,
+/// caches, ssh keys) is read-only from the sandbox's point of view.
+fn sandbox_policy_for(project_dir: &Path, process_cwd: &Path) -> meow_runtime::SandboxPolicy {
+    let mut write_roots: Vec<PathBuf> = Vec::new();
+    for root in [
+        project_dir.to_path_buf(),
+        process_cwd.to_path_buf(),
+        std::env::temp_dir(),
+    ] {
+        let canonical = std::fs::canonicalize(&root).unwrap_or(root);
+        if !write_roots.contains(&canonical) {
+            write_roots.push(canonical);
+        }
+    }
+    meow_runtime::SandboxPolicy {
+        write_roots,
+        allow_net: false,
+    }
+}
+// === /SEC-001 ===
+
 fn run_flags(args: &RunArgs) -> RunFlagView<'_> {
+    let trusted = args.trust || trust_all_env();
     RunFlagView {
         argv: &args.argv,
-        allow_clock: args.allow_clock || args.trust,
-        allow_random: args.allow_random || args.trust,
+        allow_clock: args.allow_clock || trusted,
+        allow_random: args.allow_random || trusted,
         allow_env: &args.allow_env,
-        trust: args.trust,
+        trust: trusted,
+        sandbox: !trusted && (args.sandbox || sandbox_env()),
         max_old_space_size: args.max_old_space_size.or_else(env_max_old_space_size),
         no_snapshot: args.no_snapshot,
         v8_flags: args.v8_flags.as_deref(),
@@ -46,12 +92,14 @@ fn run_flags(args: &RunArgs) -> RunFlagView<'_> {
 }
 // === RUN-001 ===
 fn run_script_flags(args: &RunScriptArgs) -> RunFlagView<'_> {
+    let trusted = args.trust || trust_all_env();
     RunFlagView {
         argv: &args.argv,
-        allow_clock: args.allow_clock || args.trust,
-        allow_random: args.allow_random || args.trust,
+        allow_clock: args.allow_clock || trusted,
+        allow_random: args.allow_random || trusted,
         allow_env: &args.allow_env,
-        trust: args.trust,
+        trust: trusted,
+        sandbox: !trusted && (args.sandbox || sandbox_env()),
         max_old_space_size: args.max_old_space_size.or_else(env_max_old_space_size),
         no_snapshot: args.no_snapshot,
         v8_flags: args.v8_flags.as_deref(),
@@ -283,6 +331,7 @@ pub fn cmd_node_eval(args: NodeEvalArgs) -> ExitCode {
         allow_random: false,
         allow_env: &None,
         trust: false,
+        sandbox: false,
         max_old_space_size: env_max_old_space_size(),
         no_snapshot: false,
         v8_flags: None,
@@ -776,8 +825,19 @@ pub(super) async fn run_native_request(
     let deno_node_services =
         meow_runtime::node::DenoNodeServicesBuilder::new(deno_node_bridge).build();
 
-    // === RT-004 ===
-    let caps: meow_runtime::web::NetCaps = std::sync::Arc::new(meow_runtime::AllowAll);
+    // === RT-004 === / === SEC-001 ===
+    // Trusted runs (default `meow run`) keep AllowAll — byte-identical to before.
+    // Sandboxed runs (`meow x` by default, `meow run --sandbox`) enforce fs/net:
+    // the one policy drives the fetch gate's NetCaps here, meow's io/http seam
+    // (io_capability_extension below), and the Node stack's PermissionsContainer
+    // (NodeOptions.sandbox). Workers inherit it via WorkerSpawnConfig.
+    let sandbox = flags
+        .sandbox
+        .then(|| sandbox_policy_for(&request.project_dir, &request.process_cwd));
+    let caps: meow_runtime::web::NetCaps = match &sandbox {
+        Some(policy) => meow_runtime::sandbox_caps(policy.clone()),
+        None => std::sync::Arc::new(meow_runtime::AllowAll),
+    };
     let mut extensions = Vec::new();
     // === RT-005 ===
     extensions.push(meow_runtime::http_extension());
@@ -786,7 +846,14 @@ pub(super) async fn run_native_request(
     extensions.push(meow_loader::cjs_resolve_extension(resolver.clone()));
     // === /UI-001 ===
     // === /RT-005 ===
-    // === /RT-004 ===
+    // Seed meow's own capability seam (meow:http listen, meow-native io ops) with
+    // the sandbox too, so net/write enforcement is consistent across every seam.
+    if let Some(policy) = &sandbox {
+        extensions.push(meow_runtime::io_capability_extension(std::rc::Rc::new(
+            meow_runtime::SandboxCaps::new(policy.clone()),
+        )));
+    }
+    // === /RT-004 === / === /SEC-001 ===
 
     // === RT-006 ===
     let hermetic = run_hermetic_config(&flags, ctx.node_mode);
@@ -810,6 +877,7 @@ pub(super) async fn run_native_request(
             deno_node_services: Some(deno_node_services),
             caps: Some(caps),
             user_agent: Some(format!("meow/{}", env!("CARGO_PKG_VERSION"))),
+            sandbox: sandbox.clone(),
         },
     ));
     // === /RT-007 ===
@@ -822,7 +890,7 @@ pub(super) async fn run_native_request(
     // `build_worker_runtime` (snapshot op indices are positional).
     let worker_spawner: std::rc::Rc<dyn meow_runtime::worker::WorkerSpawner> =
         std::rc::Rc::new(super::worker::CliWorkerSpawner {
-            config: WorkerSpawnConfig::new(&ctx, &env, &flags),
+            config: WorkerSpawnConfig::new(&ctx, &env, &flags, sandbox),
         });
     extensions.push(meow_runtime::worker::worker_extension(Some(worker_spawner)));
     // === /WORKER-001 ===
@@ -905,16 +973,25 @@ pub(super) struct WorkerSpawnConfig {
     hermetic: meow_runtime::hermetic::HermeticConfig,
     max_heap_size: Option<usize>,
     no_snapshot: bool,
+    // === SEC-001 === a worker inherits the parent run's sandbox (else a package
+    // could escape enforcement by moving its work onto a worker thread).
+    sandbox: Option<meow_runtime::SandboxPolicy>,
 }
 
 impl WorkerSpawnConfig {
-    fn new(ctx: &RuntimeContext, env: &BTreeMap<String, String>, flags: &RunFlagView<'_>) -> Self {
+    fn new(
+        ctx: &RuntimeContext,
+        env: &BTreeMap<String, String>,
+        flags: &RunFlagView<'_>,
+        sandbox: Option<meow_runtime::SandboxPolicy>,
+    ) -> Self {
         WorkerSpawnConfig {
             ctx: ctx.clone(),
             env: env.clone(),
             hermetic: run_hermetic_config(flags, ctx.node_mode),
             max_heap_size: flags.max_old_space_size.map(|mib| mib * 1024 * 1024),
             no_snapshot: flags.no_snapshot,
+            sandbox,
         }
     }
 }
@@ -953,12 +1030,21 @@ pub(super) fn build_worker_runtime(
     let deno_node_services =
         meow_runtime::node::DenoNodeServicesBuilder::new(deno_node_bridge).build();
 
-    let caps: meow_runtime::web::NetCaps = std::sync::Arc::new(meow_runtime::AllowAll);
+    // === SEC-001 === a worker enforces the same sandbox as its parent run.
+    let caps: meow_runtime::web::NetCaps = match &config.sandbox {
+        Some(policy) => meow_runtime::sandbox_caps(policy.clone()),
+        None => std::sync::Arc::new(meow_runtime::AllowAll),
+    };
     let mut extensions = vec![
         meow_runtime::http_extension(),
         meow_runtime::ui_extension(),
         meow_loader::cjs_resolve_extension(resolver.clone()),
     ];
+    if let Some(policy) = &config.sandbox {
+        extensions.push(meow_runtime::io_capability_extension(std::rc::Rc::new(
+            meow_runtime::SandboxCaps::new(policy.clone()),
+        )));
+    }
     meow_runtime::hermetic::pin_deterministic_intl(&config.hermetic);
     extensions.extend(meow_runtime::hermetic::extensions(config.hermetic.clone()));
 
@@ -977,6 +1063,7 @@ pub(super) fn build_worker_runtime(
             deno_node_services: Some(deno_node_services),
             caps: Some(caps),
             user_agent: Some(format!("meow/{}", env!("CARGO_PKG_VERSION"))),
+            sandbox: config.sandbox.clone(),
         },
     ));
     // WORKER-001: worker ops LAST so the extension/op order matches `build.rs`
@@ -1776,6 +1863,7 @@ pub fn cmd_task(args: &TaskArgs) -> ExitCode {
         allow_random: false,
         allow_env: &None,
         trust: false,
+        sandbox: false,
         max_old_space_size: None,
         no_snapshot: false,
         v8_flags: None,

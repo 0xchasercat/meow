@@ -32,7 +32,7 @@ One AST parsed exactly once in memory. Zero redundant allocations. Zero configur
 * **The Parse-Once Pipeline:** Webpack, ESLint, Prettier, and Jest all drag your code through separate parsers, melting your CPU. `meow` maps your codebase **exactly once** in memory using the Oxc parser, natively feeding that single AST to the runtime, linter, formatter, typechecker, and bundler simultaneously.
 * **Soft Paws, Zero Waste Installs:** Packages download to a global content-addressed cache exactly once and instantly project into your workspace via Copy-on-Write (`clonefile` on macOS APFS) or highly parallel hardlinking (Linux/Windows). You get millisecond warm installs, zero messy symlink loops, and **0 bytes of duplicated disk space**.
 * **Fast by Math, Not by Cheating:** We don't skip cryptographic supply-chain signatures just to win Twitter speed benchmarks. `meow` executes full, ironclad **SHA-512 verification** by offloading heavy hashing to background OS threads so your network never stalls.
-* **Hermetic & Deterministic by Default:** Third-party execution utilities (like `npx` or dynamic imports) are a massive supply-chain security hazard. `meow` executes in a strict isolation sandbox by default: the system clock is frozen, environmental variables are hidden, and randomness is seeded. 
+* **Hermetic & Sandboxed by Default:** Third-party execution utilities (like `npx`/`meow x`) are a massive supply-chain security hazard. `meow x` runs ephemeral packages in a real sandbox by default: **the network is denied and filesystem writes are confined to the working directory**, while the system clock is frozen, environment variables are hidden, and randomness is seeded. Your own installed project (`meow run`) is trusted by default — opt into the same sandbox with `--sandbox`, or bypass everything permanently with a single `MEOW_TRUST_ALL=1`.
 * **Framework Ready from Day 1:** No magic, no toy examples. Powered by a highly tuned V8 engine, `meow` natively boots Next.js 15, Astro, Vite, Playwright, and Puppeteer right out of the box with full support for CommonJS and Node built-ins.
 
 ---
@@ -148,22 +148,31 @@ INSIGHT
 
 ## 🛡️ Security Boundaries & Opt-Outs
 
-To protect you against malicious npm updates, `meow` isolates script execution by default:
+`meow x` runs untrusted, ephemeral packages — the npm supply chain's sharpest edge — in a **sandbox by default**: the network is denied, filesystem writes are confined to the current directory + workspace, and the clock/entropy/env are hermetic. Your own installed project runs under `meow run` **trusted by default** (it's your code) — opt it into the sandbox per-run with `--sandbox`, or globally with `MEOW_SANDBOX=1`.
+
+Every denial names the exact bypass, so you're never stuck:
 
 ```bash
-🐾 Executing create-next-app in strict isolation.
-Set MEOW_DANGEROUSLY_DISABLE_SECURITY=1 or pass --trust to bypass.
+🐾 Sandboxing create-next-app: network denied, writes limited to this directory.
+   Pass --trust (or set MEOW_TRUST_ALL=1) for full access.
 
 ```
 
-We treat you like an adult. If you want to take the training wheels off completely and skip the flag typing, just run:
+Grant a single run full host access with `--trust`:
 
 ```bash
-echo "export MEOW_DANGEROUSLY_DISABLE_SECURITY=1" >> ~/.zshrc
+meow x --trust create-next-app my-app
 
 ```
 
-Power users can haul ass with zero nag screens; security-conscious CI environments stay completely locked down.
+We treat you like an adult. To take the training wheels off completely and permanently — one line, as easy as installing meow:
+
+```bash
+echo "export MEOW_TRUST_ALL=1" >> ~/.zshrc
+
+```
+
+Power users haul ass with zero nag screens; security-conscious CI stays completely locked down. (The older `MEOW_DANGEROUSLY_DISABLE_SECURITY=1` still works as an alias.)
 
 ---
 

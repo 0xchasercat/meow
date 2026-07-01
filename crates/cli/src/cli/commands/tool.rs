@@ -198,10 +198,14 @@ pub fn cmd_check(args: &PathArgs) -> ExitCode {
 
     // Dogfood our own omni-router: `meow x tsc` resolves tsc locally if installed
     // (via `meow add typescript`) or ephemerally if not. No node_modules/.bin or
-    // $PATH search — the graph handles binary resolution natively.
+    // $PATH search — the graph handles binary resolution natively. `--trust`: this
+    // is meow's own typechecker on the user's own project (a trusted toolchain
+    // path, like `meow run`), not an untrusted npx package, so it must not be
+    // fs/net-sandboxed (SEC-001) — tsc reads the whole project + writes tsbuildinfo.
     let meow_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("meow"));
     let mut cmd = std::process::Command::new(meow_exe);
     cmd.arg("x")
+        .arg("--trust")
         .arg("tsc")
         .arg("--")
         .arg("--project")
