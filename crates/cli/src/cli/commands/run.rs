@@ -167,6 +167,11 @@ pub(super) enum RunCommandError {
     AmbiguousBin { command: String, packages: String },
     #[error("cannot unpack cached package `{package}`: {reason}")]
     UnpackBin { package: String, reason: String },
+    #[error(
+        "cannot run `{command}`: required packages are not in the meow store \
+         (the content cache is cold or incomplete). Run `meow install` first."
+    )]
+    ColdStore { command: String },
     #[error("cannot spawn {shell}: {source}")]
     ShellSpawn {
         shell: &'static str,
@@ -1162,6 +1167,19 @@ fn plan_script(
     })
 }
 
+/// A missing blob in the content cache (a cold or incomplete store, e.g. after
+/// clearing `~/.meow`) — distinct from a corrupt/tampered blob, which must still
+/// surface as a hard integrity error rather than an "install it" hint.
+fn is_cold_cache_blob(err: &meow_pkg::MaterializeError) -> bool {
+    matches!(
+        err,
+        meow_pkg::MaterializeError::CacheBlob {
+            source: meow_pkg::CacheError::NotFound(_),
+            ..
+        }
+    )
+}
+
 fn resolve_package_bin(
     ctx: &RuntimeContext,
     command: &str,
@@ -1169,16 +1187,28 @@ fn resolve_package_bin(
 ) -> Result<Option<NativeRunRequest>, RunCommandError> {
     let store = meow_pkg::UnpackedStore::new(ctx.cache.root().join("unpacked"), ctx.cache.clone());
     let mut matches = Vec::new();
+    let mut cold_store = false;
     for (name, version) in ctx.graph.root_deps() {
         let Some(entry) = ctx.graph.lockfile().get(name, version) else {
             continue;
         };
-        let root = store
-            .ensure(&entry.integrity)
-            .map_err(|err| RunCommandError::UnpackBin {
-                package: name.to_string(),
-                reason: err.to_string(),
-            })?;
+        let root = match store.ensure(&entry.integrity) {
+            Ok(root) => root,
+            // A cold/incomplete content cache (e.g. after clearing ~/.meow) is
+            // missing this dep's blob. Skip it so an unrelated missing dep does
+            // not hide a bin that IS cached; if nothing resolves we surface one
+            // actionable error below instead of a cryptic per-blob message.
+            Err(err) if is_cold_cache_blob(&err) => {
+                cold_store = true;
+                continue;
+            }
+            Err(err) => {
+                return Err(RunCommandError::UnpackBin {
+                    package: name.to_string(),
+                    reason: err.to_string(),
+                });
+            }
+        };
         let manifest_path = root.join("package.json");
         let bytes = std::fs::read(&manifest_path).map_err(|source| {
             RunCommandError::CachedManifestRead {
@@ -1225,6 +1255,12 @@ fn resolve_package_bin(
     }
 
     match matches.len() {
+        // No bin matched only because required packages were missing from the
+        // store — tell the user to install rather than falling through to a
+        // confusing "command not found" shell error.
+        0 if cold_store => Err(RunCommandError::ColdStore {
+            command: command.to_owned(),
+        }),
         0 => Ok(None),
         1 => {
             let (_package, spec, bin_path) = matches.pop().expect("one match");
