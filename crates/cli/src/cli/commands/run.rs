@@ -975,10 +975,19 @@ pub(super) fn build_worker_runtime(
         },
     ));
     // WORKER-001: worker ops LAST so the extension/op order matches `build.rs`
-    // and `run_native_request` (snapshot op indices are positional). No spawner
-    // here -> a nested `new Worker(...)` inside a worker is inert for now; this
-    // worker's own channels are installed below as `WorkerSideState`.
-    extensions.push(meow_runtime::worker::worker_extension(None));
+    // and `run_native_request` (snapshot op indices are positional). Install a
+    // spawner so a worker can spawn NESTED workers (each on its own OS thread) --
+    // e.g. SvelteKit's prerender worker spins up miniflare's synchronous-fetch
+    // worker. The nested worker inherits THIS worker's effective env (Node
+    // parent-env semantics); its own `env` option, if any, overrides per spawn.
+    // This worker's channels are installed below as `WorkerSideState`.
+    let mut nested_config = config.clone();
+    nested_config.env = env.clone();
+    let nested_spawner: std::rc::Rc<dyn meow_runtime::worker::WorkerSpawner> =
+        std::rc::Rc::new(super::worker::CliWorkerSpawner {
+            config: nested_config,
+        });
+    extensions.push(meow_runtime::worker::worker_extension(Some(nested_spawner)));
 
     let startup_snapshot = if config.no_snapshot {
         None
