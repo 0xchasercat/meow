@@ -152,8 +152,11 @@ fn fmt_rewrites_and_then_check_succeeds() {
     std::fs::remove_dir_all(&tmp).ok();
 }
 
+// End-to-end: `meow bundle` drives Rolldown through meow's own resolver and
+// emits a real ESM chunk (dist/entry.js). Named for what it verifies now that
+// the bundler is fully wired — not a skeleton.
 #[test]
-fn bundle_entry_is_skeleton_with_pending_wiring_message() {
+fn bundle_emits_esm_chunk_via_rolldown_and_meow_resolver() {
     let tmp = load_tmp("bundle");
     let entry = tmp.join("entry.ts");
     let dist = tmp.join("dist");
