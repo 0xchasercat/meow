@@ -3,13 +3,13 @@
 //
 // meow-native `node:worker_threads`.
 //
-// meow runs workers as COOPERATIVE ISOLATES: each worker is its own
-// `deno_core::JsRuntime` (V8 isolate) driven as a `spawn_local` task on the SAME
-// OS thread as the main isolate (see `crates/cli/src/cli/commands/worker.rs`).
-// That keeps the runtime single-threaded (so meow's frozen-clock / seeded-RNG
-// determinism survives) and lets workers share the resolver + Oxc module graph
-// by `Rc` clone -- but cross-isolate values must be structured-cloned
-// (`core.serialize`/`core.deserialize`), never shared by reference.
+// meow runs each worker on its OWN OS thread with its OWN `deno_core::JsRuntime`
+// (V8 isolate) + tokio runtime (see `crates/cli/src/cli/commands/worker.rs`).
+// Determinism survives because every worker gets a clone of the run's hermetic
+// config (same frozen clock + seed). Cross-isolate values are structured-cloned
+// (`core.serialize`/`core.deserialize`); `SharedArrayBuffer`s are shared via a
+// process-global store so `Atomics.wait`/`notify` work across threads, and
+// `MessagePort`s transfer by carrying a registry id (`op_meow_port_*`).
 //
 // This replaces Deno's worker_threads polyfill, which is welded to
 // `deno_runtime`'s worker host (`op_create_worker`, `op_host_*`) and newer
@@ -92,7 +92,11 @@
         ? null
         : options.workerData;
 
-      this.#id = ops.op_meow_worker_create(spec, serialize(workerData), isEval);
+      this.#id = ops.op_meow_worker_create(
+        spec,
+        serializeForPort(workerData, options.transferList),
+        isEval,
+      );
       this.threadId = this.#id;
       this.resourceLimits = { ...(options.resourceLimits ?? {}) };
       this.#pump();
@@ -132,7 +136,7 @@
               // clone), messages as a `core.serialize`d value.
               this.emit("error", new Error(core.decode(payload)));
             } else {
-              this.emit("message", deserialize(payload));
+              this.emit("message", deserializeForPort(payload));
             }
             step();
           },
@@ -147,9 +151,12 @@
       step();
     }
 
-    postMessage(value) {
+    postMessage(value, transferList) {
       if (this.#terminated) return;
-      ops.op_meow_worker_host_post(this.#id, serialize(value));
+      ops.op_meow_worker_host_post(
+        this.#id,
+        serializeForPort(value, transferList),
+      );
     }
 
     terminate() {
@@ -171,8 +178,8 @@
   function makeParentPort() {
     const port = new EventEmitter();
     let closed = false;
-    port.postMessage = (value) => {
-      if (!closed) ops.op_meow_worker_post(serialize(value));
+    port.postMessage = (value, transferList) => {
+      if (!closed) ops.op_meow_worker_post(serializeForPort(value, transferList));
     };
     port.close = () => {
       closed = true;
@@ -190,7 +197,7 @@
           closed = true;
           return; // host terminated us
         }
-        const value = deserialize(bytes);
+        const value = deserializeForPort(bytes);
         port.emit("message", value);
         if (typeof port.onmessage === "function") port.onmessage({ data: value });
         step();
@@ -217,7 +224,7 @@
     if (!isMainThread) {
       const dataBytes = ops.op_meow_worker_data();
       exportsObj.workerData = dataBytes && dataBytes.length > 0
-        ? deserialize(dataBytes)
+        ? deserializeForPort(dataBytes)
         : null;
       exportsObj.parentPort = makeParentPort();
     }
@@ -232,41 +239,198 @@
     internals.__initWorkerThreads(false, workerId, null, moduleSpecifier);
   };
 
-  // ----------------- minimal MessagePort / MessageChannel -----------------
-  // SvelteKit/Vite drive workers through `Worker` + `parentPort` only; these
-  // give same-isolate channels for libraries that destructure the names at
-  // import time. Cross-isolate port transfer is not supported yet.
+  // ------------------- transferable MessagePort / MessageChannel -------------
+  // A `MessagePort` is backed by a PROCESS-GLOBAL registry endpoint keyed by an
+  // integer id (Rust `op_meow_port_*`). Because the endpoint lives in the
+  // registry by id, transferring a port to another isolate is just carrying its
+  // id across the structured clone: `serializeForPort` walks the value replacing
+  // each `MessagePort` with a `{ [PORT_MARKER]: id }` placeholder before
+  // `core.serialize`, and `deserializeForPort` rebuilds ports from placeholders
+  // after `core.deserialize`. `SharedArrayBuffer`/`ArrayBuffer` are left to
+  // `core.serialize` (shared / copied); we recurse only plain objects + arrays.
+  const PORT_MARKER = "__meow_transferred_port__";
+  const kPortId = Symbol("meowPortId");
+  const kNeuter = Symbol("meowNeuter");
+
+  const isPlainContainer = (v) => {
+    if (Array.isArray(v)) return true;
+    const proto = Object.getPrototypeOf(v);
+    return proto === Object.prototype || proto === null;
+  };
+
+  const hasPort = (value, seen) => {
+    if (value instanceof MessagePort) return true;
+    if (value === null || typeof value !== "object" || !isPlainContainer(value)) {
+      return false;
+    }
+    if (seen.has(value)) return false;
+    seen.add(value);
+    if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i++) {
+        if (hasPort(value[i], seen)) return true;
+      }
+    } else {
+      for (const key of Object.keys(value)) {
+        if (hasPort(value[key], seen)) return true;
+      }
+    }
+    return false;
+  };
+
+  const replacePorts = (value, seen) => {
+    if (value instanceof MessagePort) {
+      return { [PORT_MARKER]: value[kPortId] };
+    }
+    if (value === null || typeof value !== "object" || !isPlainContainer(value)) {
+      return value;
+    }
+    if (seen.has(value)) return seen.get(value);
+    const out = Array.isArray(value) ? [] : {};
+    seen.set(value, out);
+    if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i++) {
+        out[i] = replacePorts(value[i], seen);
+      }
+    } else {
+      for (const key of Object.keys(value)) {
+        out[key] = replacePorts(value[key], seen);
+      }
+    }
+    return out;
+  };
+
+  const isPortPlaceholder = (v) =>
+    v !== null && typeof v === "object" &&
+    typeof v[PORT_MARKER] === "number" && Object.keys(v).length === 1;
+
+  const restorePorts = (value, seen) => {
+    if (value === null || typeof value !== "object") return value;
+    if (isPortPlaceholder(value)) return new MessagePort(value[PORT_MARKER]);
+    if (!isPlainContainer(value)) return value;
+    if (seen.has(value)) return value;
+    seen.add(value);
+    if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i++) {
+        value[i] = restorePorts(value[i], seen);
+      }
+    } else {
+      for (const key of Object.keys(value)) {
+        value[key] = restorePorts(value[key], seen);
+      }
+    }
+    return value;
+  };
+
+  // Node detaches transferred ports from the sender; we neuter the local object
+  // WITHOUT closing the shared registry endpoint (the receiver adopts it by id).
+  const neuterTransferList = (transferList) => {
+    if (!Array.isArray(transferList)) return;
+    for (const item of transferList) {
+      if (item instanceof MessagePort) item[kNeuter]();
+    }
+  };
+
+  const serializeForPort = (value, transferList) => {
+    const bytes = hasPort(value, new WeakSet())
+      ? serialize(replacePorts(value, new WeakMap()))
+      : serialize(value);
+    neuterTransferList(transferList);
+    return bytes;
+  };
+
+  const deserializeForPort = (bytes) =>
+    restorePorts(deserialize(bytes), new WeakSet());
+
   class MessagePort extends EventEmitter {
-    #peer = null;
     #closed = false;
-    _link(peer) {
-      this.#peer = peer;
+    #started = false;
+    #onmessage = null;
+
+    constructor(id) {
+      super();
+      this[kPortId] = id;
     }
-    postMessage(value) {
-      if (this.#closed || !this.#peer) return;
-      const cloned = deserialize(serialize(value));
-      const peer = this.#peer;
-      PromisePrototypeThen(PromiseResolve(), () => {
-        peer.emit("message", cloned);
-        if (typeof peer.onmessage === "function") peer.onmessage({ data: cloned });
-      });
+
+    postMessage(value, transferList) {
+      if (this.#closed) return;
+      ops.op_meow_port_post(this[kPortId], serializeForPort(value, transferList));
     }
-    start() {}
+
+    // Node delivers nothing until the port is started (via `start()`, an
+    // `onmessage` setter, or a "message" listener). `receiveMessageOnPort`
+    // drains synchronously without starting the async pump.
+    start() {
+      if (this.#started || this.#closed) return;
+      this.#started = true;
+      const step = () => {
+        if (this.#closed) return;
+        PromisePrototypeThen(ops.op_meow_port_recv(this[kPortId]), (bytes) => {
+          if (this.#closed) return;
+          if (bytes.length === 0) return; // peer closed (EOF)
+          const value = deserializeForPort(bytes);
+          this.emit("message", value);
+          if (typeof this.#onmessage === "function") {
+            this.#onmessage({ data: value });
+          }
+          step();
+        });
+      };
+      step();
+    }
+
     close() {
+      if (this.#closed) return;
+      this.#closed = true;
+      ops.op_meow_port_close(this[kPortId]);
+    }
+
+    get onmessage() {
+      return this.#onmessage;
+    }
+    set onmessage(fn) {
+      this.#onmessage = typeof fn === "function" ? fn : null;
+      if (this.#onmessage) this.start();
+    }
+
+    // Web `EventTarget` shim (miniflare uses `addEventListener`): deliver
+    // "message"/"messageerror" as `{ data }` events and auto-start on "message".
+    addEventListener(type, listener) {
+      if (typeof listener !== "function") return;
+      if (type === "message") {
+        this.on("message", (value) => listener({ data: value }));
+        this.start();
+      } else {
+        this.on(type, listener);
+      }
+    }
+    removeEventListener(type) {
+      this.removeAllListeners(type);
+    }
+
+    [kNeuter]() {
       this.#closed = true;
     }
+
     ref() {}
     unref() {}
   }
 
   class MessageChannel {
     constructor() {
-      this.port1 = new MessagePort();
-      this.port2 = new MessagePort();
-      this.port1._link(this.port2);
-      this.port2._link(this.port1);
+      const pair = ops.op_meow_port_channel_new();
+      this.port1 = new MessagePort(pair[0]);
+      this.port2 = new MessagePort(pair[1]);
     }
   }
+
+  // Synchronous, non-blocking drain -- the piece that lets a thread read a port's
+  // reply while it is blocked in `Atomics.wait` (miniflare's synchronous fetch).
+  const receiveMessageOnPort = (port) => {
+    if (!(port instanceof MessagePort)) return undefined;
+    const bytes = ops.op_meow_port_recv_sync(port[kPortId]);
+    if (bytes.length === 0) return undefined;
+    return { message: deserializeForPort(bytes) };
+  };
 
   const SHARE_ENV = Symbol.for("nodejs.worker_threads.SHARE_ENV");
   const environmentData = new SafeMap();
@@ -292,7 +456,7 @@
     markAsUncloneable: identity,
     isMarkedAsUntransferable: () => false,
     moveMessagePortToContext: identity,
-    receiveMessageOnPort: () => undefined,
+    receiveMessageOnPort,
     setMaxListeners: (n, ...targets) => {
       if (typeof EventEmitter.setMaxListeners === "function") {
         EventEmitter.setMaxListeners(n, ...targets);

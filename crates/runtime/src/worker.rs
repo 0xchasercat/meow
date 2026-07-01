@@ -25,10 +25,11 @@
 //! on its own thread).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::task::{Poll, Waker};
 
 use deno_core::{extension, op2, Extension, JsBuffer, OpState};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -205,6 +206,11 @@ extension!(
         op_meow_worker_post,
         op_meow_worker_recv,
         op_meow_worker_data,
+        op_meow_port_channel_new,
+        op_meow_port_post,
+        op_meow_port_recv,
+        op_meow_port_recv_sync,
+        op_meow_port_close,
     ],
 );
 
@@ -401,4 +407,159 @@ fn op_meow_worker_data(state: &mut OpState) -> Result<Vec<u8>, deno_error::JsErr
         .try_borrow::<WorkerSideState>()
         .map(|side| side.data.clone())
         .unwrap_or_default())
+}
+
+// ------------------------- MessageChannel ports -------------------------
+//
+// `MessageChannel` / `MessagePort` (the transferable kind, distinct from a
+// worker's `parentPort`) are backed by a PROCESS-GLOBAL, id-keyed registry of
+// endpoints with cross-thread queues. A port "lives" in the registry by id, so
+// transferring it to another isolate is just handing over the id (the JS side
+// embeds it in the structured-cloned value) — either isolate then addresses the
+// same endpoint by id through these ops. Two properties make this work for
+// miniflare's synchronous fetch:
+//   * cross-thread delivery: the worker thread can push into a port's queue
+//     while the main thread is blocked inside `Atomics.wait` (a plain
+//     `Mutex`-guarded `VecDeque`, no event loop needed on the receiver);
+//   * synchronous drain: `receiveMessageOnPort` pops without awaiting
+//     (`op_meow_port_recv_sync`), so the just-woken main thread can read the
+//     reply immediately.
+
+/// One end of a `MessageChannel`. Messages posted from the peer land in `queue`;
+/// `waker` belongs to a pending async `op_meow_port_recv` for the `onmessage`
+/// pump (woken cross-thread by the peer's post / close).
+struct PortEndpoint {
+    queue: VecDeque<Vec<u8>>,
+    peer: u32,
+    waker: Option<Waker>,
+    closed: bool,
+    peer_closed: bool,
+}
+
+impl PortEndpoint {
+    fn new(peer: u32) -> PortEndpoint {
+        PortEndpoint {
+            queue: VecDeque::new(),
+            peer,
+            waker: None,
+            closed: false,
+            peer_closed: false,
+        }
+    }
+}
+
+#[derive(Default)]
+struct PortRegistry {
+    ports: HashMap<u32, PortEndpoint>,
+    next_id: u32,
+}
+
+/// Process-global registry shared by every isolate (main + all workers). The
+/// `Mutex` is only ever held for brief, non-blocking critical sections (never
+/// across an `.await`), so it is safe to touch from any thread's op.
+fn port_registry() -> &'static StdMutex<PortRegistry> {
+    static REGISTRY: OnceLock<StdMutex<PortRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| StdMutex::new(PortRegistry::default()))
+}
+
+/// Create an entangled pair; returns `[id1, id2]`. `id1` posts reach `id2`'s
+/// queue and vice versa.
+#[op2]
+#[serde]
+fn op_meow_port_channel_new() -> Vec<u32> {
+    let mut reg = port_registry().lock().unwrap();
+    let id1 = reg.next_id;
+    let id2 = id1.wrapping_add(1);
+    reg.next_id = id2.wrapping_add(1);
+    reg.ports.insert(id1, PortEndpoint::new(id2));
+    reg.ports.insert(id2, PortEndpoint::new(id1));
+    vec![id1, id2]
+}
+
+/// Post `data` from port `id` to its peer's queue, waking a pending async recv.
+#[op2]
+fn op_meow_port_post(#[smi] id: u32, #[buffer] data: JsBuffer) {
+    let waker = {
+        let mut reg = port_registry().lock().unwrap();
+        let Some(peer) = reg.ports.get(&id).filter(|e| !e.closed).map(|e| e.peer) else {
+            return;
+        };
+        match reg.ports.get_mut(&peer) {
+            Some(peer_ep) if !peer_ep.closed => {
+                peer_ep.queue.push_back(data.to_vec());
+                peer_ep.waker.take()
+            }
+            _ => None,
+        }
+    };
+    // Wake AFTER releasing the lock to avoid any re-entrant lock attempt.
+    if let Some(waker) = waker {
+        waker.wake();
+    }
+}
+
+/// Async receive for port `id` (the `onmessage` pump). Resolves to the next
+/// message, or an empty buffer when the peer has closed (EOF).
+#[op2]
+#[buffer]
+async fn op_meow_port_recv(#[smi] id: u32) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    Ok(std::future::poll_fn(move |cx| {
+        let mut reg = port_registry().lock().unwrap();
+        match reg.ports.get_mut(&id) {
+            Some(endpoint) => {
+                if let Some(message) = endpoint.queue.pop_front() {
+                    Poll::Ready(message)
+                } else if endpoint.peer_closed {
+                    Poll::Ready(Vec::new())
+                } else {
+                    endpoint.waker = Some(cx.waker().clone());
+                    Poll::Pending
+                }
+            }
+            None => Poll::Ready(Vec::new()),
+        }
+    })
+    .await)
+}
+
+/// Synchronous, non-blocking drain for port `id` (`receiveMessageOnPort`).
+/// Returns an empty buffer when no message is queued (a real message is never
+/// empty — `core.serialize` always writes a header).
+#[op2]
+#[buffer]
+fn op_meow_port_recv_sync(#[smi] id: u32) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    let mut reg = port_registry().lock().unwrap();
+    Ok(reg
+        .ports
+        .get_mut(&id)
+        .and_then(|endpoint| endpoint.queue.pop_front())
+        .unwrap_or_default())
+}
+
+/// Close port `id`: mark it closed, mark the peer's `peer_closed` so a pending
+/// peer recv resolves to EOF, and wake both sides. The endpoint records remain
+/// (cheap) until the process exits.
+#[op2(fast)]
+fn op_meow_port_close(#[smi] id: u32) {
+    let (own_waker, peer_waker) = {
+        let mut reg = port_registry().lock().unwrap();
+        let (peer, own_waker) = match reg.ports.get_mut(&id) {
+            Some(endpoint) => {
+                endpoint.closed = true;
+                (endpoint.peer, endpoint.waker.take())
+            }
+            None => return,
+        };
+        let peer_waker = reg.ports.get_mut(&peer).and_then(|peer_ep| {
+            peer_ep.peer_closed = true;
+            peer_ep.waker.take()
+        });
+        (own_waker, peer_waker)
+    };
+    if let Some(waker) = own_waker {
+        waker.wake();
+    }
+    if let Some(waker) = peer_waker {
+        waker.wake();
+    }
 }
