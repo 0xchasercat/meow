@@ -33,18 +33,51 @@ use std::sync::{Arc, OnceLock};
 use deno_core::{extension, op2, Extension, JsBuffer, OpState};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::Notify;
 
 use crate::v8::IsolateHandle;
 
 /// Framing tags shared with `worker_threads.ts`: `op_meow_worker_host_recv`
 /// returns `[tag, ...payload]`; an empty buffer means the worker exited.
+/// `Online` carries no payload — it fires the Node `'online'` event the moment
+/// the worker isolate starts, independent of any message (worker pools wait on
+/// `'online'` before dispatching work, so tying it to the first message would
+/// deadlock).
 const CTRL_MESSAGE: u8 = 0;
 const CTRL_ERROR: u8 = 1;
+const CTRL_ONLINE: u8 = 2;
+
+/// Opt-in worker lifecycle tracing (`MEOW_WORKER_DEBUG`). The BINARY EDGE is the
+/// only place allowed to read host env (I-6); it calls [`set_worker_debug`], and
+/// the ops here only ever read this process-global flag — never the environment.
+static WORKER_DEBUG: AtomicBool = AtomicBool::new(false);
+
+/// Enable/disable worker tracing. Called once by the binary edge after reading
+/// `MEOW_WORKER_DEBUG`.
+pub fn set_worker_debug(on: bool) {
+    WORKER_DEBUG.store(on, Ordering::Relaxed);
+}
+
+/// Whether worker tracing is on (read by both this crate's ops and the binary
+/// edge's driver, so both share one env-free source of truth).
+pub fn worker_debug() -> bool {
+    WORKER_DEBUG.load(Ordering::Relaxed)
+}
+
+macro_rules! wtrace {
+    ($id:expr, $($arg:tt)*) => {
+        if $crate::worker::worker_debug() {
+            eprintln!("[meow-worker {}] {}", $id, format!($($arg)*));
+        }
+    };
+}
 
 /// A worker -> host event. `Message` carries a `core.serialize`d JS value;
-/// `Error` carries a UTF-8 error string (the polyfill wraps it in an `Error`).
-/// Both variants are `Send`, so the worker->host channel crosses OS threads.
+/// `Error` carries a UTF-8 error string (the polyfill wraps it in an `Error`);
+/// `Online` signals the worker isolate has started. All variants are `Send`, so
+/// the worker->host channel crosses OS threads.
 pub enum HostEvent {
+    Online,
     Message(Vec<u8>),
     Error(String),
 }
@@ -72,6 +105,10 @@ struct HostWorker {
     isolate: SharedIsolate,
     /// Cooperative-stop hint; the hard stop is [`IsolateHandle::terminate_execution`].
     terminated: Arc<AtomicBool>,
+    /// Wakes a pending `op_meow_worker_host_recv` on `terminate()` so the main
+    /// event loop stops waiting on a worker that may be parked (idle) and thus
+    /// not about to drop its outbox on its own. Main-thread only.
+    terminate_wake: Rc<Notify>,
 }
 
 /// All live workers spawned from a runtime; stored as `Rc<RefCell<WorkerManager>>`
@@ -86,6 +123,7 @@ pub struct WorkerManager {
 /// the WORKER runtime's `OpState` (on the worker thread); the guest ops read it.
 /// `!Send` by design — it is built and consumed entirely on the worker thread.
 pub struct WorkerSideState {
+    id: u32,
     data: Vec<u8>,
     inbox: SharedReceiver<Vec<u8>>,
     outbox: UnboundedSender<HostEvent>,
@@ -94,13 +132,15 @@ pub struct WorkerSideState {
 impl WorkerSideState {
     /// Wrap the raw (Send) channel endpoints handed across the thread boundary
     /// into the thread-local shapes the guest ops expect. Call on the worker
-    /// thread.
+    /// thread. `id` is carried only for trace correlation with the host side.
     pub fn new(
+        id: u32,
         data: Vec<u8>,
         inbox: UnboundedReceiver<Vec<u8>>,
         outbox: UnboundedSender<HostEvent>,
     ) -> WorkerSideState {
         WorkerSideState {
+            id,
             data,
             inbox: Rc::new(AsyncMutex::new(inbox)),
             outbox,
@@ -183,6 +223,7 @@ fn op_meow_worker_create(
     let Some(spawner) = state.try_borrow::<Rc<dyn WorkerSpawner>>().cloned() else {
         // No spawner installed (e.g. snapshot warmup, or a context that does not
         // support workers). u32::MAX is an inert id the host never tracks.
+        wtrace!(u32::MAX, "create: no spawner installed -> inert worker");
         return u32::MAX;
     };
 
@@ -202,11 +243,13 @@ fn op_meow_worker_create(
                 outbox: Rc::new(AsyncMutex::new(host_outbox)),
                 isolate: isolate.clone(),
                 terminated: terminated.clone(),
+                terminate_wake: Rc::new(Notify::new()),
             },
         );
         id
     };
 
+    wtrace!(id, "create spec={specifier} data={}B", worker_data.len());
     spawner.spawn(WorkerSpawnRequest {
         id,
         specifier,
@@ -226,7 +269,10 @@ fn op_meow_worker_host_post(state: &mut OpState, #[smi] id: u32, #[buffer] data:
     if let Some(worker) = mgr.workers.get(&id) {
         // Unbounded send never blocks: it just enqueues + wakes the worker's
         // event loop on its own thread.
+        wtrace!(id, "host_post -> worker ({}B)", data.len());
         let _ = worker.inbox.send(data.to_vec());
+    } else {
+        wtrace!(id, "host_post: worker not found (already exited?)");
     }
 }
 
@@ -236,23 +282,42 @@ async fn op_meow_worker_host_recv(
     state: Rc<RefCell<OpState>>,
     #[smi] id: u32,
 ) -> Result<Vec<u8>, deno_error::JsErrorBox> {
-    let (manager, outbox) = {
+    let (manager, outbox, terminate_wake) = {
         let state = state.borrow();
         let manager = state.borrow::<Rc<RefCell<WorkerManager>>>().clone();
-        let outbox = match manager.borrow().workers.get(&id) {
-            Some(worker) => worker.outbox.clone(),
+        let (outbox, terminate_wake) = match manager.borrow().workers.get(&id) {
+            Some(worker) => (worker.outbox.clone(), worker.terminate_wake.clone()),
             None => return Ok(Vec::new()),
         };
-        (manager, outbox)
+        (manager, outbox, terminate_wake)
     };
     let mut rx = outbox.lock().await;
-    match rx.recv().await {
-        Some(HostEvent::Message(bytes)) => Ok(frame(CTRL_MESSAGE, &bytes)),
-        Some(HostEvent::Error(text)) => Ok(frame(CTRL_ERROR, text.as_bytes())),
+    // `terminate()` may fire while the worker is parked (idle) and therefore not
+    // about to drop its outbox; the notify wakes us so the main event loop is not
+    // pinned open by this pending recv. `biased` prioritises prompt termination.
+    let event = tokio::select! {
+        biased;
+        _ = terminate_wake.notified() => None,
+        ev = rx.recv() => ev,
+    };
+    match event {
+        Some(HostEvent::Online) => {
+            wtrace!(id, "host_recv <- ONLINE");
+            Ok(frame(CTRL_ONLINE, &[]))
+        }
+        Some(HostEvent::Message(bytes)) => {
+            wtrace!(id, "host_recv <- message ({}B)", bytes.len());
+            Ok(frame(CTRL_MESSAGE, &bytes))
+        }
+        Some(HostEvent::Error(text)) => {
+            wtrace!(id, "host_recv <- error: {text}");
+            Ok(frame(CTRL_ERROR, text.as_bytes()))
+        }
         None => {
-            // Worker exited (its outbox sender dropped): drop the host record so
-            // a long-lived main process does not accumulate dead entries. The
+            // Worker exited or was terminated: drop the host record so a
+            // long-lived main process does not accumulate dead entries. The
             // cloned `outbox` Rc keeps the receiver alive until this op returns.
+            wtrace!(id, "host_recv <- EOF (exit)");
             manager.borrow_mut().workers.remove(&id);
             Ok(Vec::new())
         }
@@ -264,13 +329,19 @@ fn op_meow_worker_terminate(state: &mut OpState, #[smi] id: u32) {
     let manager = state.borrow::<Rc<RefCell<WorkerManager>>>().clone();
     let mut mgr = manager.borrow_mut();
     if let Some(worker) = mgr.workers.remove(&id) {
+        wtrace!(id, "terminate");
         worker.terminated.store(true, Ordering::Relaxed);
-        // Hard stop: interrupt V8 on the worker thread. Safe cross-thread — that
-        // is exactly what `IsolateHandle` is for. No-op if the worker has not
-        // published its handle yet (it checks `terminated` before running).
+        // Hard stop: interrupt V8 on the worker thread if it is executing JS.
+        // Safe cross-thread — that is exactly what `IsolateHandle` is for. No-op
+        // if the worker has not published its handle yet (it checks `terminated`
+        // before running).
         if let Some(handle) = worker.isolate.get() {
             handle.terminate_execution();
         }
+        // Dropping `worker` closes the inbox (worker's recv -> EOF, so an idle
+        // worker winds down); the notify wakes any pending host recv now so the
+        // main event loop can complete without waiting on that chain.
+        worker.terminate_wake.notify_one();
     }
 }
 
@@ -279,6 +350,7 @@ fn op_meow_worker_terminate(state: &mut OpState, #[smi] id: u32) {
 #[op2]
 fn op_meow_worker_post(state: &mut OpState, #[buffer] data: JsBuffer) {
     if let Some(side) = state.try_borrow::<WorkerSideState>() {
+        wtrace!(side.id, "post -> host ({}B)", data.len());
         let _ = side.outbox.send(HostEvent::Message(data.to_vec()));
     }
 }
@@ -288,15 +360,22 @@ fn op_meow_worker_post(state: &mut OpState, #[buffer] data: JsBuffer) {
 async fn op_meow_worker_recv(
     state: Rc<RefCell<OpState>>,
 ) -> Result<Vec<u8>, deno_error::JsErrorBox> {
-    let inbox = {
+    let (id, inbox) = {
         let state = state.borrow();
         match state.try_borrow::<WorkerSideState>() {
-            Some(side) => side.inbox.clone(),
+            Some(side) => (side.id, side.inbox.clone()),
             None => return Ok(Vec::new()),
         }
     };
     let mut rx = inbox.lock().await;
-    Ok(rx.recv().await.unwrap_or_default())
+    let msg = rx.recv().await.unwrap_or_default();
+    wtrace!(
+        id,
+        "recv <- host ({}B{})",
+        msg.len(),
+        if msg.is_empty() { " EOF" } else { "" }
+    );
+    Ok(msg)
 }
 
 #[op2]

@@ -22,12 +22,24 @@
 
 use std::sync::atomic::Ordering;
 
-use meow_runtime::worker::{HostEvent, WorkerSideState, WorkerSpawnRequest, WorkerSpawner};
+use meow_runtime::worker::{
+    worker_debug, HostEvent, WorkerSideState, WorkerSpawnRequest, WorkerSpawner,
+};
 use meow_runtime::ModuleSpecifier;
 
 use crate::cli::hiss;
 
 use super::run::{build_worker_runtime, WorkerSpawnConfig};
+
+/// Gated worker-lifecycle tracing (`MEOW_WORKER_DEBUG`), mirroring the runtime
+/// crate's op traces so a full spawn/message/exit timeline appears together.
+macro_rules! wtrace {
+    ($id:expr, $($arg:tt)*) => {
+        if worker_debug() {
+            eprintln!("[meow-worker {}] {}", $id, format!($($arg)*));
+        }
+    };
+}
 
 // Compile-time guarantee that everything moved onto a worker OS thread is `Send`.
 // If a future change adds an `!Send` field (e.g. an `Rc`) to the config or the
@@ -78,6 +90,7 @@ impl WorkerSpawner for CliWorkerSpawner {
 /// Worker OS-thread entrypoint: stand up a dedicated single-threaded tokio
 /// runtime + V8 isolate for this worker, then drive it to completion.
 fn run_worker_thread(config: WorkerSpawnConfig, request: WorkerSpawnRequest) {
+    wtrace!(request.id, "thread started (spec={})", request.specifier);
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -94,11 +107,12 @@ fn run_worker_thread(config: WorkerSpawnConfig, request: WorkerSpawnRequest) {
 }
 
 async fn drive_worker(config: WorkerSpawnConfig, req: WorkerSpawnRequest) {
+    let id = req.id;
     if req.terminated.load(Ordering::Relaxed) {
         return;
     }
-    // Keep a sender clone for early-failure reporting before the worker side
-    // takes ownership of the original.
+    // Keep a sender clone for the online signal + early-failure reporting before
+    // the worker side takes ownership of the original.
     let outbox = req.outbox.clone();
     let Some(spec) = worker_module_specifier(&req.specifier) else {
         let _ = outbox.send(HostEvent::Error(format!(
@@ -108,10 +122,12 @@ async fn drive_worker(config: WorkerSpawnConfig, req: WorkerSpawnRequest) {
         return;
     };
 
-    let worker_side = WorkerSideState::new(req.worker_data, req.inbox, req.outbox);
+    wtrace!(id, "building runtime");
+    let worker_side = WorkerSideState::new(id, req.worker_data, req.inbox, req.outbox);
     let mut runtime = match build_worker_runtime(&config, &spec, worker_side) {
         Ok(runtime) => runtime,
         Err(err) => {
+            wtrace!(id, "build failed: {err}");
             let _ = outbox.send(HostEvent::Error(err));
             return;
         }
@@ -128,19 +144,34 @@ async fn drive_worker(config: WorkerSpawnConfig, req: WorkerSpawnRequest) {
     // so it uses the `globalThis` hook the polyfill installed during bootstrap.
     let init = format!(
         "globalThis.__meowInitWorkerThread({}, {});",
-        req.id,
+        id,
         json_string(spec.as_str())
     );
     if let Err(err) = runtime.execute_script("meow:worker-init", init) {
+        wtrace!(id, "init failed: {err}");
         let _ = outbox.send(HostEvent::Error(err.to_string()));
         return;
     }
 
+    // Signal `'online'` NOW — the isolate is up and parentPort is pumping, ready
+    // to receive. Node fires `'online'` on worker start (not on first message);
+    // worker pools wait for it before dispatching work, so tying it to a message
+    // would deadlock. Sent before `run_main_module` so it is the first frame the
+    // host observes.
+    wtrace!(id, "online; running module {spec}");
+    let _ = outbox.send(HostEvent::Online);
+
     // Drive the worker module to completion. It stays alive while parentPort has
     // a pending receive; `terminate()` stops it via `terminate_execution`.
-    if let Err(err) = runtime.run_main_module(&spec).await {
-        if !req.terminated.load(Ordering::Relaxed) {
-            let _ = outbox.send(HostEvent::Error(err.to_string()));
+    match runtime.run_main_module(&spec).await {
+        Ok(()) => wtrace!(id, "module completed"),
+        Err(err) => {
+            if req.terminated.load(Ordering::Relaxed) {
+                wtrace!(id, "module stopped by terminate()");
+            } else {
+                wtrace!(id, "module error: {err}");
+                let _ = outbox.send(HostEvent::Error(err.to_string()));
+            }
         }
     }
     // `outbox` and `runtime` drop here: the host's pending recv resolves to

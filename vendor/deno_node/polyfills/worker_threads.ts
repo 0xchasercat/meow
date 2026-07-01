@@ -42,11 +42,15 @@
   const deserialize = (bytes) => core.deserialize(bytes);
 
   // `op_meow_worker_host_recv` returns a framed Uint8Array: byte 0 is the tag
-  // (CTRL_MESSAGE | CTRL_ERROR), the rest is the serialized payload. An EMPTY
-  // buffer means the worker isolate has exited. (Framing avoids fragile
-  // option-of-tuple op return shapes across the op2 boundary.)
+  // (CTRL_MESSAGE | CTRL_ERROR | CTRL_ONLINE), the rest is the serialized
+  // payload. An EMPTY buffer means the worker isolate has exited. (Framing
+  // avoids fragile option-of-tuple op return shapes across the op2 boundary.)
+  // CTRL_ONLINE has no payload; it fires the `'online'` event the moment the
+  // worker isolate starts (Node semantics -- pools wait for it before dispatching
+  // work, so it must NOT be tied to the first message).
   const CTRL_MESSAGE = 0;
   const CTRL_ERROR = 1;
+  const CTRL_ONLINE = 2;
 
   // The live module exports. `__initWorkerThreads` mutates the bootstrap fields
   // (isMainThread / threadId / parentPort / workerData) in place; the synthetic
@@ -91,18 +95,29 @@
           ops.op_meow_worker_host_recv(this.#id),
           (frame) => {
             if (this.#terminated) return;
-            // First event observed => the worker isolate is live.
-            if (!this.#onlineEmitted) {
-              this.#onlineEmitted = true;
-              this.emit("online");
-            }
             if (frame.length === 0) {
               this.#terminated = true;
               this.emit("exit", 0);
               return;
             }
+            const tag = frame[0];
+            if (tag === CTRL_ONLINE) {
+              // Explicit start signal from the worker driver.
+              if (!this.#onlineEmitted) {
+                this.#onlineEmitted = true;
+                this.emit("online");
+              }
+              step();
+              return;
+            }
+            // Safety net: if a message/error somehow precedes the explicit online
+            // frame, still emit `'online'` first (Node emits it before any event).
+            if (!this.#onlineEmitted) {
+              this.#onlineEmitted = true;
+              this.emit("online");
+            }
             const payload = TypedArrayPrototypeSubarray(frame, 1);
-            if (frame[0] === CTRL_ERROR) {
+            if (tag === CTRL_ERROR) {
               // Errors arrive as a UTF-8 string (the Rust driver can't structured-
               // clone), messages as a `core.serialize`d value.
               this.emit("error", new Error(core.decode(payload)));

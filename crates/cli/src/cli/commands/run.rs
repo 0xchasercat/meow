@@ -723,6 +723,10 @@ pub(super) async fn run_native_request(
     env: BTreeMap<String, String>,
 ) -> Result<ExitCode, RunCommandError> {
     let mut env = env;
+    // === WORKER-001 === opt-in worker tracing. The binary edge is the only place
+    // allowed to read host env (I-6); hand the flag to the runtime crate, whose
+    // worker ops read it from a process-global — never from the environment.
+    meow_runtime::worker::set_worker_debug(std::env::var_os("MEOW_WORKER_DEBUG").is_some());
     let host_home = host::host_home();
     env.entry("HOME".to_owned())
         .or_insert_with(|| host_home.to_string_lossy().into_owned());
