@@ -68,7 +68,9 @@ impl WorkerSpawner for CliWorkerSpawner {
             // the JS side's pending recv resolves to EOF and the `Worker` emits
             // `exit`. Surface the cause through the branded UI (stderr, and
             // non-interactive-safe).
-            hiss(&format!("worker_threads: failed to spawn worker thread: {err}"));
+            hiss(&format!(
+                "worker_threads: failed to spawn worker thread: {err}"
+            ));
         }
     }
 }

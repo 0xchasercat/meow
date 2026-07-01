@@ -285,7 +285,9 @@ fn op_meow_worker_post(state: &mut OpState, #[buffer] data: JsBuffer) {
 
 #[op2]
 #[buffer]
-async fn op_meow_worker_recv(state: Rc<RefCell<OpState>>) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+async fn op_meow_worker_recv(
+    state: Rc<RefCell<OpState>>,
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
     let inbox = {
         let state = state.borrow();
         match state.try_borrow::<WorkerSideState>() {
