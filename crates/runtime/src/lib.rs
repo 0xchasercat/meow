@@ -217,11 +217,16 @@ fn shared_array_buffer_store() -> SharedArrayBufferStore {
 /// Apply raw V8 engine flags before any isolate is created.
 /// Calls `v8::V8::set_flags_from_command_line` which is a process-global
 /// init point — must be invoked before any `JsRuntime` is constructed.
-fn apply_v8_flags(raw: &str) {
+fn apply_v8_flags(user_raw: Option<&str>) {
+    let mut flags = "--max-semi-space-size=128".to_string();
+    if let Some(raw) = user_raw {
+        flags.push(' ');
+        flags.push_str(raw);
+    }
     // Split on both commas and whitespace so users can use either separator:
     //   --v8-flags=--allow-natives-syntax,--trace-opt
     //   --v8-flags="--allow-natives-syntax --trace-opt"
-    let joined = raw.replace(',', " ");
+    let joined = flags.replace(',', " ");
     let mut args: Vec<String> = vec!["meow".to_string()];
     args.extend(joined.split_whitespace().map(|s| s.to_string()));
     v8::V8::set_flags_from_command_line(args);
@@ -243,9 +248,7 @@ impl Runtime {
     /// a later spec (meow:fs + SEC/P6).
     pub fn new(options: RuntimeOptions) -> Result<Runtime, RuntimeError> {
         maximize_fd_limit();
-        if let Some(raw) = options.v8_flags.as_deref() {
-            apply_v8_flags(raw);
-        }
+        apply_v8_flags(options.v8_flags.as_deref());
         let mut extensions = Vec::with_capacity(options.extensions.len() + 1);
         extensions.push(ext::meow_runtime::init());
         extensions.extend(options.extensions);

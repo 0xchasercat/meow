@@ -7,7 +7,7 @@ edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/meow-rs/meow"
-version = "0.1.0"
+version = "0.1.1"
 
 # Externals are DECLARED centrally so consuming crates inherit one pin each.
 # A pin here costs nothing until a crate lists it under its own [dependencies].
@@ -15,6 +15,7 @@ version = "0.1.0"
 # its own `# === <SPEC-ID> ===` marker (keeps fence-balance meaningful, makes the
 # footprint audit a single read).
 [workspace.dependencies]
+mimalloc = { version = "0.1", default-features = false }
 # === DIST-001 ===
 # V8 — unmodified upstream `deno_core` (re-exports `v8`), never forked (I-10, CANON §26.2, ADR-1).
 # Pin confirmed by RT-001's V8 build; consumed by RT-* (use `deno_core::v8`, no direct v8 dep).

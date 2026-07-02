@@ -842,16 +842,17 @@ function readFilePromise(
 
 function readFileSync(
   path: string | URL | number,
-  opt: TextOptionsArgument,
-): string;
-function readFileSync(
-  path: string | URL | number,
-  opt?: BinaryOptionsArgument,
-): Buffer;
-function readFileSync(
-  path: string | URL | number,
   opt?: FileOptionsArgument,
 ): string | Buffer {
+  if (typeof path === "string" && opt === undefined) {
+    try {
+      const data = op_fs_read_file_sync(path, 0);
+      return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+    } catch (err) {
+      throw denoErrorToNodeError(err as Error, { path, syscall: "open" });
+    }
+  }
+
   const options = getOptions<FileOptions>(opt, readFileDefaultOptions);
 
   let data;
@@ -865,7 +866,7 @@ function readFileSync(
     try {
       data = op_fs_read_file_sync(path, flagsNumber);
     } catch (err) {
-      throw denoErrorToNodeError(err, { path, syscall: "open" });
+      throw denoErrorToNodeError(err as Error, { path, syscall: "open" });
     }
   }
   const textOrBuffer = readFileMaybeDecode(data, options?.encoding);

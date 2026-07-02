@@ -80,14 +80,78 @@ function buildRequest(parts: NativeIncomingRequest): Request {
     parts.body.byteLength > 0 && parts.method !== "GET" && parts.method !== "HEAD"
       ? parts.body
       : undefined;
-  const headers = Array.from(parts.headers, ([name, value]) => [name, value] as [string, string]);
   return new Request(parts.url, {
     method: parts.method,
-    headers,
+    headers: parts.headers,
     body,
   });
 }
+
+let responseSym: symbol | null = null;
+let headersListSym: symbol | null = null;
+const textEncoder = new TextEncoder();
+
+function getResponseSym(res: Response): symbol | null {
+  if (responseSym !== null) return responseSym;
+  const syms = Object.getOwnPropertySymbols(res);
+  const found = syms.find(s => s.toString() === "Symbol(response)");
+  if (found) {
+    responseSym = found;
+  }
+  return responseSym;
+}
+
+function getHeadersList(headers: Headers): Array<[string, string]> {
+  if (headersListSym === null) {
+    const syms = Object.getOwnPropertySymbols(headers);
+    const found = syms.find(s => s.toString() === "Symbol(header list)");
+    if (found) {
+      headersListSym = found;
+    }
+  }
+  if (headersListSym !== null) {
+    return (headers as any)[headersListSym] || [];
+  }
+  return Array.from(headers.entries());
+}
+
 async function responseToWire(response: Response): Promise<WireResponse> {
+  const sym = getResponseSym(response);
+  if (sym) {
+    const inner = (response as any)[sym];
+    if (inner) {
+      if (inner.body === null) {
+        return {
+          status: response.status,
+          headers: getHeadersList(response.headers),
+          body: new Uint8Array(0),
+        };
+      }
+      const streamOrStatic = inner.body.streamOrStatic;
+      if (streamOrStatic && streamOrStatic.body !== undefined) {
+        const rawBody = streamOrStatic.body;
+        let bodyBytes: Uint8Array;
+        if (typeof rawBody === "string") {
+          bodyBytes = textEncoder.encode(rawBody);
+        } else if (rawBody instanceof Uint8Array) {
+          bodyBytes = rawBody;
+        } else if (rawBody instanceof ArrayBuffer) {
+          bodyBytes = new Uint8Array(rawBody);
+        } else if (ArrayBuffer.isView(rawBody)) {
+          bodyBytes = new Uint8Array(rawBody.buffer, rawBody.byteOffset, rawBody.byteLength);
+        } else {
+          bodyBytes = new Uint8Array(await response.arrayBuffer());
+        }
+        return {
+          status: response.status,
+          headers: getHeadersList(response.headers),
+          body: bodyBytes,
+        };
+      }
+    }
+  }
+
+  // Fallback
   const body = new Uint8Array(await response.arrayBuffer());
   return {
     status: response.status,

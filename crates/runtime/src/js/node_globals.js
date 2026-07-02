@@ -734,7 +734,7 @@ function meowRunNodeBootstrap(info, warmup) {
   if (typeof globalThis.nodeBootstrap !== "function") return;
   try {
     globalThis.nodeBootstrap({
-      usesLocalNodeModulesDir: false,
+      usesLocalNodeModulesDir: true,
       argv0: info.argv?.[0] ?? "meow",
       runningOnMainThread: true,
       nodeDebug: "",
