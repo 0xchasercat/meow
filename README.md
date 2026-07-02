@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="banner.webp" alt="meow banner" width="100%" />
+ <a href="https://meow.style"> <img src="banner.webp" alt="meow banner" width="100%" /></a>
 </div>
 
 <div align="center">
@@ -11,6 +11,7 @@
     <a href="https://meow.style"><img src="https://img.shields.io/badge/website-meow.style-lightgrey?style=flat-square&color=FFB7C5" alt="Website"></a>
     <a href="https://github.com/0xchasercat/meow/stars"><img src="https://img.shields.io/github/stars/0xchasercat/meow?style=flat-square&color=Floof" alt="GitHub Stars"></a>
   </p>
+ <h3><a href="https://meow.style">Website</a> | <a href="https://docs.meow.style">Documentation</a></h3>
 </div>
 
 ---
