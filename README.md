@@ -14,6 +14,16 @@
  <h3><a href="https://meow.style">Website</a> | <a href="https://docs.meow.style">Documentation</a></h3>
 </div>
 
+
+---
+
+<p align="center">
+  <sub>Sponsored by heretic bot mitigation and anti-fraud</sub><br/>
+  <a href="https://heretic.tech">
+    <img src="https://raw.githubusercontent.com/heretic-hq/.github/refs/heads/main/heretic-gh.png" width="800" alt="Sponsored by Heretic" />
+  </a>
+</p>
+
 ---
 
 # 🐾 meow
